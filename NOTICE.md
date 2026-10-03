@@ -1,7 +1,7 @@
 # Notice
 
 Kinetic
-Copyright 2026 OpenValence contributors
+Copyright 2026 AtlanticTM
 
 Licensed under the Apache License, Version 2.0 (see `LICENSE`).
 
