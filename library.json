@@ -1,0 +1,18 @@
+{
+  "name": "Kinetic",
+  "version": "0.8.0",
+  "description": "Jerk-limited trajectory engine: one plan per command from the actual p/v/a, Hermite waveform segments with Blend/Stretch policies, Ruckig chase and guard. Header-only, hardware-free, deterministic.",
+  "keywords": ["motion", "jerk-limited", "trajectory", "ruckig", "kinetic"],
+  "license": "Apache-2.0",
+  "frameworks": "*",
+  "platforms": "*",
+  "headers": "kinetic/kinetic.hpp",
+  "export": {
+    "exclude": ["build", "build-*", "tests", "wasm"]
+  },
+  "build": {
+    "includeDir": "include",
+    "srcFilter": ["-<*>"],
+    "flags": ["-std=gnu++2b"]
+  }
+}
