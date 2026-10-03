@@ -1,0 +1,15 @@
+{
+  "name": "ruckig",
+  "version": "0.19.4",
+  "description": "Ruckig Community Version (vendored subset) — instantaneous jerk-limited trajectory generation. See VENDORED.md for provenance and update procedure.",
+  "keywords": ["motion", "trajectory", "jerk-limited", "ruckig"],
+  "license": "MIT",
+  "frameworks": "*",
+  "platforms": "*",
+  "headers": "ruckig/ruckig.hpp",
+  "build": {
+    "includeDir": "include",
+    "srcDir": "src",
+    "flags": ["-std=gnu++2b"]
+  }
+}
