@@ -132,10 +132,14 @@ struct Solved {
     // engine removes it from the timeline. Promise 3 outranks the knot.
     bool     dropped = false;
     // HARD junction: the polynomial head ends at (head_us, head) and the brake
-    // profile from there lands at rest on the knot.
+    // profile from there lands at rest on the knot. CORNER (Corner::Cubic): the
+    // head ends at the ramp's start and `ramp` carries the jerk-limited step;
+    // t_us / p / v / a are then the ramp's END, where the next piece starts.
     bool     hard = false;
+    bool     corner = false;
     uint64_t head_us = 0;
     State    head{};
+    Profile  ramp{};
     // The state the piece into this knot was judged from (tooling, and the
     // engine's consistency check: it must equal the previous solved knot).
     State    from{};
@@ -155,7 +159,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     for (size_t i = 0; i < n; ++i) {
         out[i].t_us = knots[i].t_us; out[i].p = knots[i].p;
         out[i].share = 1.0f; out[i].stretched_s = 0.0f; out[i].worst = 0.0f; out[i].clamped = false;
-        out[i].hard = false; out[i].pin_v = false; out[i].pin_a = false; out[i].dropped = false;
+        out[i].hard = false; out[i].corner = false; out[i].pin_v = false; out[i].pin_a = false; out[i].dropped = false;
     }
 
     // Monotone slope at knot i from its solved neighbors (the origin on the left
@@ -258,6 +262,48 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         if (rest_end) {
             out[i].pin_a = true; out[i].a = 0.0f;
             if (!knots[i].has_v) { out[i].pin_v = true; out[i].v = 0.0f; }
+        }
+        // CORNER: an authored C1 knot still moving. Each side keeps the
+        // acceleration the author's cubic has there; one constant-jerk phase
+        // of |da| / jmax, centered on the knot, joins them. The knot is hit at
+        // its time with its velocity. Falls through to the smooth path when
+        // the head cannot legally reach the ramp's start.
+        if (cfg.corner == Corner::Cubic && !rest_end && knots[i].family == Family::C1 && knots[i].has_v
+            && knots[i].v != 0.0f && i + 1 < n) {
+            const float vk = authored(i);
+            const float Tin = float(out[i].t_us - prev_us) * 1e-6f;
+            const float Tout = float(out[i + 1].t_us - out[i].t_us) * 1e-6f;
+            const float pk = out[i].p, pn = out[i + 1].p, vn = slopeAt(i + 1);
+            // Cubic Hermite second derivatives at the shared knot.
+            float a_l = (6.0f * (prev.p - pk) + Tin * (2.0f * prev.v + 4.0f * vk)) / (Tin * Tin);
+            float a_r = (6.0f * (pn - pk) - Tout * (4.0f * vk + 2.0f * vn)) / (Tout * Tout);
+            a_l = std::fmax(-L.amax, std::fmin(L.amax, a_l));
+            a_r = std::fmax(-L.amax, std::fmin(L.amax, a_r));
+            const float Tr = std::fabs(a_r - a_l) / L.jmax, h = 0.5f * Tr;
+            const uint64_t h_us = uint64_t(h * 1e6f + 0.5f);
+            if (Tr > 0.0f && out[i].t_us > prev_us + h_us + 1000) {
+                const float j = (a_r - a_l) / Tr;
+                // Walk the mid state back to the ramp's start.
+                const float vs = vk - a_l * h - 0.5f * j * h * h;
+                const float ps = pk - vs * h - 0.5f * a_l * h * h - j * h * h * h / 6.0f;
+                const State start{ps, vs, a_l};
+                const uint64_t ts = out[i].t_us - h_us;
+                const Piece head = Piece::hermite(prev_us, prev, ts, start);
+                if (referee::worstRatio(head, L, lo, hi) <= 1.0f) {
+                    Profile ramp; ramp.start_us = ts; ramp.s0 = start; ramp.n = 1; ramp.dt[0] = Tr; ramp.jerk[0] = j; ramp.ends_at_rest = false;
+                    const State exit = Profile::step(start, j, Tr);
+                    if (ramp.worstRatio(L, lo, hi) <= 1.0f) {
+                        out[i].corner = true; out[i].head_us = ts; out[i].head = start; out[i].ramp = ramp;
+                        out[i].t_us = ts + uint64_t(Tr * 1e6f + 0.5f);
+                        out[i].p = exit.p; out[i].v = exit.v; out[i].a = exit.a;
+                        out[i].worst = referee::worstRatio(head, L, lo, hi);
+                        out[i].from = prev; out[i].from_us = prev_us;
+                        pp = prev; pp_us = prev_us; last = i;
+                        prev = exit; prev_us = out[i].t_us;
+                        return true;
+                    }
+                }
+            }
         }
 
         Piece q; float worst = 0.0f;

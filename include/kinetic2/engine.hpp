@@ -196,6 +196,11 @@ private:
                 a.piece.has_tail = true;
                 a.piece.tail = Profile::brake(k.head, k.head_us, _cfg.limits);
                 a.piece.end_us = k.t_us;
+            } else if (k.corner) {
+                a.piece = Piece::hermite(a.origin_us, a.origin, k.head_us, k.head);
+                a.piece.has_tail = true;
+                a.piece.tail = k.ramp;
+                a.piece.end_us = k.t_us;
             } else {
                 a.piece = Piece::hermite(a.origin_us, a.origin, k.t_us, State{k.p, k.v, k.a});
             }

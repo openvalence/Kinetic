@@ -67,6 +67,15 @@ constexpr Junction junctionOf(const Knot& k) {
     return Junction::Authored;
 }
 
+// ---- Corner (RFC-105 planner option `corner`) --------------------------------
+// How an AUTHORED C1 knot with a nonzero velocity renders. Both exist until
+// the tuner proves which earns its place (operator 2026-10-05).
+enum class Corner : uint8_t {
+    Continuous = 0,  // the junction acceleration is smoothed through (default)
+    Cubic      = 1,  // each side keeps the author's cubic acceleration, joined
+                     // by a jerk-limited ramp centered on the knot
+};
+
 // ---- Config -----------------------------------------------------------------
 // Every member here is a planner option in the RFC-105 sense: a setup-category
 // catalog field on the hub, tunable from the client. Add one only where one
@@ -77,6 +86,7 @@ struct Config {
     Policy  policy          = Policy::Blend;
     float   amplitude_floor = 0.25f;   // Blend never trims a stroke below this share of it
     uint32_t lookahead_us   = 250000;  // how far past now the solver considers knots
+    Corner  corner          = Corner::Continuous;
 };
 
 // ---- Anomaly ----------------------------------------------------------------

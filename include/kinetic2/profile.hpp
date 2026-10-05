@@ -27,6 +27,7 @@ struct Profile {
     int      n = 0;
     float    dt[kMaxPhases] = {};   // seconds
     float    jerk[kMaxPhases] = {};
+    bool     ends_at_rest = true;   // a brake; false for a corner ramp, which keeps moving
 
     float duration() const { float T = 0.0f; for (int i = 0; i < n; ++i) T += dt[i]; return T; }
     uint64_t end_us() const { return start_us + uint64_t(duration() * 1e6f + 0.5f); }
@@ -47,7 +48,7 @@ struct Profile {
             s = step(s, jerk[i], dt[i]);
             t -= dt[i];
         }
-        s.v = 0.0f; s.a = 0.0f;   // a profile ends at rest by construction; pin it
+        if (ends_at_rest) { s.v = 0.0f; s.a = 0.0f; }   // a brake ends at rest by construction; pin it
         return s;
     }
     State at(uint64_t t_us) const {

@@ -495,3 +495,45 @@ TEST_CASE("fingerprint: the canonical run has not changed bits") {
     MESSAGE("fingerprint 0x" << std::hex << fp);
     CHECK(fp == KINETIC2_FINGERPRINT);
 }
+
+// ---- the corner option (kin-jub, RFC-105 planner option `corner`) -------------
+
+TEST_CASE("corner: cubic keeps the author's acceleration step as a jerk-limited ramp, continuous smooths it") {
+    // A rising corner: fast in, slow out, authored C1 with nonzero velocity.
+    auto run = [](Corner c) {
+        Config cfg; cfg.limits = {6.0f, 80.0f, 2000.0f}; cfg.corner = c;
+        Engine<> e(cfg, 0.1f);
+        REQUIRE(e.submit(knotAt(300 * kMs, 0.6f, true, 2.5f, Family::C1), 0));
+        REQUIRE(e.submit(knotAt(700 * kMs, 0.9f, true, 0.3f, Family::C1), 0));
+        REQUIRE(e.submit(knotAt(1000 * kMs, 0.9f, true, 0.0f, Family::C1), 0));
+        return sweep(e, 0, 1100 * kMs);
+    };
+    const auto cubic = run(Corner::Cubic), cont = run(Corner::Continuous);
+    for (const auto* s : {&cubic, &cont}) {
+        // The knot is hit at its time with its velocity, under every ceiling.
+        CHECK((*s)[300].p == doctest::Approx(0.6f).epsilon(2e-3));
+        CHECK((*s)[300].v == doctest::Approx(2.5f).epsilon(5e-2));
+        CHECK((*s)[700].p == doctest::Approx(0.9f).epsilon(2e-3));
+        const Peaks pk = peaksOf(*s);
+        CHECK(pk.v <= 6.0f * 1.001f);
+        CHECK(pk.a <= 80.0f * 1.001f);
+        CHECK(pk.j <= 2000.0f * 1.05f);
+    }
+    // Cubic: each side of the knot carries the author's cubic acceleration
+    // (left: the span from rest at 0.1 over 300 ms; right: the span to 0.9 at
+    // 0.3 over 400 ms), joined by a ramp at the jerk ceiling. The ramp is
+    // |a_r - a_l| / jmax long, centered on the knot.
+    const float a_l = (6.0f * (0.1f - 0.6f) + 0.3f * (2.0f * 0.0f + 4.0f * 2.5f)) / (0.3f * 0.3f);
+    const float a_r = (6.0f * (0.9f - 0.6f) - 0.4f * (4.0f * 2.5f + 2.0f * 0.3f)) / (0.4f * 0.4f);
+    const float h_ms = 0.5f * std::fabs(a_r - a_l) / 2000.0f * 1000.0f;
+    const size_t before = 300 - size_t(h_ms + 2.0f), after = 300 + size_t(h_ms + 2.0f);
+    CHECK(cubic[before].a == doctest::Approx(a_l).epsilon(0.2).scale(10.0));
+    CHECK(cubic[after].a == doctest::Approx(a_r).epsilon(0.2).scale(10.0));
+    // Continuous has no such step: its acceleration moves smoothly through.
+    CHECK(std::fabs(cont[after].a - cont[before].a) < 0.5f * std::fabs(a_r - a_l));
+    float jpk = 0.0f;
+    for (size_t i = 281; i <= 320; ++i) jpk = std::max(jpk, std::fabs(cubic[i].a - cubic[i - 1].a) / 1e-3f);
+    CHECK(jpk == doctest::Approx(2000.0f).epsilon(0.05));
+    // The default is Continuous: a Config{} run matches Continuous bit for bit.
+    Config d; CHECK(d.corner == Corner::Continuous);
+}
