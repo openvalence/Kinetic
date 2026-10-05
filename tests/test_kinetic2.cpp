@@ -98,8 +98,8 @@ TEST_CASE("a knot in the past or behind the newest is refused and counted") {
     CHECK(refused == 3);
 }
 
-TEST_CASE("brake drops the future and comes to rest") {
-    Config cfg; cfg.limits.amax = 20.0f;
+TEST_CASE("brake drops the future and stops as fast as the ceilings allow") {
+    Config cfg; cfg.limits = {10.0f, 20.0f, 500.0f};
     Engine<> e(cfg, 0.1f);
     const uint64_t now = 0;
     REQUIRE(e.submit(knotAt(500 * kMs, 0.9f), now));
@@ -107,14 +107,41 @@ TEST_CASE("brake drops the future and comes to rest") {
     const State mid = e.stateAt(0, 250 * kMs);
     CHECK(mid.v > 0.0f);
     e.brake(250 * kMs);
-    CHECK(e.pending() == 1);
+    CHECK(e.pending() == 0);
+    CHECK(e.isBusy(260 * kMs));
     const auto s = sweep(e, 250 * kMs, 1000 * kMs);
     CHECK(s.back().v == 0.0f);
     CHECK(s.back().p > mid.p);        // it stopped ahead of where it was
     CHECK(s.back().p < 0.9f);         // and short of the dropped knot
+    // Peaks: the decel ceiling is reached (a real brake, not a glide) and
+    // nothing is exceeded. Jerk by finite difference over 1 ms.
+    float a_min = 0.0f, j_max = 0.0f;
+    for (size_t i = 1; i < s.size(); ++i) { a_min = std::min(a_min, s[i].a); j_max = std::max(j_max, std::fabs(s[i].a - s[i - 1].a) / 1e-3f); }
+    CHECK(a_min <= -cfg.limits.amax * 0.99f);
+    CHECK(a_min >= -cfg.limits.amax * 1.001f);
+    CHECK(j_max <= cfg.limits.jmax * 1.05f);
+    // Continuous into the brake: no jump at 250 ms.
+    CHECK(s[0].p == doctest::Approx(mid.p));
+    CHECK(s[0].v == doctest::Approx(mid.v));
     Anomaly an; bool settled = false;
     while (e.popAnomaly(an)) settled |= an.kind == uint8_t(AnomalyKind::SettleEngaged);
     CHECK(settled);
+    // A knot before the brake's end is past; one after it chains from rest.
+    CHECK_FALSE(e.submit(knotAt(300 * kMs, 0.5f), 260 * kMs));
+    CHECK(e.submit(knotAt(1500 * kMs, 0.5f), 260 * kMs));
+}
+
+TEST_CASE("the brake profile stops exactly, from any entry state") {
+    const Limits L{5.0f, 40.0f, 800.0f};
+    const State entries[] = {{0.5f, 2.0f, 0.0f}, {0.5f, -3.0f, 10.0f}, {0.5f, 1.0f, -40.0f}, {0.5f, 0.1f, -30.0f}, {0.5f, 0.0f, 20.0f}, {0.5f, 4.0f, 35.0f}};
+    for (const State& s0 : entries) {
+        const Profile pr = Profile::brake(s0, 0, L);
+        const State end = pr.atSeconds(pr.duration());
+        CHECK(end.v == doctest::Approx(0.0f).epsilon(1e-3).scale(1.0));
+        CHECK(end.a == doctest::Approx(0.0f).epsilon(1e-3).scale(1.0));
+        CHECK(pr.worstRatio(L, -10.0f, 10.0f) <= 1.001f);
+        for (int i = 0; i < pr.n; ++i) CHECK(pr.dt[i] >= 0.0f);
+    }
 }
 
 TEST_CASE("reset forgets everything and holds the new position") {
@@ -267,4 +294,34 @@ TEST_CASE("the rail is a wall: a reversal that would bulge past it is spent") {
     const auto an = drain(e);
     CHECK(countKind(an, AnomalyKind::EndVelClamped) >= 1);
     CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
+}
+
+TEST_CASE("a hard stop keeps its speed longer than a smooth stop and lands at rest") {
+    Config cfg; cfg.limits = {4.0f, 40.0f, 1000.0f};
+    auto run = [&](Family f) {
+        Engine<> e(cfg, 0.0f);
+        REQUIRE(e.submit(knotAt(500 * kMs, 0.8f, true, 0.0f, f), 0));
+        return sweep(e, 0, 600 * kMs);
+    };
+    const auto hard = run(Family::C1), smooth = run(Family::C2);
+    for (const auto* s : {&hard, &smooth}) {
+        CHECK((*s)[500].p == doctest::Approx(0.8f).epsilon(1e-3));
+        CHECK(std::fabs((*s)[500].v) < 1e-2f);
+        const Peaks pk = peaksOf(*s);
+        CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+        CHECK(pk.a <= cfg.limits.amax * 1.001f);
+        CHECK(pk.j <= cfg.limits.jmax * 1.05f);
+    }
+    // Time at which each has fallen to half its own peak speed, on the way in.
+    auto halfTime = [](const std::vector<State>& s) {
+        float vpk = 0.0f; size_t ipk = 0;
+        for (size_t i = 0; i < 500; ++i) if (s[i].v > vpk) { vpk = s[i].v; ipk = i; }
+        for (size_t i = ipk; i < 500; ++i) if (s[i].v < 0.5f * vpk) return i;
+        return size_t(500);
+    };
+    CHECK(halfTime(hard) > halfTime(smooth));
+    // The hard stop reaches the decel ceiling; the smooth one need not.
+    float a_hard = 0.0f;
+    for (const State& x : hard) a_hard = std::min(a_hard, x.a);
+    CHECK(a_hard <= -cfg.limits.amax * 0.98f);
 }

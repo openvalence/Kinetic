@@ -126,6 +126,11 @@ struct Solved {
     float    stretched_s = 0.0f; // Stretch: seconds added
     float    worst = 0.0f;       // the incoming piece's worst ratio after the spend
     bool     clamped = false;    // an authored velocity was cut (reported once)
+    // HARD junction: the polynomial head ends at (head_us, head) and the brake
+    // profile from there lands at rest on the knot.
+    bool     hard = false;
+    uint64_t head_us = 0;
+    State    head{};
 };
 
 // ---- the solver --------------------------------------------------------------
@@ -141,6 +146,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     for (size_t i = 0; i < n; ++i) {
         out[i].t_us = knots[i].t_us; out[i].p = knots[i].p;
         out[i].share = 1.0f; out[i].stretched_s = 0.0f; out[i].worst = 0.0f; out[i].clamped = false;
+        out[i].hard = false;
     }
 
     // Monotone slope at knot i from its solved neighbors (the origin on the left
@@ -184,6 +190,35 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     State prev = origin;
     uint64_t prev_us = origin_us;
     for (size_t i = 0; i < n; ++i) {
+        // HARD: cruise as fast as the head can legally reach, then the fastest
+        // legal brake landing at rest exactly on the knot. Bisection on the
+        // cruise speed; the head is a plain piece into the brake's start
+        // state. Falls through to the smooth path when even a crawl fails.
+        if (junctionOf(knots[i]) == Junction::Hard) {
+            const float d = out[i].p - prev.p;
+            const float sgn = d >= 0.0f ? 1.0f : -1.0f;
+            float v_lo = 0.0f, v_hi = L.vmax, v_ok = -1.0f;
+            Piece head_ok; uint64_t head_us_ok = 0; State head_s_ok{};
+            for (int it = 0; it < 16; ++it) {
+                const float vc = it == 0 ? 0.0f : 0.5f * (v_lo + v_hi);
+                const Profile br = Profile::brake(State{0.0f, sgn * vc, 0.0f}, 0, L);
+                const float tb = br.duration();
+                const uint64_t tb_us = uint64_t(tb * 1e6f + 0.5f);
+                if (out[i].t_us <= prev_us + tb_us + 1000) { if (it) v_hi = vc; continue; }
+                const uint64_t tc = out[i].t_us - tb_us;
+                const State hs{out[i].p - br.end().p, sgn * vc, 0.0f};
+                const Piece head = Piece::hermite(prev_us, prev, tc, hs);
+                if (referee::worstRatio(head, L, lo, hi) <= 1.0f) { v_ok = vc; v_lo = vc; head_ok = head; head_us_ok = tc; head_s_ok = hs; }
+                else { if (it == 0) break; v_hi = vc; }
+            }
+            if (v_ok >= 0.0f) {
+                out[i].hard = true; out[i].head_us = head_us_ok; out[i].head = head_s_ok;
+                out[i].v = 0.0f; out[i].a = 0.0f; out[i].worst = referee::worstRatio(head_ok, L, lo, hi);
+                prev = State{out[i].p, 0.0f, 0.0f};
+                prev_us = out[i].t_us;
+                continue;
+            }
+        }
         auto build = [&]() {
             out[i].v = slopeAt(i);
             out[i].a = accelAt(i, out[i].v);

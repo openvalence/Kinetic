@@ -51,10 +51,11 @@ public:
         Axis& a = _ax[axis];
         if (!std::isfinite(k.p) || (k.has_v && !std::isfinite(k.v))) return refuse(k, now_us, kDetailNonFinite);
         if (k.t_us <= now_us) return refuse(k, now_us, kDetailPast);
+        if (k.t_us <= a.origin_us) return refuse(k, now_us, kDetailPast);   // inside a brake
         if (a.tl.full()) return refuse(k, now_us, kDetailTimelineFull);
         // An axis at rest has been holding since its origin: the first piece
-        // starts now, not when the hold began.
-        if (a.tl.empty()) a.origin_us = now_us;
+        // starts now, not when the hold began. A brake in flight keeps its end.
+        if (a.tl.empty() && a.origin_us < now_us) a.origin_us = now_us;
         if (!a.tl.push(k)) return refuse(k, now_us, kDetailPast);
         // A successor changes the junction of the knot before it: re-solve
         // the window lazily, at the next sample.
@@ -64,27 +65,24 @@ public:
     bool submit(const Knot& k, uint64_t now_us) { return submit(0, k, now_us); }
 
     // ---- brake --------------------------------------------------------------
-    // Drop every pending knot and come to rest under amax from the current
-    // state. ponytail: a trapezoid estimate of the stop (jerk unbounded in the
-    // estimate); kin-4gd replaces it with the jerk-limited brake profile.
+    // Drop every pending knot and stop as fast as the ceilings allow from the
+    // current state (profile.hpp). The brake wins: the origin moves to its
+    // end, at rest, so a knot submitted meanwhile chains from there and one
+    // before its end is refused as past.
     bool brake(uint64_t now_us) {
         for (size_t ax = 0; ax < DoF; ++ax) {
             Axis& a = _ax[ax];
             const State s = stateAt(ax, now_us);
             a.tl.clear();
-            a.solved_valid = false;
-            a.origin = s;
-            a.origin_us = now_us;
-            if (std::fabs(s.v) > 1e-6f) {
-                // Stop time of a jerk-limited decel: ramp in, hold amax, ramp out.
-                const float t_stop = std::fabs(s.v) / _cfg.limits.amax + _cfg.limits.amax / _cfg.limits.jmax;
-                Knot stop;
-                stop.t_us = now_us + uint64_t(t_stop * 1e6f) + 1;
-                stop.p = s.p + 0.5f * s.v * t_stop;
-                stop.v = 0.0f; stop.has_v = true; stop.family = Family::C1;
-                a.tl.push(stop);
-                record(AnomalyKind::SettleEngaged, now_us, stop.p, s.v);
-            }
+            a.n_sol = 0;
+            a.solved_valid = true;
+            const Profile pr = Profile::brake(s, now_us, _cfg.limits);
+            if (pr.n == 0) { a.origin = State{s.p, 0.0f, 0.0f}; a.origin_us = now_us; a.piece = Piece::hold(s.p, now_us); a.piece_valid = true; continue; }
+            a.piece = Piece::profile(pr);
+            a.piece_valid = true;
+            a.origin = pr.end();
+            a.origin_us = pr.end_us();
+            record(AnomalyKind::SettleEngaged, now_us, a.origin.p, s.v);
         }
         return true;
     }
@@ -95,6 +93,8 @@ public:
         // Retire knots the clock has passed (at their SOLVED time: Stretch may
         // have moved them); the solved junction state becomes the origin.
         ensureSolved(a);
+        // A brake in flight renders until its end; the origin already sits there.
+        if (a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) return a.piece.at(now_us);
         while (!a.tl.empty() && a.sol[0].t_us <= now_us) {
             const Solved& k = a.sol[0];
             a.origin = State{k.p, k.v, k.a};
@@ -117,7 +117,8 @@ public:
             Axis& a = _ax[ax];
             ensureSolved(a);
             if (a.n_sol && a.sol[a.n_sol - 1].t_us > now_us) return true;
-            if (a.tl.empty() && std::fabs(a.origin.v) > 1e-6f) return true;
+            if (a.tl.empty() && a.piece_valid && a.piece.has_tail && a.piece.end_us > now_us) return true;
+            if (a.tl.empty() && std::fabs(a.origin.v) > 1e-6f) return true;   // never after a brake: its origin is at rest
         }
         return false;
     }
@@ -181,7 +182,14 @@ private:
             a.origin.v = 0.0f; a.origin.a = 0.0f;
         } else {
             const Solved& k = a.sol[0];
-            a.piece = Piece::hermite(a.origin_us, a.origin, k.t_us, State{k.p, k.v, k.a});
+            if (k.hard) {
+                a.piece = Piece::hermite(a.origin_us, a.origin, k.head_us, k.head);
+                a.piece.has_tail = true;
+                a.piece.tail = Profile::brake(k.head, k.head_us, _cfg.limits);
+                a.piece.end_us = k.t_us;
+            } else {
+                a.piece = Piece::hermite(a.origin_us, a.origin, k.t_us, State{k.p, k.v, k.a});
+            }
         }
         a.piece_valid = true;
     }

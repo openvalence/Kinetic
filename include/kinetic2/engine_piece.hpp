@@ -5,6 +5,7 @@
 
 #include <cstdint>
 
+#include "profile.hpp"
 #include "types.hpp"
 
 namespace kinetic2 {
@@ -15,8 +16,19 @@ namespace kinetic2 {
 struct Piece {
     uint64_t start_us = 0;
     uint64_t end_us   = 0;
-    float    T        = 0.0f;   // seconds; 0 = a hold at c[0]
+    float    T        = 0.0f;   // seconds of the polynomial head; 0 = a hold at c[0]
     float    c[6]     = {};
+    // A brake tail (RFC-105 HARD junction, and brake()): from tail.start_us
+    // the profile renders instead of the polynomial. has_tail with T == 0 is
+    // a bare profile.
+    bool     has_tail = false;
+    Profile  tail{};
+
+    static Piece profile(const Profile& pr) {
+        Piece q; q.start_us = pr.start_us; q.end_us = pr.end_us(); q.T = 0.0f; q.c[0] = pr.s0.p;
+        q.has_tail = true; q.tail = pr;
+        return q;
+    }
 
     static Piece hold(float p, uint64_t from) {
         Piece h; h.start_us = from; h.end_us = from; h.T = 0.0f; h.c[0] = p;
@@ -41,6 +53,7 @@ struct Piece {
 
     State at(uint64_t t) const {
         State s;
+        if (has_tail && t >= tail.start_us) return tail.at(t);
         if (T <= 0.0f) { s.p = c[0]; return s; }
         float tau = float(t - start_us) * 1e-6f / T;
         if (tau < 0.0f) tau = 0.0f;
