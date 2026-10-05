@@ -51,6 +51,14 @@ public:
 
     void clear() { _head = 0; _n = 0; }
 
+    // Removes the i-th knot, closing the gap. The engine uses it for a knot the
+    // solver dropped as unreachable.
+    void erase(size_t i) {
+        if (i >= _n) return;
+        for (size_t k = i; k + 1 < _n; ++k) at(k) = at(k + 1);
+        --_n;
+    }
+
     // Index of the first knot with t_us > t, or size() when none.
     size_t firstAfter(uint64_t t) const {
         size_t lo = 0, hi = _n;

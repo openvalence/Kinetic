@@ -126,11 +126,20 @@ struct Solved {
     float    stretched_s = 0.0f; // Stretch: seconds added
     float    worst = 0.0f;       // the incoming piece's worst ratio after the spend
     bool     clamped = false;    // an authored velocity was cut (reported once)
+    uint64_t base_us = 0;        // Stretch scratch: the time before the current spend
+    bool     pin_v = false, pin_a = false;   // junction values fixed by a backward relaxation
+    // Unreachable under every spend: not rendered, reported PlanFailed; the
+    // engine removes it from the timeline. Promise 3 outranks the knot.
+    bool     dropped = false;
     // HARD junction: the polynomial head ends at (head_us, head) and the brake
     // profile from there lands at rest on the knot.
     bool     hard = false;
     uint64_t head_us = 0;
     State    head{};
+    // The state the piece into this knot was judged from (tooling, and the
+    // engine's consistency check: it must equal the previous solved knot).
+    State    from{};
+    uint64_t from_us = 0;
 };
 
 // ---- the solver --------------------------------------------------------------
@@ -146,7 +155,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     for (size_t i = 0; i < n; ++i) {
         out[i].t_us = knots[i].t_us; out[i].p = knots[i].p;
         out[i].share = 1.0f; out[i].stretched_s = 0.0f; out[i].worst = 0.0f; out[i].clamped = false;
-        out[i].hard = false;
+        out[i].hard = false; out[i].pin_v = false; out[i].pin_a = false; out[i].dropped = false;
     }
 
     // Monotone slope at knot i from its solved neighbors (the origin on the left
@@ -156,13 +165,31 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         const uint64_t ta = a == size_t(-1) ? origin_us : out[a].t_us;
         return (out[b].p - pa) / (float(out[b].t_us - ta) * 1e-6f);
     };
-    // An authored velocity is honored within vmax and never through a rail:
-    // at a rail an outward velocity becomes 0 (EndVelClamped, once per knot).
+    // An authored velocity is honored within vmax and within what the rail
+    // allows: a velocity the fastest legal brake could not stop before the
+    // wall is illegal whatever follows, so it is cut to the one that can
+    // (EndVelClamped, reported once per knot). At the rail that is 0.
     auto authored = [&](size_t i) -> float {
         const float v = knots[i].v;
         const float p = out[i].p;
-        const bool outward = (v > 0.0f && p >= hi - 1e-6f) || (v < 0.0f && p <= lo + 1e-6f);
-        const float cl = outward ? 0.0f : std::fmax(-L.vmax, std::fmin(L.vmax, v));
+        float cl = std::fmax(-L.vmax, std::fmin(L.vmax, v));
+        // Room on both sides: the fastest legal stop ahead must fit, and so
+        // must the fastest legal run-up behind (the curve arrives from there).
+        const float gap = std::fmin(hi - p, p - lo);
+        if (cl != 0.0f) {
+            if (gap <= 1e-6f) cl = 0.0f;
+            else {
+                // Stop distance of the fastest legal brake from speed u, at rest
+                // in acceleration: the ramp in and out each cover u * amax / (2 jmax)
+                // beyond the trapezoid's u^2 / (2 amax); a triangle stop is shorter.
+                auto stopDist = [&](float u) { return u * u / (2.0f * L.amax) + u * L.amax / (2.0f * L.jmax); };
+                if (stopDist(std::fabs(cl)) > gap) {
+                    float u_lo = 0.0f, u_hi = std::fabs(cl);
+                    for (int it = 0; it < 24; ++it) { const float m = 0.5f * (u_lo + u_hi); if (stopDist(m) <= gap) u_lo = m; else u_hi = m; }
+                    cl = (cl > 0.0f ? 1.0f : -1.0f) * u_lo;
+                }
+            }
+        }
         if (cl != v && !out[i].clamped) { out[i].clamped = true; report(AnomalyKind::EndVelClamped, out[i].t_us, p, cl); }
         return cl;
     };
@@ -187,9 +214,16 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         return (vr - vl) / (float(out[i + 1].t_us - tl) * 1e-6f);
     };
 
-    State prev = origin;
+    State prev = origin;          // the state the piece into knot i starts from
     uint64_t prev_us = origin_us;
-    for (size_t i = 0; i < n; ++i) {
+    State pp = origin;            // the state the piece into the last accepted knot started from
+    uint64_t pp_us = origin_us;
+    size_t last = size_t(-1);     // the last accepted knot (dropped ones never count)
+
+    // Solve knot i from prev. rest_end: the knot ends the timeline (everything
+    // after it was dropped), so it rests and no backward relaxation runs.
+    // Returns false when the knot was dropped.
+    auto solveKnot = [&](size_t i, bool rest_end) -> bool {
         // HARD: cruise as fast as the head can legally reach, then the fastest
         // legal brake landing at rest exactly on the knot. Bisection on the
         // cruise speed; the head is a plain piece into the brake's start
@@ -214,77 +248,143 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
             if (v_ok >= 0.0f) {
                 out[i].hard = true; out[i].head_us = head_us_ok; out[i].head = head_s_ok;
                 out[i].v = 0.0f; out[i].a = 0.0f; out[i].worst = referee::worstRatio(head_ok, L, lo, hi);
+                out[i].from = prev; out[i].from_us = prev_us;
+                pp = prev; pp_us = prev_us; last = i;
                 prev = State{out[i].p, 0.0f, 0.0f};
                 prev_us = out[i].t_us;
-                continue;
+                return true;
             }
         }
+        if (rest_end) {
+            out[i].pin_a = true; out[i].a = 0.0f;
+            if (!knots[i].has_v) { out[i].pin_v = true; out[i].v = 0.0f; }
+        }
+
+        Piece q; float worst = 0.0f;
         auto build = [&]() {
-            out[i].v = slopeAt(i);
-            out[i].a = accelAt(i, out[i].v);
+            if (!out[i].pin_v) out[i].v = slopeAt(i);
+            if (!out[i].pin_a) out[i].a = accelAt(i, out[i].v);
             return Piece::hermite(prev_us, prev, out[i].t_us, State{out[i].p, out[i].v, out[i].a});
         };
-        Piece q = build();
-        float worst = referee::worstRatio(q, L, lo, hi);
-        if (worst > 1.0f) {
+        auto judge = [&]() { q = build(); worst = referee::worstRatio(q, L, lo, hi); return worst <= 1.0f; };
+
+        // Reports of an attempt are held until the attempt that stands, so a
+        // retried knot is counted once.
+        struct Held { AnomalyKind k; float detail; };
+        Held held[2]; int n_held = 0;
+        auto hold = [&](AnomalyKind k, float detail) { if (n_held < 2) held[n_held++] = Held{k, detail}; };
+
+        // The spends. Blend trims toward the previous end state down to the
+        // floor; the ceilings outrank the deadline, so a floor still illegal
+        // stretches as well. Stretch moves the knot and every later one by the
+        // same amount on top of earlier stretches, from the analytic bound,
+        // doubling while illegal up to a cap, then bisection.
+        auto spend = [&]() -> bool {
+            n_held = 0;
+            out[i].share = 1.0f; out[i].stretched_s = 0.0f;
+            if (judge()) return true;
             if (cfg.policy == Policy::Blend) {
-                // Trim the stroke toward where the previous piece ends, never
-                // below the floor: bisection on the kept share.
-                const float p_full = knots[i].p;
+                const float p_full = out[i].p;
                 float s_lo = cfg.amplitude_floor, s_hi = 1.0f, s_ok = -1.0f;
                 for (int it = 0; it < 14; ++it) {
-                    const float s = 0.5f * (s_lo + s_hi);
-                    out[i].p = prev.p + s * (p_full - prev.p);
-                    q = build();
-                    const float w = referee::worstRatio(q, L, lo, hi);
-                    if (w <= 1.0f) { s_ok = s; s_lo = s; worst = w; } else s_hi = s;
+                    const float sh = 0.5f * (s_lo + s_hi);
+                    out[i].p = prev.p + sh * (p_full - prev.p);
+                    if (judge()) { s_ok = sh; s_lo = sh; } else s_hi = sh;
                 }
-                if (s_ok < 0.0f) {
-                    out[i].p = prev.p + cfg.amplitude_floor * (p_full - prev.p);
-                    q = build();
-                    worst = referee::worstRatio(q, L, lo, hi);
-                    out[i].share = cfg.amplitude_floor;
-                    report(AnomalyKind::WaveformScaled, out[i].t_us, out[i].p, out[i].share);
-                    report(AnomalyKind::PlanFailed, out[i].t_us, out[i].p, worst);
-                } else {
-                    out[i].p = prev.p + s_ok * (p_full - prev.p);
-                    q = build();
-                    out[i].share = s_ok;
-                    report(AnomalyKind::WaveformScaled, out[i].t_us, out[i].p, s_ok);
-                }
-            } else {
-                // Move the knot later, and every knot after it by the same
-                // amount, until the piece is legal: bisection on added time,
-                // up to four times the interval.
-                const uint64_t span = out[i].t_us - prev_us;
-                // The least time a rest-to-rest stroke of this length can take
-                // under each ceiling bounds the search; 2x covers moving ends.
-                const float d = std::fabs(out[i].p - prev.p);
-                const float t_need = 2.0f * std::fmax(std::fmax(1.875f * d / L.vmax, std::sqrt(5.7735f * d / L.amax)),
-                                                      std::cbrt(60.0f * d / L.jmax));
-                const uint64_t t_hi = uint64_t(t_need * 1e6f) + 1000;
-                uint64_t add_lo = 0, add_hi = t_hi > span ? t_hi - span : 1, add_ok = 0;
-                bool found = false;
-                for (int it = 0; it < 16; ++it) {
-                    const uint64_t add = (add_lo + add_hi) / 2;
-                    for (size_t k = i; k < n; ++k) out[k].t_us = knots[k].t_us + add;
-                    q = build();
-                    const float w = referee::worstRatio(q, L, lo, hi);
-                    if (w <= 1.0f) { add_ok = add; add_hi = add; found = true; worst = w; } else add_lo = add + 1;
-                    if (add_hi <= add_lo) break;
-                }
-                const uint64_t add = found ? add_ok : add_hi;
-                for (size_t k = i; k < n; ++k) out[k].t_us = knots[k].t_us + add;
-                q = build();
-                worst = referee::worstRatio(q, L, lo, hi);
-                out[i].stretched_s = float(add) * 1e-6f;
-                report(AnomalyKind::DeadlineStretched, out[i].t_us, out[i].p, out[i].stretched_s);
-                if (!found) report(AnomalyKind::PlanFailed, out[i].t_us, out[i].p, worst);
+                const float share = s_ok >= 0.0f ? s_ok : cfg.amplitude_floor;
+                out[i].p = prev.p + share * (p_full - prev.p);
+                out[i].share = share;
+                hold(AnomalyKind::WaveformScaled, share);
+                if (judge()) return true;
             }
+            for (size_t k = i; k < n; ++k) out[k].base_us = out[k].t_us;
+            auto place = [&](uint64_t add) { for (size_t k = i; k < n; ++k) out[k].t_us = out[k].base_us + add; return judge(); };
+            const uint64_t span = out[i].t_us - prev_us;
+            const float d = std::fabs(out[i].p - prev.p);
+            const float t_need = 2.0f * std::fmax(std::fmax(1.875f * d / L.vmax, std::sqrt(5.7735f * d / L.amax)),
+                                                  std::cbrt(60.0f * d / L.jmax));
+            const uint64_t t_hi = uint64_t(t_need * 1e6f) + 1000;
+            uint64_t add_lo = 0, add_hi = t_hi > span ? t_hi - span : 1000;
+            constexpr uint64_t kCap = 8000000;   // 8 s: past this the knot is unreachable
+            while (add_hi < kCap && !place(add_hi)) add_hi *= 2;
+            if (add_hi >= kCap) add_hi = kCap;
+            bool found = false;
+            if (place(add_hi)) {
+                found = true;
+                for (int it = 0; it < 18 && add_hi > add_lo + 1; ++it) {
+                    const uint64_t mid = (add_lo + add_hi) / 2;
+                    if (place(mid)) add_hi = mid; else add_lo = mid;
+                }
+            }
+            place(add_hi);
+            out[i].stretched_s = float(add_hi) * 1e-6f;
+            hold(AnomalyKind::DeadlineStretched, out[i].stretched_s);
+            return found;
+        };
+        // Undo a failed attempt's spends so the next attempt starts clean.
+        auto restore = [&]() {
+            out[i].p = knots[i].p;
+            for (size_t k = i; k < n; ++k) out[k].t_us = out[k].base_us;
+        };
+        // Times as they stand now are the base a failed attempt restores to.
+        for (size_t k = i; k < n; ++k) out[k].base_us = out[k].t_us;
+
+        bool legal = spend();
+        // Backward relaxation. When no spend on this knot makes its piece
+        // legal, the fault is the state it starts from: the last accepted
+        // junction's acceleration (and, for a free knot, velocity) was chosen
+        // with its own piece in view and this one not yet. Zero them when
+        // that piece stays legal with the change, and spend again.
+        if (!legal && !rest_end && last != size_t(-1) && !out[last].hard) {
+            auto relax = [&](bool alsoV) -> bool {
+                State np = prev; np.a = 0.0f; if (alsoV) np.v = 0.0f;
+                const Piece back = Piece::hermite(pp_us, pp, prev_us, np);
+                if (referee::worstRatio(back, L, lo, hi) > 1.0f) return false;
+                out[last].a = 0.0f; out[last].pin_a = true;
+                if (alsoV) { out[last].v = 0.0f; out[last].pin_v = true; }
+                prev = np;
+                return true;
+            };
+            if (relax(false)) { restore(); legal = spend(); }
+            if (!legal && !knots[last].has_v && relax(true)) { restore(); legal = spend(); }
+        }
+        // Last resort on this side: an outward junction acceleration at the
+        // knot itself.
+        if (!legal && !out[i].pin_a) { out[i].a = 0.0f; out[i].pin_a = true; restore(); legal = spend(); }
+
+        for (int h = 0; h < n_held; ++h) report(held[h].k, out[i].t_us, out[i].p, held[h].detail);
+        if (!legal) {
+            // Unreachable: drop the knot rather than render past a ceiling.
+            // The next piece starts where this one would have.
+            restore();
+            out[i].dropped = true; out[i].share = 1.0f; out[i].stretched_s = 0.0f; out[i].worst = worst;
+            report(AnomalyKind::PlanFailed, out[i].t_us, knots[i].p, worst);
+            return false;
         }
         out[i].worst = worst;
+        out[i].from = prev; out[i].from_us = prev_us;
+        pp = prev; pp_us = prev_us; last = i;
         prev = State{out[i].p, out[i].v, out[i].a};
         prev_us = out[i].t_us;
+        return true;
+    };
+
+    for (size_t i = 0; i < n; ++i) solveKnot(i, false);
+
+    // Every knot after the last accepted one was dropped: that knot now ends
+    // the timeline and the hold starts there, so it must rest. Its junction
+    // values were chosen with a successor in view; solve it again as the end,
+    // from the state it was judged from. If it cannot rest legally it is
+    // dropped too, and the one before it becomes the end.
+    while (last != size_t(-1) && last + 1 < n && !out[last].hard) {
+        const size_t i = last;
+        prev = out[i].from; prev_us = out[i].from_us;
+        out[i].p = knots[i].p; out[i].t_us = out[i].base_us;
+        out[i].pin_v = false; out[i].pin_a = false; out[i].hard = false;
+        // The last accepted knot before i, if any.
+        last = size_t(-1);
+        for (size_t k = i; k-- > 0;) if (!out[k].dropped) { last = k; break; }
+        if (solveKnot(i, true)) break;
     }
 }
 

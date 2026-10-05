@@ -124,6 +124,9 @@ public:
     }
 
     size_t pending(size_t axis = 0) const { return _ax[axis].tl.size(); }
+    // The solver's decision for pending knot i (tooling: the tuner shows the
+    // share and the stretch per knot). Solves first.
+    const Solved& solved(size_t axis, size_t i) { ensureSolved(_ax[axis]); return _ax[axis].sol[i]; }
 
     // ---- anomalies ----------------------------------------------------------
     bool popAnomaly(Anomaly& out) {
@@ -168,7 +171,13 @@ private:
         for (size_t i = 0; i < n; ++i) tmp[i] = a.tl.at(i);
         solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol,
                     [this](AnomalyKind k, uint64_t t, float target, float detail) { record(k, t, target, detail); });
-        a.n_sol = n;
+        // A knot the solver dropped leaves the timeline for good.
+        size_t m = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (a.sol[i].dropped) { a.tl.erase(m); continue; }
+            a.sol[m++] = a.sol[i];
+        }
+        a.n_sol = m;
         a.solved_valid = true;
         a.piece_valid = false;
     }

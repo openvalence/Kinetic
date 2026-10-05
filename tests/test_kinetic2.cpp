@@ -10,6 +10,10 @@
 
 #include "kinetic2/engine.hpp"
 
+#ifndef KINETIC2_FINGERPRINT
+#define KINETIC2_FINGERPRINT 0xaf187335dc85dfa1ull   // accepted 2026-10-05: solver with drops, relaxation, end rest
+#endif
+
 using namespace kinetic2;
 
 namespace {
@@ -371,4 +375,123 @@ TEST_CASE("segments become knots at anchor plus duration with the authored end v
     CHECK(junctionOf(k) == Junction::Authored);
     CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, true, 0.0f, 0, Family::C1)) == Junction::Hard);
     CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, false, 0.0f, 0, Family::C2)) == Junction::Smooth);
+}
+
+// ---- the property suite (kin-vcr) --------------------------------------------
+
+namespace {
+
+// A small deterministic PRNG (xorshift32): the same sequences on every host.
+struct Rng {
+    uint32_t s;
+    explicit Rng(uint32_t seed) : s(seed ? seed : 1u) {}
+    uint32_t next() { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; }
+    float uni(float lo, float hi) { return lo + (hi - lo) * float(next() % 10000u) / 9999.0f; }
+    int pick(int n) { return int(next() % uint32_t(n)); }
+};
+
+// FNV-1a over the sampled states: a run's fingerprint.
+uint64_t fingerprint(const std::vector<State>& s) {
+    uint64_t h = 1469598103934665603ull;
+    for (const State& x : s) {
+        const unsigned char* b = reinterpret_cast<const unsigned char*>(&x);
+        for (size_t i = 0; i < sizeof(State); ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    }
+    return h;
+}
+
+struct Score { int knots = 0, hit = 0, spent = 0, violations = 0, overshoots = 0, failed = 0; float amplitude = 1.0f; int why[5] = {}; };
+
+// Random knot sequences: free, authored and hard knots, legal and not, over a
+// random policy and ceilings. Returns the sampled score.
+Score randomRun(uint32_t seed, Policy policy) {
+    Rng r(seed);
+    Config cfg;
+    cfg.limits = {r.uni(1.0f, 8.0f), r.uni(10.0f, 200.0f), r.uni(200.0f, 20000.0f)};
+    cfg.policy = policy; cfg.amplitude_floor = r.uni(0.05f, 0.4f);
+    Engine<> e(cfg, r.uni(0.0f, 1.0f));
+    const int n = 3 + r.pick(20);
+    std::vector<Knot> ks;
+    uint64_t t = 0;
+    for (int i = 0; i < n; ++i) {
+        t += uint64_t(r.uni(20.0f, 600.0f) * 1000.0f);
+        Knot k; k.t_us = t; k.p = r.uni(0.0f, 1.0f);
+        const int kind = r.pick(3);
+        if (kind == 1) { k.has_v = true; k.v = r.uni(-cfg.limits.vmax, cfg.limits.vmax); k.family = Family::C2; }
+        if (kind == 2) { k.has_v = true; k.v = 0.0f; k.family = Family::C1; }
+        if (kind == 0) k.family = Family::C2;
+        ks.push_back(k);
+    }
+    // Submit everything up front (a scheduled bundle), then sample through.
+    for (const Knot& k : ks) REQUIRE(e.submit(k, 0));
+    std::vector<State> s;
+    const uint64_t end = t + 300 * kMs;
+    // Sample past the sender's end until the engine is idle: Stretch may have
+    // moved the last knot (a 30 s cap guards the loop).
+    for (uint64_t x = 0;; x += kMs) {
+        s.push_back(e.stateAt(0, x));
+        if ((x >= end && !e.isBusy(x)) || x > 30000 * kMs) break;
+    }
+    Score sc; sc.knots = n;
+    const Peaks pk = peaksOf(s);
+    if (pk.v > cfg.limits.vmax * 1.01f) { ++sc.violations; ++sc.why[0]; }
+    if (pk.a > cfg.limits.amax * 1.01f) { ++sc.violations; ++sc.why[1]; }
+    if (pk.j > cfg.limits.jmax * 1.10f) { ++sc.violations; ++sc.why[2]; }   // finite difference over 1 ms
+    if (pk.lo < -1e-3f || pk.hi > 1.0f + 1e-3f) { ++sc.violations; ++sc.why[3]; }
+    const auto an = drain(e);
+    sc.failed = countKind(an, AnomalyKind::PlanFailed);
+    sc.spent = countKind(an, AnomalyKind::WaveformScaled) + countKind(an, AnomalyKind::DeadlineStretched);
+    // Every knot not spent is hit at its time, at rest if hard.
+    for (const Knot& k : ks) {
+        const size_t idx = size_t(k.t_us / kMs);
+        bool spentHere = false;
+        for (const Anomaly& a : an) if ((a.kind == uint8_t(AnomalyKind::WaveformScaled) || a.kind == uint8_t(AnomalyKind::DeadlineStretched) || a.kind == uint8_t(AnomalyKind::PlanFailed)) && std::fabs(a.target - k.p) < 1e-3f) spentHere = true;
+        if (policy == Policy::Stretch && sc.spent) break;   // times moved: the index no longer applies after the first stretch
+        if (!spentHere && idx < s.size()) {
+            if (std::fabs(s[idx].p - k.p) < 2e-3f) ++sc.hit;
+        }
+    }
+    // The curve ends at rest on the last knot's solved position.
+    if (std::fabs(s.back().v) > 1e-3f) { ++sc.violations; ++sc.why[4]; }
+    return sc;
+}
+
+}  // namespace
+
+TEST_CASE("property: random knot sequences never exceed a ceiling or the window, under either policy") {
+    int runs = 0, violations = 0, spent = 0, hits = 0, knots = 0, failed = 0, why[5] = {}, withFail = 0, withoutFail = 0;
+    for (uint32_t seed = 1; seed <= 400; ++seed) {
+        for (const Policy pol : {Policy::Blend, Policy::Stretch}) {
+            const Score sc = randomRun(seed, pol);
+            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; knots += sc.knots; failed += sc.failed;
+            for (int w = 0; w < 5; ++w) why[w] += sc.why[w];
+            if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
+            if (sc.violations && (withFail + withoutFail) <= 6) MESSAGE("seed " << seed << " policy " << int(pol) << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " failed " << sc.failed);
+        }
+    }
+    MESSAGE(runs << " runs, " << knots << " knots, " << hits << " hit exactly, " << spent << " spent, " << failed << " PlanFailed, " << violations
+            << " violations (v " << why[0] << ", a " << why[1] << ", j " << why[2] << ", window " << why[3] << ", rest " << why[4] << "); runs with violations: " << withFail << " with PlanFailed, " << withoutFail << " without");
+    CHECK(violations == 0);
+    CHECK(hits > 0);
+}
+
+TEST_CASE("fingerprint: the canonical run has not changed bits") {
+    // A fixed scenario covering every junction kind and both spends. The
+    // constant below is the hash of the accepted output; a change here is a
+    // change in rendered motion and must be deliberate (update the constant
+    // in the same commit, say why).
+    Config cfg; cfg.limits = {4.0f, 60.0f, 3000.0f}; cfg.policy = Policy::Blend; cfg.amplitude_floor = 0.2f;
+    Engine<> e(cfg, 0.3f);
+    REQUIRE(e.submit(knotAt(150 * kMs, 0.9f), 0));
+    REQUIRE(e.submit(knotAt(260 * kMs, 0.1f, true, -1.0f), 0));
+    REQUIRE(e.submit(knotAt(500 * kMs, 0.7f, true, 0.0f, Family::C1), 0));
+    REQUIRE(e.submit(knotAt(520 * kMs, 0.95f), 0));
+    REQUIRE(e.submit(knotAt(900 * kMs, 0.4f), 0));
+    std::vector<State> s;
+    for (uint64_t t = 0; t <= 1000 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+    e.brake(1000 * kMs);
+    for (uint64_t t = 1000 * kMs; t <= 1200 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+    const uint64_t fp = fingerprint(s);
+    MESSAGE("fingerprint 0x" << std::hex << fp);
+    CHECK(fp == KINETIC2_FINGERPRINT);
 }

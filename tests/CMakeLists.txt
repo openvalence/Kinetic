@@ -14,3 +14,11 @@ target_include_directories(test_kinetic2 PRIVATE third_party)
 target_compile_options(test_kinetic2 PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>)
 add_test(NAME test_kinetic2 COMMAND test_kinetic2)
+
+# Kinetic 1 as the oracle for Kinetic²: the one binary that links both.
+add_executable(test_kinetic2_oracle test_kinetic2_oracle.cpp)
+target_link_libraries(test_kinetic2_oracle PRIVATE kinetic::kinetic kinetic::kinetic2)
+target_include_directories(test_kinetic2_oracle PRIVATE third_party)
+target_compile_options(test_kinetic2_oracle PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall>)
+add_test(NAME test_kinetic2_oracle COMMAND test_kinetic2_oracle)
