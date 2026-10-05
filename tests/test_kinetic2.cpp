@@ -325,3 +325,50 @@ TEST_CASE("a hard stop keeps its speed longer than a smooth stop and lands at re
     for (const State& x : hard) a_hard = std::min(a_hard, x.a);
     CHECK(a_hard <= -cfg.limits.amax * 0.98f);
 }
+
+// ---- sources: one sample behind (kin-ob3) ------------------------------------
+#include "kinetic2/sources.hpp"
+
+TEST_CASE("a sample stream renders one behind and never overshoots a dead stop") {
+    // The scrub that overshot on the bench (Phosphor ph-ffsk, Nucleus val-1bf):
+    // 60 Hz samples racing across the window, then the pointer stops dead.
+    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
+    const uint32_t latency = 40 * kMs;   // the grant's schedule_latency_us
+    Engine<> e(cfg, 0.1f);
+    const uint64_t dt = 16667;           // 60 Hz
+    uint64_t t = 0;
+    float p = 0.1f;
+    std::vector<State> s;
+    auto sampleUntil = [&](uint64_t until) { for (; t < until; t += kMs) s.push_back(e.stateAt(0, t)); };
+    // 20 samples moving fast (0.03 per sample = 1.8 units/s), then 30 samples parked at the stop.
+    for (int i = 0; i < 50; ++i) {
+        if (i < 20) p += 0.03f;
+        REQUIRE(e.submit(knotFromSample(p, t, latency), t));
+        sampleUntil(t + dt);
+    }
+    sampleUntil(t + 200 * kMs);
+    const float stop = p;
+    float hi = -1.0f;
+    for (const State& x : s) hi = std::max(hi, x.p);
+    CHECK(hi <= stop + 1e-4f);                    // no overshoot past the last sample
+    CHECK(s.back().p == doctest::Approx(stop).epsilon(1e-4));
+    CHECK(s.back().v == 0.0f);
+    // One behind: the curve passes each moving sample `latency` after it arrived.
+    const State at_k10 = e.stateAt(0, 10 * dt + latency);
+    (void)at_k10;   // the engine's clock has moved on; the sweep is the record
+    const size_t idx = size_t((10 * dt + latency) / kMs);
+    CHECK(s[idx].p == doctest::Approx(0.1f + 11 * 0.03f).epsilon(2e-2));
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+}
+
+TEST_CASE("segments become knots at anchor plus duration with the authored end velocity") {
+    const Knot k = knotFromSegment(0.7f, 250 * kMs, true, -1.5f, 1000 * kMs, Family::C1);
+    CHECK(k.t_us == 1250 * kMs);
+    CHECK(k.p == 0.7f);
+    CHECK(k.has_v); CHECK(k.v == -1.5f);
+    CHECK(junctionOf(k) == Junction::Authored);
+    CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, true, 0.0f, 0, Family::C1)) == Junction::Hard);
+    CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, false, 0.0f, 0, Family::C2)) == Junction::Smooth);
+}
