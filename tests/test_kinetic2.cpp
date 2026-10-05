@@ -57,7 +57,8 @@ TEST_CASE("a fresh engine holds its seed") {
 }
 
 TEST_CASE("knots are hit at their times and the curve is continuous") {
-    Engine<> e(Config{}, 0.2f);
+    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
+    Engine<> e(cfg, 0.2f);
     const uint64_t now = 1000 * kMs;
     REQUIRE(e.submit(knotAt(now + 200 * kMs, 0.8f), now));
     REQUIRE(e.submit(knotAt(now + 400 * kMs, 0.3f), now));
@@ -127,7 +128,8 @@ TEST_CASE("reset forgets everything and holds the new position") {
 
 TEST_CASE("same calls in, same bits out") {
     auto run = [] {
-        Engine<> e(Config{}, 0.25f);
+        Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
+        Engine<> e(cfg, 0.25f);
         e.submit(knotAt(150 * kMs, 0.75f), 0);
         e.submit(knotAt(333 * kMs, 0.4f, true, -0.3f), 0);
         e.submit(knotAt(777 * kMs, 0.6f), 0);
@@ -141,11 +143,128 @@ TEST_CASE("same calls in, same bits out") {
 }
 
 TEST_CASE("two axes are independent") {
-    Engine<2> e(Config{}, 0.5f);
+    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
+    Engine<2> e(cfg, 0.5f);
     REQUIRE(e.submit(0, knotAt(200 * kMs, 0.9f), 0));
     REQUIRE(e.submit(1, knotAt(300 * kMs, 0.1f), 0));
     CHECK(e.stateAt(0, 200 * kMs).p == doctest::Approx(0.9f).epsilon(1e-4));
     CHECK(e.stateAt(1, 200 * kMs).p != doctest::Approx(0.9f));
     CHECK(e.stateAt(1, 300 * kMs).p == doctest::Approx(0.1f).epsilon(1e-4));
     CHECK(e.stateAt(0, 300 * kMs).p == doctest::Approx(0.9f));
+}
+
+// ---- the solver (kin-ahl) ---------------------------------------------------
+
+namespace {
+
+struct Peaks { float v = 0, a = 0, j = 0, lo = 1e9f, hi = -1e9f; };
+
+// Peaks of the sampled trajectory on a 1 ms grid; jerk by finite difference of a.
+Peaks peaksOf(const std::vector<State>& s) {
+    Peaks pk;
+    for (size_t i = 0; i < s.size(); ++i) {
+        pk.v = std::max(pk.v, std::fabs(s[i].v));
+        pk.a = std::max(pk.a, std::fabs(s[i].a));
+        pk.lo = std::min(pk.lo, s[i].p); pk.hi = std::max(pk.hi, s[i].p);
+        if (i) pk.j = std::max(pk.j, std::fabs(s[i].a - s[i - 1].a) / 1e-3f);
+    }
+    return pk;
+}
+
+std::vector<Anomaly> drain(Engine<>& e) {
+    std::vector<Anomaly> out; Anomaly an;
+    while (e.popAnomaly(an)) out.push_back(an);
+    return out;
+}
+int countKind(const std::vector<Anomaly>& v, AnomalyKind k, float* last_detail = nullptr) {
+    int n = 0;
+    for (const Anomaly& an : v) if (an.kind == uint8_t(k)) { ++n; if (last_detail) *last_detail = an.detail; }
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("a legal script keeps every ceiling in sampled reality") {
+    Config cfg; cfg.limits = {3.0f, 30.0f, 500.0f};
+    Engine<> e(cfg, 0.2f);
+    // A gentle stroke chain: 0.6 of travel per 500 ms (rest-to-rest peaks:
+    // v 2.25, a 13.9, j 288), under every ceiling.
+    for (int i = 1; i <= 6; ++i) REQUIRE(e.submit(knotAt(uint64_t(i) * 500 * kMs, (i % 2) ? 0.8f : 0.2f), 0));
+    const auto s = sweep(e, 0, 3200 * kMs);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.05f);    // finite difference over 1 ms
+    CHECK(pk.lo >= -1e-4f); CHECK(pk.hi <= 1.0f + 1e-4f);
+    for (int i = 1; i <= 6; ++i) CHECK(s[size_t(i) * 500].p == doctest::Approx((i % 2) ? 0.8f : 0.2f).epsilon(1e-4));
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::WaveformScaled) == 0);
+    CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
+    CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
+}
+
+TEST_CASE("free knots never overshoot between two knots") {
+    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
+    Engine<> e(cfg, 0.1f);
+    // A staircase: monotone rising steps then a plateau. No dip, no bulge.
+    const float ps[] = {0.3f, 0.5f, 0.52f, 0.9f, 0.9f, 0.9f};
+    for (int i = 0; i < 6; ++i) REQUIRE(e.submit(knotAt(uint64_t(i + 1) * 100 * kMs, ps[i]), 0));
+    const auto s = sweep(e, 0, 600 * kMs);
+    for (size_t i = 1; i < s.size(); ++i) CHECK(s[i].p >= s[i - 1].p - 1e-4f);   // monotone rise
+    CHECK(peaksOf(s).hi <= 0.9f + 1e-4f);
+}
+
+TEST_CASE("Blend trims an impossible stroke to the ceilings and reports the share") {
+    Config cfg; cfg.limits = {2.0f, 50.0f, 5000.0f}; cfg.policy = Policy::Blend; cfg.amplitude_floor = 0.05f;
+    Engine<> e(cfg, 0.0f);
+    // Full travel in 120 ms: the accel ceiling allows about 0.125 of it.
+    REQUIRE(e.submit(knotAt(120 * kMs, 1.0f, true, 0.0f), 0));
+    const auto s = sweep(e, 0, 200 * kMs);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.05f);
+    CHECK(s[120].p < 1.0f);                 // amplitude spent
+    CHECK(s[120].p > cfg.amplitude_floor);  // but not below the floor
+    CHECK(s[120].v == doctest::Approx(0.0f).epsilon(1e-3));   // deadline and the stop kept
+    float share = 0.0f;
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::WaveformScaled, &share) == 1);
+    CHECK(share == doctest::Approx(s[120].p).epsilon(1e-3));
+    CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
+}
+
+TEST_CASE("Stretch keeps the stroke, moves the knot and everything after it") {
+    Config cfg; cfg.limits = {2.0f, 50.0f, 5000.0f}; cfg.policy = Policy::Stretch;
+    Engine<> e(cfg, 0.0f);
+    REQUIRE(e.submit(knotAt(120 * kMs, 1.0f, true, 0.0f), 0));
+    REQUIRE(e.submit(knotAt(620 * kMs, 0.5f, true, 0.0f), 0));
+    CHECK(e.isBusy(700 * kMs));             // the second knot moved past 700 ms
+    const auto s = sweep(e, 0, 1500 * kMs);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.hi >= 1.0f - 1e-3f);           // the full stroke happened
+    float added = 0.0f;
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::DeadlineStretched, &added) == 1);
+    CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
+    CHECK(added > 0.1f);
+    // The second knot moved by the same amount: it lands at 0.5 at 620 ms + added.
+    const size_t t2 = 620 + size_t(added * 1000.0f + 0.5f);
+    CHECK(s[t2].p == doctest::Approx(0.5f).epsilon(2e-3));
+}
+
+TEST_CASE("the rail is a wall: a reversal that would bulge past it is spent") {
+    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f}; cfg.policy = Policy::Blend; cfg.amplitude_floor = 0.1f;
+    Engine<> e(cfg, 0.5f);
+    // Arrive at the top rail fast and leave fast: the authored velocities would
+    // carry the curve past 1.0 between the knots.
+    REQUIRE(e.submit(knotAt(100 * kMs, 1.0f, true, 4.0f), 0));
+    REQUIRE(e.submit(knotAt(200 * kMs, 0.5f, true, 0.0f), 0));
+    const auto s = sweep(e, 0, 250 * kMs);
+    CHECK(peaksOf(s).hi <= 1.0f + 1e-4f);
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::EndVelClamped) >= 1);
+    CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
 }

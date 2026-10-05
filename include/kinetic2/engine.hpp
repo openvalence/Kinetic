@@ -7,67 +7,22 @@
 //   it, from the state the previous piece ends in, so the rendered curve is
 //   continuous in p and v by construction. Sampling is polynomial evaluation.
 // - Single-threaded: every call on one Engine comes from one task.
-// - SKELETON (kin-nb9): pieces are quintic Hermite through consecutive knots
-//   with junction velocities taken as authored or estimated from the chord,
-//   junction acceleration 0, and NO ceiling referee yet. The lookahead solver
-//   (kin-ahl) replaces pieceFor(); the brake profile (kin-4gd) replaces the
-//   trapezoid estimate in brake(). Both are marked below.
+// - The pending window is solved as a whole (solver.hpp) whenever it changes,
+//   lazily at the next sample: junction values, the referee, the spend. A
+//   piece is then one solved interval. The brake profile (kin-4gd) replaces
+//   the trapezoid estimate in brake(), marked below.
 #pragma once
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 
+#include "engine_piece.hpp"
+#include "solver.hpp"
 #include "timeline.hpp"
 #include "types.hpp"
 
 namespace kinetic2 {
-
-// A quintic Hermite piece in normalized tau over T seconds, from (p0, v0, a0)
-// at tau = 0 to (p1, v1, a1) at tau = 1. Coefficients in tau; the derivatives
-// are scaled back by T on evaluation.
-struct Piece {
-    uint64_t start_us = 0;
-    uint64_t end_us   = 0;
-    float    T        = 0.0f;   // seconds; 0 = a hold at c[0]
-    float    c[6]     = {};
-
-    static Piece hold(float p, uint64_t from) {
-        Piece h; h.start_us = from; h.end_us = from; h.T = 0.0f; h.c[0] = p;
-        return h;
-    }
-
-    static Piece hermite(uint64_t t0, const State& s0, uint64_t t1, const State& s1) {
-        Piece q; q.start_us = t0; q.end_us = t1;
-        const float T = float(t1 - t0) * 1e-6f;
-        q.T = T;
-        // Boundary derivatives in tau units.
-        const float p0 = s0.p, m0 = s0.v * T, k0 = s0.a * T * T;
-        const float p1 = s1.p, m1 = s1.v * T, k1 = s1.a * T * T;
-        q.c[0] = p0;
-        q.c[1] = m0;
-        q.c[2] = 0.5f * k0;
-        q.c[3] = 10.0f * (p1 - p0) - 6.0f * m0 - 4.0f * m1 - 1.5f * k0 + 0.5f * k1;
-        q.c[4] = -15.0f * (p1 - p0) + 8.0f * m0 + 7.0f * m1 + 1.5f * k0 - k1;
-        q.c[5] = 6.0f * (p1 - p0) - 3.0f * (m0 + m1) - 0.5f * (k0 - k1);
-        return q;
-    }
-
-    State at(uint64_t t) const {
-        State s;
-        if (T <= 0.0f) { s.p = c[0]; return s; }
-        float tau = float(t - start_us) * 1e-6f / T;
-        if (tau < 0.0f) tau = 0.0f;
-        if (tau > 1.0f) tau = 1.0f;
-        const float t2 = tau * tau, t3 = t2 * tau, t4 = t3 * tau, t5 = t4 * tau;
-        s.p = c[0] + c[1] * tau + c[2] * t2 + c[3] * t3 + c[4] * t4 + c[5] * t5;
-        const float dp = c[1] + 2.0f * c[2] * tau + 3.0f * c[3] * t2 + 4.0f * c[4] * t3 + 5.0f * c[5] * t4;
-        const float ddp = 2.0f * c[2] + 6.0f * c[3] * tau + 12.0f * c[4] * t2 + 20.0f * c[5] * t3;
-        s.v = dp / T;
-        s.a = ddp / (T * T);
-        return s;
-    }
-};
 
 template <size_t DoF = 1, size_t Capacity = 64>
 class Engine {
@@ -97,10 +52,13 @@ public:
         if (!std::isfinite(k.p) || (k.has_v && !std::isfinite(k.v))) return refuse(k, now_us, kDetailNonFinite);
         if (k.t_us <= now_us) return refuse(k, now_us, kDetailPast);
         if (a.tl.full()) return refuse(k, now_us, kDetailTimelineFull);
+        // An axis at rest has been holding since its origin: the first piece
+        // starts now, not when the hold began.
+        if (a.tl.empty()) a.origin_us = now_us;
         if (!a.tl.push(k)) return refuse(k, now_us, kDetailPast);
-        // A piece already built toward "nothing after this knot" assumed a
-        // stop there; a successor changes that junction, so rebuild lazily.
-        a.piece_valid = false;
+        // A successor changes the junction of the knot before it: re-solve
+        // the window lazily, at the next sample.
+        a.solved_valid = false;
         return true;
     }
     bool submit(const Knot& k, uint64_t now_us) { return submit(0, k, now_us); }
@@ -114,11 +72,12 @@ public:
             Axis& a = _ax[ax];
             const State s = stateAt(ax, now_us);
             a.tl.clear();
-            a.piece_valid = false;
+            a.solved_valid = false;
             a.origin = s;
             a.origin_us = now_us;
             if (std::fabs(s.v) > 1e-6f) {
-                const float t_stop = std::fabs(s.v) / _cfg.limits.amax;
+                // Stop time of a jerk-limited decel: ramp in, hold amax, ramp out.
+                const float t_stop = std::fabs(s.v) / _cfg.limits.amax + _cfg.limits.amax / _cfg.limits.jmax;
                 Knot stop;
                 stop.t_us = now_us + uint64_t(t_stop * 1e6f) + 1;
                 stop.p = s.p + 0.5f * s.v * t_stop;
@@ -133,13 +92,16 @@ public:
     // ---- sampling -----------------------------------------------------------
     State stateAt(size_t axis, uint64_t now_us) {
         Axis& a = _ax[axis];
-        // Retire knots the clock has passed; their end state becomes the origin.
-        while (!a.tl.empty() && a.tl.at(0).t_us <= now_us) {
-            ensurePiece(a);
-            a.origin = a.piece.at(a.tl.at(0).t_us);
-            a.origin.a = 0.0f;   // skeleton: junction acceleration is 0
-            a.origin_us = a.tl.at(0).t_us;
+        // Retire knots the clock has passed (at their SOLVED time: Stretch may
+        // have moved them); the solved junction state becomes the origin.
+        ensureSolved(a);
+        while (!a.tl.empty() && a.sol[0].t_us <= now_us) {
+            const Solved& k = a.sol[0];
+            a.origin = State{k.p, k.v, k.a};
+            a.origin_us = k.t_us;
             a.tl.popFront();
+            for (size_t i = 0; i + 1 < a.n_sol; ++i) a.sol[i] = a.sol[i + 1];
+            if (a.n_sol) --a.n_sol;
             a.piece_valid = false;
         }
         ensurePiece(a);
@@ -148,11 +110,13 @@ public:
     float positionAt(uint64_t now_us) { return stateAt(0, now_us).p; }
     float velocityAt(uint64_t now_us) { return stateAt(0, now_us).v; }
 
-    // Motion left to render on any axis.
-    bool isBusy(uint64_t now_us) const {
+    // Motion left to render on any axis. Solves first: Stretch may have moved
+    // the last knot past the time the sender asked for.
+    bool isBusy(uint64_t now_us) {
         for (size_t ax = 0; ax < DoF; ++ax) {
-            const Axis& a = _ax[ax];
-            if (!a.tl.empty() && a.tl.newest().t_us > now_us) return true;
+            Axis& a = _ax[ax];
+            ensureSolved(a);
+            if (a.n_sol && a.sol[a.n_sol - 1].t_us > now_us) return true;
             if (a.tl.empty() && std::fabs(a.origin.v) > 1e-6f) return true;
         }
         return false;
@@ -176,6 +140,9 @@ private:
         Timeline<Capacity> tl;
         State    origin{};         // the state the next piece starts from
         uint64_t origin_us = 0;
+        Solved   sol[Capacity]{};  // the solved window, aligned with tl
+        size_t   n_sol = 0;
+        bool     solved_valid = false;
         Piece    piece{};
         bool     piece_valid = false;
     };
@@ -185,30 +152,36 @@ private:
         a.tl.clear();
         a.origin = State{p, 0.0f, 0.0f};
         a.origin_us = now_us;
+        a.n_sol = 0;
+        a.solved_valid = true;
         a.piece = Piece::hold(p, now_us);
         a.piece_valid = true;
     }
 
-    // The piece from the origin to the first pending knot, or a hold.
-    // SKELETON junction rule: the end velocity is the knot's when authored,
-    // else the chord slope toward the knot after it (0 when none follows).
+    // Solve the whole pending window from the origin. Knots are copied out of
+    // the ring once so the solver sees them contiguous.
+    void ensureSolved(Axis& a) {
+        if (a.solved_valid) return;
+        Knot tmp[Capacity];
+        const size_t n = a.tl.size();
+        for (size_t i = 0; i < n; ++i) tmp[i] = a.tl.at(i);
+        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol,
+                    [this](AnomalyKind k, uint64_t t, float target, float detail) { record(k, t, target, detail); });
+        a.n_sol = n;
+        a.solved_valid = true;
+        a.piece_valid = false;
+    }
+
+    // The piece from the origin to the first solved knot, or a hold.
     void ensurePiece(Axis& a) {
+        ensureSolved(a);   // a re-solve invalidates the piece
         if (a.piece_valid) return;
-        if (a.tl.empty()) {
+        if (a.n_sol == 0) {
             a.piece = Piece::hold(a.origin.p, a.origin_us);
             a.origin.v = 0.0f; a.origin.a = 0.0f;
         } else {
-            const Knot& k = a.tl.at(0);
-            State end{k.p, 0.0f, 0.0f};
-            if (k.has_v) end.v = k.v;
-            else if (a.tl.size() >= 2) {
-                const Knot& n = a.tl.at(1);
-                const float Tn = float(n.t_us - k.t_us) * 1e-6f;
-                const float Tp = float(k.t_us - a.origin_us) * 1e-6f;
-                // Catmull-Rom style: the slope across the neighbors.
-                end.v = (n.p - a.origin.p) / (Tn + Tp);
-            }
-            a.piece = Piece::hermite(a.origin_us, a.origin, k.t_us, end);
+            const Solved& k = a.sol[0];
+            a.piece = Piece::hermite(a.origin_us, a.origin, k.t_us, State{k.p, k.v, k.a});
         }
         a.piece_valid = true;
     }
