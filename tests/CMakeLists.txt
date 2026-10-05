@@ -6,3 +6,11 @@ target_include_directories(test_kinetic PRIVATE third_party ../wasm)
 target_compile_options(test_kinetic PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall>)
 add_test(NAME test_kinetic COMMAND test_kinetic)
+
+# Kinetic²: its own binary, no Ruckig in the link.
+add_executable(test_kinetic2 test_kinetic2.cpp)
+target_link_libraries(test_kinetic2 PRIVATE kinetic::kinetic2)
+target_include_directories(test_kinetic2 PRIVATE third_party)
+target_compile_options(test_kinetic2 PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>)
+add_test(NAME test_kinetic2 COMMAND test_kinetic2)
