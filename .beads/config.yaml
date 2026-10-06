@@ -66,3 +66,6 @@
 # - github.token    → use GITHUB_TOKEN env var instead
 
 sync.remote: "git+https://github.com/openvalence/Kinetic.git"
+export:
+    auto: true
+    git-add: false
