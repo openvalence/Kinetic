@@ -537,3 +537,95 @@ TEST_CASE("corner: cubic keeps the author's acceleration step as a jerk-limited 
     // The default is Continuous: a Config{} run matches Continuous bit for bit.
     Config d; CHECK(d.corner == Corner::Continuous);
 }
+
+// ---- the oscillation modulator (kin-b5g, RFC-103) -----------------------------
+#include "kinetic2/oscillator.hpp"
+
+namespace {
+// Sample the sum of a planned state stream and the oscillator at 1 ms.
+std::vector<State> oscSweep(Oscillator& o, const Limits& L, const std::vector<State>& planned, uint64_t t0 = 0) {
+    std::vector<State> s;
+    for (size_t i = 0; i < planned.size(); ++i) s.push_back(o.apply(planned[i], t0 + i * kMs, L, 0.0f, 1.0f));
+    return s;
+}
+std::vector<State> rest(float p, size_t n) { return std::vector<State>(n, State{p, 0.0f, 0.0f}); }
+}  // namespace
+
+TEST_CASE("oscillator: a sine at rest swings the asked amplitude at the asked period, inside the ceilings") {
+    const Limits L{5.0f, 200.0f, 20000.0f};
+    Oscillator o; OscParams p; p.enabled = true; p.frequency = 10.0f; p.amplitude = 0.02f; p.shape = OscShape::Sine; o.set(p);
+    const auto s = oscSweep(o, L, rest(0.5f, 2000));
+    float lo = 1, hi = 0; for (const State& x : s) { lo = std::min(lo, x.p); hi = std::max(hi, x.p); }
+    CHECK(hi == doctest::Approx(0.52f).epsilon(2e-3));
+    CHECK(lo == doctest::Approx(0.48f).epsilon(2e-3));
+    CHECK(o.amplitudeEffective() == doctest::Approx(0.02f));
+    // Period: the crest recurs every 100 ms.
+    size_t first = 0; for (size_t i = 1; i + 1 < 300; ++i) if (s[i].p > s[i - 1].p && s[i].p >= s[i + 1].p) { first = i; break; }
+    size_t second = 0; for (size_t i = first + 50; i + 1 < 400; ++i) if (s[i].p > s[i - 1].p && s[i].p >= s[i + 1].p) { second = i; break; }
+    CHECK(second - first == doctest::Approx(100).epsilon(0.03));
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= L.vmax * 1.001f); CHECK(pk.a <= L.amax * 1.001f); CHECK(pk.j <= L.jmax * 1.05f);
+    // 10 Hz at 0.02: v peak 1.26, a peak 79, j peak 4960: all under, so nothing was shed.
+    CHECK(pk.a > 70.0f);
+}
+
+TEST_CASE("oscillator: yields first; a full-speed stroke sheds it to nothing, half speed keeps part") {
+    const Limits L{4.0f, 60.0f, 2000.0f};
+    Oscillator o; OscParams p; p.enabled = true; p.frequency = 20.0f; p.amplitude = 0.05f; o.set(p);
+    std::vector<State> full(500, State{0.5f, 4.0f, 0.0f}), half(500, State{0.5f, 2.0f, 0.0f});
+    oscSweep(o, L, full);
+    CHECK(o.amplitudeEffective() == 0.0f);
+    CHECK_FALSE(o.active());
+    o.set(p);
+    const auto s = oscSweep(o, L, half);
+    CHECK(o.amplitudeEffective() > 0.0f);
+    CHECK(o.amplitudeEffective() < 0.05f);   // the jerk ceiling binds at 20 Hz
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= L.vmax * 1.001f); CHECK(pk.a <= L.amax * 1.001f); CHECK(pk.j <= L.jmax * 1.05f);
+}
+
+TEST_CASE("oscillator: every shape stays under the ceilings and inside its amplitude; dwells hold the extremes") {
+    const Limits L{5.0f, 300.0f, 30000.0f};
+    for (const OscShape sh : {OscShape::Sine, OscShape::Square, OscShape::Saw, OscShape::SawReverse}) {
+        Oscillator o; OscParams p; p.enabled = true; p.frequency = 4.0f; p.amplitude = 0.05f; p.shape = sh; p.dwell_crest = 0.3f; o.set(p);
+        const auto s = oscSweep(o, L, rest(0.5f, 2600));
+        const Peaks pk = peaksOf(s);
+        CHECK(pk.v <= L.vmax * 1.001f); CHECK(pk.a <= L.amax * 1.001f); CHECK(pk.j <= L.jmax * 1.05f);
+        CHECK(pk.hi <= 0.55f + 1e-3f); CHECK(pk.lo >= 0.45f - 1e-3f);
+        // Period with a 0.3 crest dwell: 1.3 / 4 Hz = 325 ms; the crest holds 75 ms of it.
+        const float crest = 0.5f + o.amplitudeEffective();   // the ramped shapes shed amplitude to the jerk ceiling
+        size_t atCrest = 0; for (size_t i = 325; i < 325 * 5; ++i) if (s[i].p > crest - 2e-3f) ++atCrest;
+        const float share = float(atCrest) / (325.0f * 4.0f);
+        // A saw arrives at its crest moving, so the saw shapes ignore dwells by design.
+        if (sh == OscShape::Sine || sh == OscShape::Square) CHECK(share >= 0.3f / 1.3f * 0.9f);
+        CHECK(o.amplitudeEffective() > 0.0f);
+    }
+}
+
+TEST_CASE("oscillator: never leaves the window and is bit-exact") {
+    const Limits L{5.0f, 300.0f, 30000.0f};
+    auto run = [&] {
+        Oscillator o; OscParams p; p.enabled = true; p.frequency = 3.0f; p.amplitude = 0.2f; o.set(p);
+        return oscSweep(o, L, rest(0.05f, 700));   // 0.05 from the low rail
+    };
+    const auto a = run(), b = run();
+    const Peaks pk = peaksOf(a);
+    CHECK(pk.lo >= -1e-6f);
+    CHECK(pk.hi <= 0.1f + 1e-3f);   // amplitude limited to the gap, 0.05
+    CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(State)) == 0);
+}
+
+TEST_CASE("oscillator over a planned stroke: the sum keeps every ceiling") {
+    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+    Engine<> e(cfg, 0.2f);
+    REQUIRE(e.submit(knotAt(600 * kMs, 0.8f, true, 0.0f), 0));
+    REQUIRE(e.submit(knotAt(1200 * kMs, 0.2f, true, 0.0f), 0));
+    Oscillator o; OscParams p; p.enabled = true; p.frequency = 8.0f; p.amplitude = 0.03f; o.set(p);
+    std::vector<State> sum;
+    for (uint64_t t = 0; t <= 1400 * kMs; t += kMs) sum.push_back(o.apply(e.stateAt(0, t), t, cfg.limits, 0.0f, 1.0f));
+    const Peaks pk = peaksOf(sum);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.10f);
+    CHECK(pk.lo >= -1e-3f); CHECK(pk.hi <= 1.0f + 1e-3f);
+}
