@@ -11,7 +11,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0xaf187335dc85dfa1ull   // accepted 2026-10-05: solver with drops, relaxation, end rest
+#define KINETIC2_FINGERPRINT 0x2ce1f4d526af88fcull   // accepted 2026-10-06: reaction horizon, minimum-jerk junctions, starvation brake
 #endif
 
 using namespace kinetic2;
@@ -176,8 +176,9 @@ TEST_CASE("same calls in, same bits out") {
 TEST_CASE("two axes are independent") {
     Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
     Engine<2> e(cfg, 0.5f);
-    REQUIRE(e.submit(0, knotAt(200 * kMs, 0.9f), 0));
-    REQUIRE(e.submit(1, knotAt(300 * kMs, 0.1f), 0));
+    // Authored rests: a free last knot continues at its secant and brakes past it.
+    REQUIRE(e.submit(0, knotAt(200 * kMs, 0.9f, true, 0.0f), 0));
+    REQUIRE(e.submit(1, knotAt(300 * kMs, 0.1f, true, 0.0f), 0));
     CHECK(e.stateAt(0, 200 * kMs).p == doctest::Approx(0.9f).epsilon(1e-4));
     CHECK(e.stateAt(1, 200 * kMs).p != doctest::Approx(0.9f));
     CHECK(e.stateAt(1, 300 * kMs).p == doctest::Approx(0.1f).epsilon(1e-4));
@@ -234,15 +235,19 @@ TEST_CASE("a legal script keeps every ceiling in sampled reality") {
     CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
 }
 
-TEST_CASE("free knots never overshoot between two knots") {
+TEST_CASE("free knots ring by less than 0.2 percent of the window at a kink") {
     Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
     Engine<> e(cfg, 0.1f);
-    // A staircase: monotone rising steps then a plateau. No dip, no bulge.
+    // A staircase: monotone rising steps then a plateau. The minimum-jerk
+    // junctions may dip a hair at the kink; never more than this, never a bulge.
     const float ps[] = {0.3f, 0.5f, 0.52f, 0.9f, 0.9f, 0.9f};
     for (int i = 0; i < 6; ++i) REQUIRE(e.submit(knotAt(uint64_t(i + 1) * 100 * kMs, ps[i]), 0));
     const auto s = sweep(e, 0, 600 * kMs);
-    for (size_t i = 1; i < s.size(); ++i) CHECK(s[i].p >= s[i - 1].p - 1e-4f);   // monotone rise
-    CHECK(peaksOf(s).hi <= 0.9f + 1e-4f);
+    float worst_dip = 0.0f, run_max = s[0].p;
+    for (size_t i = 1; i < s.size(); ++i) { run_max = std::max(run_max, s[i].p); worst_dip = std::max(worst_dip, run_max - s[i].p); }
+    CHECK(worst_dip <= 2e-3f);
+    CHECK(peaksOf(s).hi <= 0.9f + 2e-3f);
+    for (int i = 0; i < 6; ++i) CHECK(s[size_t(i + 1) * 100].p == doctest::Approx(ps[i]).epsilon(2e-3));
 }
 
 TEST_CASE("Blend trims an impossible stroke to the ceilings and reports the share") {
@@ -628,4 +633,59 @@ TEST_CASE("oscillator over a planned stroke: the sum keeps every ceiling") {
     CHECK(pk.a <= cfg.limits.amax * 1.001f);
     CHECK(pk.j <= cfg.limits.jmax * 1.10f);
     CHECK(pk.lo >= -1e-3f); CHECK(pk.hi <= 1.0f + 1e-3f);
+}
+
+// ---- continuity under submits in flight (the arbiter's measured 67 mm jump) ----
+
+TEST_CASE("a knot submitted mid-flight never moves the curve under the carriage") {
+    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+    for (const Policy pol : {Policy::Blend, Policy::Stretch}) {
+        cfg.policy = pol;
+        Engine<> e(cfg, 0.2f);
+        std::vector<State> s;
+        uint64_t t = 0;
+        // 250 ms C2 segments arriving every 250 ms, 125 ms ahead of their start, while sampling.
+        auto sampleUntil = [&](uint64_t until) { for (; t < until; t += kMs) s.push_back(e.stateAt(0, t)); };
+        float target = 0.8f;
+        for (int i = 0; i < 12; ++i) {
+            const uint64_t start = (i + 1) * 250 * kMs;
+            sampleUntil(start - 125 * kMs);
+            REQUIRE(e.submit(knotFromSegment(target, 250 * kMs, true, 0.0f, start, Family::C2), t));
+            target = target > 0.5f ? 0.2f : 0.8f;
+        }
+        sampleUntil(t + 600 * kMs);
+        float worst_jump = 0.0f;
+        for (size_t i = 1; i < s.size(); ++i) {
+            const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+            worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
+        }
+        CHECK(worst_jump <= 0.0f);
+        const Peaks pk = peaksOf(s);
+        CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+        CHECK(pk.a <= cfg.limits.amax * 1.001f);
+        CHECK(pk.j <= cfg.limits.jmax * 1.10f);
+    }
+}
+
+TEST_CASE("a 60 Hz scrub submitted while sampling stays continuous and one behind") {
+    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f}; cfg.policy = Policy::Stretch;
+    Engine<> e(cfg, 0.1f);
+    std::vector<State> s;
+    uint64_t t = 0; float p = 0.1f;
+    auto sampleUntil = [&](uint64_t until) { for (; t < until; t += kMs) s.push_back(e.stateAt(0, t)); };
+    int refused = 0;
+    for (int i = 0; i < 90; ++i) {
+        if (i < 40) p += 0.015f;
+        if (!e.submit(knotFromSample(p, t, 40 * kMs), t)) ++refused;
+        sampleUntil(t + 16667);
+    }
+    sampleUntil(t + 300 * kMs);
+    float worst_jump = 0.0f;
+    for (size_t i = 1; i < s.size(); ++i) {
+        const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+        worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
+    }
+    CHECK(worst_jump <= 0.0f);
+    CHECK(refused == 0);
+    CHECK(s.back().p == doctest::Approx(p).epsilon(1e-3));
 }

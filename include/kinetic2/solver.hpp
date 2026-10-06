@@ -146,6 +146,124 @@ struct Solved {
     uint64_t from_us = 0;
 };
 
+// ---- minimum-jerk junctions ----------------------------------------------------
+// The free junction velocities and accelerations of a chain of quintic pieces
+// through fixed knot positions are the ones that minimize the chain's jerk
+// energy: a quadratic in the unknowns, one banded linear solve. Local
+// estimates (monotone slopes, centered-difference accelerations) were tried
+// first and whipped a 60 Hz stream into reversals under re-planning; the
+// global minimum never amplifies (RFC-105 workflow (aa)).
+// Double here on purpose: the per-interval weights scale as 1 / T^5 and float
+// cannot hold the spread between a 6 ms and a 600 ms interval.
+namespace jerk {
+
+inline constexpr size_t kMaxKnots = 64;
+inline constexpr size_t kMaxUnknowns = 2 * kMaxKnots;
+inline constexpr int kHalfBand = 4;   // a knot's two unknowns couple with its neighbors' two
+
+// Jerk energy of one quintic Hermite piece as a quadratic form in
+// x = [p0, v0, a0, p1, v1, a1] (real units): E = x^T K x.
+inline void pieceEnergy(double T, double K[6][6]) {
+    // c = M x: the tau-polynomial coefficients c3, c4, c5 (c0..c2 carry no jerk).
+    const double T2 = T * T;
+    const double M[3][6] = {
+        {-10.0, -6.0 * T, -1.5 * T2, 10.0, -4.0 * T, 0.5 * T2},
+        {15.0, 8.0 * T, 1.5 * T2, -15.0, 7.0 * T, -T2},
+        {-6.0, -3.0 * T, -0.5 * T2, 6.0, -3.0 * T, 0.5 * T2},
+    };
+    // Gram matrix of the jerk basis (6, 24 tau, 60 tau^2) over 0..1.
+    const double G[3][3] = {{36.0, 72.0, 120.0}, {72.0, 192.0, 360.0}, {120.0, 360.0, 720.0}};
+    const double w = 1.0 / (T2 * T2 * T);
+    for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) {
+            double acc = 0.0;
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) acc += M[i][r] * G[i][j] * M[j][c];
+            K[r][c] = w * acc;
+        }
+}
+
+// Knots 0..n-1 after the origin; t in seconds relative to the origin; v and a
+// are read for fixed ones and written for free ones.
+struct Chain {
+    size_t n = 0;
+    double t[kMaxKnots] = {}, p[kMaxKnots] = {}, v[kMaxKnots] = {}, a[kMaxKnots] = {};
+    bool   fix_v[kMaxKnots] = {}, fix_a[kMaxKnots] = {};
+    double p0 = 0.0, v0 = 0.0, a0 = 0.0;   // the origin, fixed
+};
+
+inline void solve(Chain& ch) {
+    if (ch.n == 0 || ch.n > kMaxKnots) return;
+    int idx_v[kMaxKnots], idx_a[kMaxKnots];
+    int m = 0;
+    for (size_t i = 0; i < ch.n; ++i) {
+        idx_v[i] = ch.fix_v[i] ? -1 : m++;
+        idx_a[i] = ch.fix_a[i] ? -1 : m++;
+    }
+    if (m == 0) return;
+    // Banded storage: A[r][kHalfBand + (c - r)].
+    static thread_local double A[kMaxUnknowns][2 * kHalfBand + 1];
+    static thread_local double b[kMaxUnknowns];
+    for (int r = 0; r < m; ++r) { b[r] = 0.0; for (int c = 0; c < 2 * kHalfBand + 1; ++c) A[r][c] = 0.0; }
+    double K[6][6];
+    for (size_t k = 0; k < ch.n; ++k) {
+        const double t_prev = k ? ch.t[k - 1] : 0.0;
+        const double T = ch.t[k] - t_prev;
+        if (!(T > 0.0)) continue;
+        pieceEnergy(T, K);
+        // x components: index into unknowns (or -1) and their known values.
+        int    ux[6];
+        double xv[6];
+        ux[0] = -1; xv[0] = k ? ch.p[k - 1] : ch.p0;
+        ux[1] = k ? idx_v[k - 1] : -1; xv[1] = k ? ch.v[k - 1] : ch.v0;
+        ux[2] = k ? idx_a[k - 1] : -1; xv[2] = k ? ch.a[k - 1] : ch.a0;
+        ux[3] = -1; xv[3] = ch.p[k];
+        ux[4] = idx_v[k]; xv[4] = ch.v[k];
+        ux[5] = idx_a[k]; xv[5] = ch.a[k];
+        for (int r = 0; r < 6; ++r) {
+            if (ux[r] < 0) continue;
+            for (int c = 0; c < 6; ++c) {
+                if (ux[c] >= 0) {
+                    const int d = ux[c] - ux[r];
+                    if (d < -kHalfBand || d > kHalfBand) continue;   // never, by ordering
+                    A[ux[r]][kHalfBand + d] += K[r][c];
+                } else {
+                    b[ux[r]] -= K[r][c] * xv[c];
+                }
+            }
+        }
+    }
+    // Banded Gaussian elimination, no pivoting: the energy form is positive
+    // definite on the unknowns once every position is fixed.
+    for (int r = 0; r < m; ++r) {
+        const double piv = A[r][kHalfBand];
+        if (!(std::fabs(piv) > 1e-300)) continue;
+        for (int rr = r + 1; rr <= r + kHalfBand && rr < m; ++rr) {
+            const int off = rr - r;   // A[rr][kHalfBand - off] is the entry under the pivot
+            const double f = A[rr][kHalfBand - off] / piv;
+            if (f == 0.0) continue;
+            for (int cc = r; cc <= r + kHalfBand && cc < m; ++cc) {
+                const int dr = cc - r, drr = cc - rr;
+                A[rr][kHalfBand + drr] -= f * A[r][kHalfBand + dr];
+            }
+            b[rr] -= f * b[r];
+        }
+    }
+    double x[kMaxUnknowns];
+    for (int r = m - 1; r >= 0; --r) {
+        double acc = b[r];
+        for (int cc = r + 1; cc <= r + kHalfBand && cc < m; ++cc) acc -= A[r][kHalfBand + (cc - r)] * x[cc];
+        const double piv = A[r][kHalfBand];
+        x[r] = std::fabs(piv) > 1e-300 ? acc / piv : 0.0;
+    }
+    for (size_t i = 0; i < ch.n; ++i) {
+        if (idx_v[i] >= 0) ch.v[i] = x[idx_v[i]];
+        if (idx_a[i] >= 0) ch.a[i] = x[idx_a[i]];
+    }
+}
+
+}  // namespace jerk
+
 // ---- the solver --------------------------------------------------------------
 // knots[0..n) pending, in time order; origin is the state the first piece
 // starts from. Writes out[0..n) and reports every spend through `report`.
@@ -169,38 +287,54 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         const uint64_t ta = a == size_t(-1) ? origin_us : out[a].t_us;
         return (out[b].p - pa) / (float(out[b].t_us - ta) * 1e-6f);
     };
-    // An authored velocity is honored within vmax and within what the rail
-    // allows: a velocity the fastest legal brake could not stop before the
-    // wall is illegal whatever follows, so it is cut to the one that can
-    // (EndVelClamped, reported once per knot). At the rail that is 0.
+    // A velocity at position p is honored within vmax and within what the
+    // rail allows on BOTH sides: the fastest legal stop ahead must fit, and so
+    // must the fastest legal run-up behind (the curve arrives from there). A
+    // velocity the brake could not stop before the wall is illegal whatever
+    // follows. Re-applied whenever p moves (a Blend trim moves it).
+    auto boundForRail = [&](float v, float p) -> float {
+        float cl = std::fmax(-L.vmax, std::fmin(L.vmax, v));
+        const float gap = std::fmin(hi - p, p - lo);
+        if (cl == 0.0f) return cl;
+        if (gap <= 1e-6f) return 0.0f;
+        // Stop distance of the fastest legal brake from speed u, at rest in
+        // acceleration: the ramp in and out each cover u * amax / (2 jmax)
+        // beyond the trapezoid's u^2 / (2 amax); a triangle stop is shorter.
+        auto stopDist = [&](float u) { return u * u / (2.0f * L.amax) + u * L.amax / (2.0f * L.jmax); };
+        if (stopDist(std::fabs(cl)) <= gap) return cl;
+        float u_lo = 0.0f, u_hi = std::fabs(cl);
+        for (int it = 0; it < 24; ++it) { const float m = 0.5f * (u_lo + u_hi); if (stopDist(m) <= gap) u_lo = m; else u_hi = m; }
+        return (cl > 0.0f ? 1.0f : -1.0f) * u_lo;
+    };
+    // An authored velocity, bounded (EndVelClamped, reported once per knot).
     auto authored = [&](size_t i) -> float {
         const float v = knots[i].v;
-        const float p = out[i].p;
-        float cl = std::fmax(-L.vmax, std::fmin(L.vmax, v));
-        // Room on both sides: the fastest legal stop ahead must fit, and so
-        // must the fastest legal run-up behind (the curve arrives from there).
-        const float gap = std::fmin(hi - p, p - lo);
-        if (cl != 0.0f) {
-            if (gap <= 1e-6f) cl = 0.0f;
-            else {
-                // Stop distance of the fastest legal brake from speed u, at rest
-                // in acceleration: the ramp in and out each cover u * amax / (2 jmax)
-                // beyond the trapezoid's u^2 / (2 amax); a triangle stop is shorter.
-                auto stopDist = [&](float u) { return u * u / (2.0f * L.amax) + u * L.amax / (2.0f * L.jmax); };
-                if (stopDist(std::fabs(cl)) > gap) {
-                    float u_lo = 0.0f, u_hi = std::fabs(cl);
-                    for (int it = 0; it < 24; ++it) { const float m = 0.5f * (u_lo + u_hi); if (stopDist(m) <= gap) u_lo = m; else u_hi = m; }
-                    cl = (cl > 0.0f ? 1.0f : -1.0f) * u_lo;
-                }
-            }
-        }
-        if (cl != v && !out[i].clamped) { out[i].clamped = true; report(AnomalyKind::EndVelClamped, out[i].t_us, p, cl); }
+        const float cl = boundForRail(v, out[i].p);
+        if (cl != v && !out[i].clamped) { out[i].clamped = true; report(AnomalyKind::EndVelClamped, out[i].t_us, out[i].p, cl); }
         return cl;
     };
     auto slopeAt = [&](size_t i) -> float {
         const Knot& k = knots[i];
         if (k.has_v) return authored(i);
-        if (i + 1 >= n) return 0.0f;   // nothing after: the curve rests here
+        // A free last knot is not the end of anything the solver can see: a
+        // live stream's newest sample has a successor on the way. It keeps the
+        // secant into it; if nothing arrives by the time it is reached, the
+        // engine brakes from there (starvation is the brake, RFC-105 (a)).
+        if (i + 1 >= n) {
+            // Bounded like an authored velocity: within vmax and stoppable
+            // before the rail, since the engine may have to brake from here.
+            float v = std::fmax(-L.vmax, std::fmin(L.vmax, secant(i == 0 ? size_t(-1) : i - 1, i)));
+            const float p = out[i].p;
+            const float gap = std::fmin(hi - p, p - lo);
+            auto stopDist = [&](float u) { return u * u / (2.0f * L.amax) + u * L.amax / (2.0f * L.jmax); };
+            if (v != 0.0f && gap <= 1e-6f) v = 0.0f;
+            else if (v != 0.0f && stopDist(std::fabs(v)) > gap) {
+                float u_lo = 0.0f, u_hi = std::fabs(v);
+                for (int it = 0; it < 24; ++it) { const float m = 0.5f * (u_lo + u_hi); if (stopDist(m) <= gap) u_lo = m; else u_hi = m; }
+                v = (v > 0.0f ? 1.0f : -1.0f) * u_lo;
+            }
+            return v;
+        }
         const float dl = secant(i == 0 ? size_t(-1) : i - 1, i), dr = secant(i, i + 1);
         if (dl == 0.0f || dr == 0.0f || (dl < 0.0f) != (dr < 0.0f)) return 0.0f;
         const float hl = float(out[i].t_us - (i == 0 ? origin_us : out[i - 1].t_us)) * 1e-6f;
@@ -208,14 +342,111 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         // Fritsch-Butland: a weighted harmonic mean, shape-preserving.
         return 3.0f * (hl + hr) / ((2.0f * hr + hl) / dl + (hr + 2.0f * hl) / dr);
     };
-    auto accelAt = [&](size_t i, float vi) -> float {
-        if (junctionOf(knots[i]) == Junction::Hard) return 0.0f;
-        if (i + 1 >= n) return 0.0f;
-        const float vl = i == 0 ? origin.v : out[i - 1].v;
-        const float vr = slopeAt(i + 1);
-        const uint64_t tl = i == 0 ? origin_us : out[i - 1].t_us;
-        (void)vi;
-        return (vr - vl) / (float(out[i + 1].t_us - tl) * 1e-6f);
+    // The junction values of every knot from `first` on, by minimum jerk over
+    // the accepted chain: pinned where authored, hard, relaxed, or the bounded
+    // secant of a free last knot; free otherwise. Dropped knots are skipped.
+    // Knots before `first` are fixed at their solved values.
+    auto junctions = [&](size_t first) {
+        jerk::Chain ch;
+        ch.p0 = origin.p; ch.v0 = origin.v; ch.a0 = origin.a;
+        size_t map[jerk::kMaxKnots]; size_t m = 0;
+        for (size_t i = 0; i < n && m < jerk::kMaxKnots; ++i) {
+            if (out[i].dropped) continue;
+            map[m] = i;
+            ch.t[m] = double(out[i].t_us - origin_us) * 1e-6;
+            ch.p[m] = out[i].p;
+            const bool hard = junctionOf(knots[i]) == Junction::Hard;
+            if (i < first || hard) { ch.v[m] = out[i].v; ch.a[m] = out[i].a; ch.fix_v[m] = ch.fix_a[m] = true; }
+            else {
+                // Velocity: pinned when authored, relaxed, or the last knot's
+                // bounded secant; free otherwise. Acceleration: pinned when
+                // relaxed and at the last knot (0: nothing is known beyond it,
+                // and an authored stop is a stop); free otherwise. A free
+                // sequence may ring by under 0.2 percent of the window at a
+                // kink, the price of the smoothest curve (RFC-105 (aa)).
+                ch.fix_v[m] = out[i].pin_v || knots[i].has_v || i + 1 >= n;
+                ch.v[m] = out[i].pin_v ? out[i].v : slopeAt(i);
+                ch.fix_a[m] = out[i].pin_a || i + 1 >= n;   // the last knot rests in acceleration: nothing is known beyond it
+                ch.a[m] = out[i].pin_a ? out[i].a : 0.0;
+            }
+            ++m;
+        }
+        ch.n = m;
+        jerk::solve(ch);
+        // Shape preservation: a free velocity may not exceed the monotone
+        // band of its two secants (three times the smaller, same sign; zero
+        // across a sign change), the Fritsch-Carlson condition, so a kink is
+        // never overshot. Accelerations are solved again under the clamped
+        // velocities. A stream's secants agree, so the band is wide there and
+        // the minimum-jerk velocities pass untouched.
+        bool clamped = false;
+        for (size_t k = 0; k < m; ++k) {
+            if (ch.fix_v[k]) continue;
+            const double pl = k ? ch.p[k - 1] : ch.p0, tl = k ? ch.t[k - 1] : 0.0;
+            const double dl = (ch.p[k] - pl) / std::fmax(ch.t[k] - tl, 1e-6);
+            const double dr = k + 1 < m ? (ch.p[k + 1] - ch.p[k]) / std::fmax(ch.t[k + 1] - ch.t[k], 1e-6) : dl;
+            double band = 0.0;
+            if (dl == 0.0 || dr == 0.0 || (dl < 0.0) != (dr < 0.0)) band = 0.0;
+            else band = 3.0 * std::fmin(std::fabs(dl), std::fabs(dr));
+            const double sgn = dl < 0.0 ? -1.0 : 1.0;
+            double v = ch.v[k];
+            if (band == 0.0) v = 0.0;
+            else if ((v < 0.0) != (sgn < 0.0)) v = 0.0;
+            else if (std::fabs(v) > band) v = sgn * band;
+            // And stoppable before the rail: any knot may turn out to be the
+            // last one (a dropped successor, a starved stream) and the engine
+            // then brakes from it.
+            if (v != 0.0) {
+                const double gap = std::fmin(hi - ch.p[k], ch.p[k] - lo);
+                auto stopDist = [&](double u) { return u * u / (2.0 * L.amax) + u * L.amax / (2.0 * L.jmax); };
+                if (gap <= 1e-6) v = 0.0;
+                else if (stopDist(std::fabs(v)) > gap) {
+                    double u_lo = 0.0, u_hi = std::fabs(v);
+                    for (int it = 0; it < 24; ++it) { const double mid = 0.5 * (u_lo + u_hi); if (stopDist(mid) <= gap) u_lo = mid; else u_hi = mid; }
+                    v = (v > 0.0 ? 1.0 : -1.0) * u_lo;
+                }
+            }
+            if (v != ch.v[k]) { ch.v[k] = v; ch.fix_v[k] = true; clamped = true; }
+        }
+        if (clamped) jerk::solve(ch);
+        // Monotone repair: a piece whose knots rise (or fall) must not turn
+        // back inside. A velocity sign change inside such a piece is the
+        // accelerations' doing; halve both junction accelerations, pin them,
+        // solve again; three rounds, then zero.
+        for (int round = 0; round < 4; ++round) {
+            bool fixed = false;
+            for (size_t k = 0; k < m; ++k) {
+                const double pl = k ? ch.p[k - 1] : ch.p0, tl = k ? ch.t[k - 1] : 0.0;
+                const double vl = k ? ch.v[k - 1] : ch.v0, al = k ? ch.a[k - 1] : ch.a0;
+                const double T = ch.t[k] - tl;
+                if (!(T > 0.0)) continue;   // a plateau piece (equal knots) must stay flat: checked too
+                const Piece q = Piece::hermite(0, State{float(pl), float(vl), float(al)}, uint64_t(T * 1e6 + 0.5),
+                                               State{float(ch.p[k]), float(ch.v[k]), float(ch.a[k])});
+                // At every extremum inside (0,1) the position must stay within
+                // the knots' own band; a position outside it is a turn-back.
+                float taus[12]; const int nt = referee::extremumTaus(q.c, taus);
+                const float band_lo = float(std::fmin(pl, ch.p[k])) - 1e-5f, band_hi = float(std::fmax(pl, ch.p[k])) + 1e-5f;
+                bool turns = false;
+                for (int j = 0; j < nt && !turns; ++j) {
+                    const float t = taus[j];
+                    if (t <= 0.0f || t >= 1.0f) continue;
+                    const float pp = q.at(uint64_t(t * T * 1e6)).p;
+                    if (pp < band_lo || pp > band_hi) turns = true;
+                }
+                if (!turns) continue;
+                fixed = true;
+                if (k) { ch.a[k - 1] = round < 3 ? 0.5 * ch.a[k - 1] : 0.0; ch.fix_a[k - 1] = true; }
+                ch.a[k] = round < 3 ? 0.5 * ch.a[k] : 0.0; ch.fix_a[k] = true;
+            }
+            if (!fixed) break;
+            jerk::solve(ch);
+        }
+        for (size_t k = 0; k < m; ++k) {
+            const size_t i = map[k];
+            if (i < first) continue;
+            out[i].v = float(ch.v[k]);
+            out[i].a = float(ch.a[k]);
+        }
     };
 
     State prev = origin;          // the state the piece into knot i starts from
@@ -228,6 +459,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     // after it was dropped), so it rests and no backward relaxation runs.
     // Returns false when the knot was dropped.
     auto solveKnot = [&](size_t i, bool rest_end) -> bool {
+        junctions(i);
         // HARD: cruise as fast as the head can legally reach, then the fastest
         // legal brake landing at rest exactly on the knot. Bisection on the
         // cruise speed; the head is a plain piece into the brake's start
@@ -308,8 +540,9 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
 
         Piece q; float worst = 0.0f;
         auto build = [&]() {
-            if (!out[i].pin_v) out[i].v = slopeAt(i);
-            if (!out[i].pin_a) out[i].a = accelAt(i, out[i].v);
+            // The rail bound follows the knot: a Blend trim moves p toward the
+            // previous end state, which may be toward a wall.
+            out[i].v = boundForRail(out[i].v, out[i].p);
             return Piece::hermite(prev_us, prev, out[i].t_us, State{out[i].p, out[i].v, out[i].a});
         };
         auto judge = [&]() { q = build(); worst = referee::worstRatio(q, L, lo, hi); return worst <= 1.0f; };
@@ -416,22 +649,8 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     };
 
     for (size_t i = 0; i < n; ++i) solveKnot(i, false);
-
-    // Every knot after the last accepted one was dropped: that knot now ends
-    // the timeline and the hold starts there, so it must rest. Its junction
-    // values were chosen with a successor in view; solve it again as the end,
-    // from the state it was judged from. If it cannot rest legally it is
-    // dropped too, and the one before it becomes the end.
-    while (last != size_t(-1) && last + 1 < n && !out[last].hard) {
-        const size_t i = last;
-        prev = out[i].from; prev_us = out[i].from_us;
-        out[i].p = knots[i].p; out[i].t_us = out[i].base_us;
-        out[i].pin_v = false; out[i].pin_a = false; out[i].hard = false;
-        // The last accepted knot before i, if any.
-        last = size_t(-1);
-        for (size_t k = i; k-- > 0;) if (!out[k].dropped) { last = k; break; }
-        if (solveKnot(i, true)) break;
-    }
+    // A knot whose successors were all dropped is reached moving and the
+    // engine brakes from it, exactly as a starved stream: no rest pass.
 }
 
 }  // namespace kinetic2

@@ -87,6 +87,13 @@ struct Config {
     float   amplitude_floor = 0.25f;   // Blend never trims a stroke below this share of it
     uint32_t lookahead_us   = 250000;  // how far past now the solver considers knots
     Corner  corner          = Corner::Continuous;
+    // A knot arriving while the axis moves re-plans from the state this far
+    // ahead of now; the curve up to there is committed. Long enough that the
+    // re-plan never starts inside a piece too short to bend legally, short
+    // enough that a one-knot guess never freezes into the motion (both were
+    // measured: 6 ms pieces spiraled into reversals, a committed knot froze a
+    // start-up velocity into every later piece).
+    uint32_t react_us       = 4000;
 };
 
 // ---- Anomaly ----------------------------------------------------------------
