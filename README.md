@@ -92,10 +92,13 @@ needs a deep stack; measure its high-water mark before shrinking it.
 
 ## Using it
 
-**Vendor it** (what Nucleus does): copy `include/`, `third_party/ruckig/`,
-`LICENSE` and `NOTICE.md` into your tree and record the Kinetic commit sha in
-a pin file beside them (Nucleus: `kinetic.pin`, checked by its lint). Never
-edit the copy; changes land here first.
+**Sibling checkout** (what Nucleus does): clone Kinetic beside your project,
+point the build at it with one of the forms below, and record the Kinetic
+commit sha in a pin file (Nucleus: `kinetic.pin`; its lint fails when the
+checkout's HEAD is not the pin). Changes land here first, then the pin moves.
+
+**Vendor it**: copy `include/`, `third_party/ruckig/`, `LICENSE` and
+`NOTICE.md` into your tree. Never edit the copy.
 
 **PlatformIO**: both directories are libraries.
 
