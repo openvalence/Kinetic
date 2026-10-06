@@ -5,6 +5,21 @@ one linear axis. It has no hardware dependencies and its output is
 deterministic. It is the motion planner of the OpenValence Nucleus firmware
 (OSSM Flagship) and can be used outside Nucleus.
 
+The repository holds two planners.
+
+- **Kinetic²** (`include/kinetic2/`) is the planner Nucleus ships: one knot
+  timeline per axis, a lookahead solver over the pending knots, three
+  junction kinds, no Ruckig. `wasm/kinetic2_wasm.h` is its C ABI and
+  `playground/` runs it in a browser. The design is RFC-105 in the Valence
+  RFC queue.
+- **Kinetic 1** (`include/kinetic/`, with the vendored Ruckig in
+  `third_party/ruckig/`) is the previous planner. It stays in this repository
+  as the test oracle that grades Kinetic² (`tests/test_kinetic2_oracle.cpp`)
+  and is not built into Nucleus.
+
+The sections below describe Kinetic 1. Kinetic²'s API is documented in its
+headers; `playground/README.md` and `wasm/kinetic2_wasm.h` show it in use.
+
 ## The model
 
 - **One trajectory per command**, planned from the engine's actual
@@ -97,6 +112,7 @@ needs a deep stack; measure its high-water mark before shrinking it.
 point the build at it with one of the forms below, and record the Kinetic
 commit sha in a pin file (Nucleus: `kinetic.pin`; its lint fails when the
 checkout's HEAD is not the pin). Changes are made in Kinetic first; the pin is then updated.
+Kinetic² needs only `include/`; the Ruckig library below is Kinetic 1's.
 
 **Vendor it**: copy `include/`, `third_party/ruckig/`, `LICENSE` and
 `NOTICE.md` into your tree. Never edit the copy.
