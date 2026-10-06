@@ -845,3 +845,92 @@ TEST_CASE("a segment with no end velocity and no successor rests at its target; 
     CHECK(e2.stateAt(0, 500 * kMs).v > 0.05f);
     CHECK(e2.stateAt(0, 1000 * kMs).p == doctest::Approx(0.25f).epsilon(1e-4));
 }
+
+// ---- the segments flush (RFC-087, Nucleus val-dz9) ------------------------------
+
+namespace {
+
+// 250 ms of 50 ms C2 segments climbing 0.2 -> 0.3 from t = 0, the last resting.
+void queueRamp(Engine<>& e) {
+    for (int k = 0; k < 5; ++k)
+        REQUIRE(e.submit(knotFromSegment(0.2f + 0.02f * float(k + 1), 50 * kMs, k < 4, 0.4f, uint64_t(k) * 50 * kMs,
+                                         Family::C2), 0));
+}
+
+float worstJump(const std::vector<State>& s) {
+    float worst = 0.0f;
+    for (size_t i = 1; i < s.size(); ++i) {
+        const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+        worst = std::max(worst, std::fabs(s[i].p - s[i - 1].p) - allowed);
+    }
+    return worst;
+}
+
+}  // namespace
+
+TEST_CASE("truncateAfter: a flush 40 ms out drops the queue from there and hands off continuously") {
+    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+    for (const Policy pol : {Policy::Blend, Policy::Stretch}) {
+        cfg.policy = pol;
+        Engine<> e(cfg, 0.2f), twin(cfg, 0.2f);
+        queueRamp(e); queueRamp(twin);
+        std::vector<State> s = sweep(e, 0, 110 * kMs);
+        (void)sweep(twin, 0, 110 * kMs);
+        // The seek at 110 ms: everything from 150 ms is replaced by one segment back down.
+        const uint64_t now = 110 * kMs, t_base = 150 * kMs;
+        CHECK(e.truncateAfter(t_base, now) == 3);                   // the knots at 150, 200 and 250 ms
+        CHECK(e.newest().t_us == t_base);                           // the hand-off knot
+        const size_t kept = e.pending();
+        REQUIRE(e.submit(knotFromSegment(0.15f, 300 * kMs, false, 0.0f, t_base, Family::C2), now));
+        REQUIRE(e.pending() == kept + 1);
+        for (size_t i = 0; i < e.pending(); ++i) {
+            const uint64_t t = e.solved(0, i).t_us;
+            CHECK(t != 200 * kMs); CHECK(t != 250 * kMs);
+        }
+        for (uint64_t t = now + kMs; t <= 900 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+        // The curve in flight runs to the new first start: there it is where
+        // the queued plan would have been.
+        const State old_at_base = twin.stateAt(0, t_base);
+        MESSAGE("policy " << int(pol) << " hand-off p " << s[150].p << " vs queued " << old_at_base.p << ", v " << s[150].v
+                          << " vs " << old_at_base.v << ", worst jump " << worstJump(s) << ", end " << s.back().p);
+        CHECK(s[150].p == doctest::Approx(old_at_base.p).epsilon(1e-4));
+        CHECK(s[150].v == doctest::Approx(old_at_base.v).epsilon(1e-3));
+        CHECK(worstJump(s) <= 0.0f);
+        const Peaks pk = peaksOf(s);
+        CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+        CHECK(pk.a <= cfg.limits.amax * 1.001f);
+        CHECK(pk.j <= cfg.limits.jmax * 1.10f);
+        CHECK(s.back().p == doctest::Approx(0.15f).epsilon(1e-4));
+        CHECK(std::fabs(s.back().v) < 1e-4f);
+        const auto an = drain(e);
+        CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
+        CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
+    }
+}
+
+TEST_CASE("truncateAfter: a flush at now drops the whole window and hands off at the reaction horizon") {
+    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+    Engine<> e(cfg, 0.2f), twin(cfg, 0.2f);
+    queueRamp(e); queueRamp(twin);
+    std::vector<State> s = sweep(e, 0, 110 * kMs);
+    (void)sweep(twin, 0, 110 * kMs);
+    const uint64_t now = 110 * kMs;
+    CHECK(e.truncateAfter(now, now) == 3);
+    CHECK(e.pending() == 0);
+    CHECK(e.newest().t_us == now + cfg.react_us);
+    REQUIRE(e.submit(knotFromSegment(0.15f, 300 * kMs, false, 0.0f, now, Family::C2), now));
+    for (uint64_t t = now + kMs; t <= 900 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+    // Through the horizon the curve is the one that was rendering.
+    for (uint64_t t = now; t <= now + cfg.react_us; t += kMs)
+        CHECK(s[t / kMs].p == twin.stateAt(0, t).p);
+    CHECK(worstJump(s) <= 0.0f);
+    CHECK(s.back().p == doctest::Approx(0.15f).epsilon(1e-4));
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
+    CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
+    // Nothing at or after the time: nothing changes.
+    Engine<> idle(cfg, 0.2f);
+    queueRamp(idle);
+    CHECK(idle.truncateAfter(300 * kMs, 0) == 0);
+    CHECK(idle.pending() == 5);
+}

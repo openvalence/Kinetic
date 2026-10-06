@@ -1,6 +1,7 @@
 // kinetic2/engine.hpp -- Engine<DoF>: knots in, a sampled trajectory out
 // Constraints:
-// - One entry for motion: submit(axis, knot). Segments, samples and strokes are
+// - One entry for motion: submit(axis, knot), and truncateAfter() to replace
+//   what is queued (the segments flush). Segments, samples and strokes are
 //   turned into knots by the caller (Nucleus's arbiter, the wasm shim); the
 //   engine never sees a wire format.
 // - Event-driven, never clocked: a piece is built when the sampler first needs
@@ -55,72 +56,71 @@ public:
         // brake is the engine's own guess that nothing follows; a knot proves
         // it wrong, so the engine re-plans from where the carriage is.
         if (a.explicit_brake && k.t_us <= a.origin_us) return refuse(k, now_us, kDetailPast);
-        // A starvation brake in flight is kept through the reaction horizon
-        // and the knot is solved from the state there, like any curve in
-        // flight (RFC-105 (bb)). The brake's end stays the origin only when
-        // the horizon is past it.
-        auto replanFromBrake = [&]() {
-            const uint64_t tr = now_us + _cfg.react_us;
-            if (tr < a.piece.end_us) {
-                a.committed = a.piece; a.committed.end_us = tr;
-                a.origin = a.piece.at(tr); a.origin_us = tr;
-                a.has_committed = true;
-            }
-        };
-        if (!a.explicit_brake && a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) replanFromBrake();
+        if (!a.explicit_brake && a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) replanFromBrake(a, now_us);
         if (a.explicit_brake && now_us >= a.origin_us) a.explicit_brake = false;
         if (a.tl.full()) return refuse(k, now_us, kDetailTimelineFull);
         // An axis at rest has been holding since its origin: the first piece
         // starts now, not when the hold began. A brake in flight keeps its end.
         if (a.tl.empty() && a.origin_us < now_us) a.origin_us = now_us;
-        // An axis in motion keeps the curve it is on through the reaction
-        // horizon (Config::react_us), or through the next knot when that is
-        // nearer, and re-plans from the state there. The curve under the
-        // carriage never moves (a re-plan from the piece's start moved it by
-        // 67 mm on the bench), the re-plan never starts inside a piece too
-        // short to bend legally, and nothing freezes a one-knot guess into
-        // later motion: RFC-105 (bb).
-        if (!a.tl.empty() && now_us > a.origin_us && !a.has_committed) {
-            (void)stateAt(axis, now_us);   // retires what is due, builds the piece
-            if (!a.tl.empty()) {
-                const uint64_t tr = now_us + _cfg.react_us;
-                const Solved& k0 = a.sol[0];
-                // A knot within one tick past the horizon counts as reached:
-                // left pending, it was re-solved one tick past the horizon
-                // with its prior junction, a piece no quintic can make legal,
-                // and the stretch that followed grew the stream's lag.
-                if (k0.t_us <= tr + 1000) {
-                    // Commit through the knot: its piece is kept whole.
-                    a.committed = a.piece;
-                    a.origin = State{k0.p, k0.v, k0.a};
-                    a.origin_us = k0.t_us;
-                    a.before = a.tl.at(0); a.before_solved_us = k0.t_us; a.has_before = true;
-                    a.tl.popFront();
-                    for (size_t i = 0; i + 1 < a.n_sol; ++i) a.sol[i] = a.sol[i + 1];
-                    if (a.n_sol) --a.n_sol;
-                } else {
-                    // Commit the curve up to the horizon and re-plan from there.
-                    a.committed = a.piece;
-                    a.committed.end_us = tr;
-                    a.origin = a.piece.at(tr);
-                    a.origin_us = tr;
-                }
-                a.has_committed = true;
-            } else if (!a.explicit_brake && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) {
-                // The knot due at this instant retired inside that call and
-                // starved the stream: the brake engaged and moved the origin
-                // to its end. Solved from there, the new knot's piece began
-                // in the future and the carriage teleported to the brake's
-                // end (a 29 mm step on the playground's starved stream).
-                replanFromBrake();
-            }
-        }
+        commitHorizon(axis, now_us);
         if (!a.tl.push(k)) return refuse(k, now_us, kDetailPast);
         a.solved_valid = false;
         a.piece_valid = false;
         return true;
     }
     bool submit(const Knot& k, uint64_t now_us) { return submit(0, k, now_us); }
+
+    // ---- supersede ----------------------------------------------------------
+    // The segments flush (Valence SPEC 5.4 "Supersede, the segments flush",
+    // RFC-087): drops every pending knot authored at or after t_us and keeps
+    // the ones before it. The curve through the reaction horizon is committed
+    // first and never moves (RFC-105 (bb)). When t_us lies past the horizon
+    // and inside the dropped plan, a knot at t_us carries that plan's (p, v)
+    // there, so the motion in flight hands off at t_us as it would to any
+    // successor (SPEC 9.6) and a knot submitted after t_us chains from it; a
+    // t_us within a tick of the horizon or before it drops the whole pending
+    // window and the hand-off is the horizon. Never an anomaly: a flush is the
+    // sender's intent. Returns the knots dropped; 0 changed nothing.
+    size_t truncateAfter(size_t axis, uint64_t t_us, uint64_t now_us) {
+        Axis& a = _ax[axis];
+        if (a.tl.empty() || a.tl.newest().t_us < t_us) return 0;
+        commitHorizon(axis, now_us);
+        ensureSolved(a);   // may drop unreachable knots; sol is aligned with tl after it
+        const size_t n = a.tl.size();
+        const bool past_horizon = t_us > a.origin_us + 1000;
+        size_t keep = 0;
+        if (past_horizon) while (keep < n && a.tl.at(keep).t_us < t_us) ++keep;
+        if (keep == n) return 0;
+        const bool handoff = past_horizon && (keep == 0 || a.sol[keep - 1].t_us < t_us);
+        const State hs = handoff ? planAt(a, t_us) : State{};
+        a.tl.truncate(keep);
+        a.n_sol = keep;
+        {
+            size_t m = 0;
+            for (size_t i = 0; i < a.rep_n; ++i)
+                if (a.rep_t[i] < t_us) { a.rep_t[m] = a.rep_t[i]; a.rep_m[m] = a.rep_m[i]; ++m; }
+            a.rep_n = m;
+        }
+        if (handoff) {
+            Knot h;
+            h.t_us = t_us; h.p = hs.p; h.v = hs.v; h.has_v = true; h.family = Family::C2;
+            (void)a.tl.push(h);   // after every kept knot, with room: one was dropped
+        }
+        a.solved_valid = false;
+        a.piece_valid = false;
+        return n - keep;
+    }
+    size_t truncateAfter(uint64_t t_us, uint64_t now_us) { return truncateAfter(0, t_us, now_us); }
+
+    // The newest pending knot as authored (a flush's hand-off knot included);
+    // with nothing pending, the origin as a knot carrying its (p, v).
+    Knot newest(size_t axis = 0) const {
+        const Axis& a = _ax[axis];
+        if (!a.tl.empty()) return a.tl.newest();
+        Knot k;
+        k.t_us = a.origin_us; k.p = a.origin.p; k.v = a.origin.v; k.has_v = true;
+        return k;
+    }
 
     // ---- brake --------------------------------------------------------------
     // Drop every pending knot and stop as fast as the ceilings allow from the
@@ -328,25 +328,104 @@ private:
             a.piece = Piece::hold(a.origin.p, a.origin_us);
             a.origin.v = 0.0f; a.origin.a = 0.0f;
         } else {
-            const Solved& k = a.sol[0];
-            // A HARD head solved from rest may start later than the origin:
-            // the piece holds the origin state until then (Piece::at clamps).
-            const uint64_t t0 = (k.hard && k.from_us > a.origin_us) ? k.from_us : a.origin_us;
-            if (k.hard) {
-                a.piece = Piece::hermite(t0, a.origin, k.head_us, k.head);
-                a.piece.has_tail = true;
-                a.piece.tail = Profile::brake(k.head, k.head_us, _cfg.limits);
-                a.piece.end_us = k.t_us;
-            } else if (k.corner) {
-                a.piece = Piece::hermite(a.origin_us, a.origin, k.head_us, k.head);
-                a.piece.has_tail = true;
-                a.piece.tail = k.ramp;
-                a.piece.end_us = k.t_us;
-            } else {
-                a.piece = Piece::hermite(a.origin_us, a.origin, k.t_us, State{k.p, k.v, k.a});
-            }
+            a.piece = pieceInto(a.origin, a.origin_us, a.sol[0]);
         }
         a.piece_valid = true;
+    }
+
+    // The piece from state s at s_us into solved knot k.
+    Piece pieceInto(const State& s, uint64_t s_us, const Solved& k) const {
+        Piece q;
+        // A HARD head solved from rest may start later than s_us: the piece
+        // holds s until then (Piece::at clamps).
+        const uint64_t t0 = (k.hard && k.from_us > s_us) ? k.from_us : s_us;
+        if (k.hard) {
+            q = Piece::hermite(t0, s, k.head_us, k.head);
+            q.has_tail = true;
+            q.tail = Profile::brake(k.head, k.head_us, _cfg.limits);
+            q.end_us = k.t_us;
+        } else if (k.corner) {
+            q = Piece::hermite(s_us, s, k.head_us, k.head);
+            q.has_tail = true;
+            q.tail = k.ramp;
+            q.end_us = k.t_us;
+        } else {
+            q = Piece::hermite(s_us, s, k.t_us, State{k.p, k.v, k.a});
+        }
+        return q;
+    }
+
+    // The solved window's state at t at or past the origin, knot to knot.
+    State planAt(Axis& a, uint64_t t) {
+        ensureSolved(a);
+        State s = a.origin;
+        uint64_t s_us = a.origin_us;
+        for (size_t i = 0; i < a.n_sol; ++i) {
+            const Solved& k = a.sol[i];
+            if (t < k.t_us) return pieceInto(s, s_us, k).at(t);
+            s = State{k.p, k.v, k.a};
+            s_us = k.t_us;
+        }
+        return s;
+    }
+
+    // A starvation brake in flight is kept through the reaction horizon and
+    // the next knot is solved from the state there, like any curve in flight
+    // (RFC-105 (bb)). The brake's end stays the origin only when the horizon
+    // is past it.
+    void replanFromBrake(Axis& a, uint64_t now_us) {
+        const uint64_t tr = now_us + _cfg.react_us;
+        if (tr < a.piece.end_us) {
+            a.committed = a.piece; a.committed.end_us = tr;
+            a.origin = a.piece.at(tr); a.origin_us = tr;
+            a.has_committed = true;
+        }
+    }
+
+    // An axis in motion keeps the curve it is on through the reaction
+    // horizon (Config::react_us), or through the next knot when that is
+    // nearer, and re-plans from the state there. The curve under the
+    // carriage never moves (a re-plan from the piece's start moved it by
+    // 67 mm on the bench), the re-plan never starts inside a piece too
+    // short to bend legally, and nothing freezes a one-knot guess into
+    // later motion: RFC-105 (bb). Once per sample: a commit already made
+    // stands until the sampler passes it.
+    void commitHorizon(size_t axis, uint64_t now_us) {
+        Axis& a = _ax[axis];
+        if (a.tl.empty() || now_us <= a.origin_us || a.has_committed) return;
+        (void)stateAt(axis, now_us);   // retires what is due, builds the piece
+        if (!a.tl.empty()) {
+            const uint64_t tr = now_us + _cfg.react_us;
+            const Solved& k0 = a.sol[0];
+            // A knot within one tick past the horizon counts as reached:
+            // left pending, it was re-solved one tick past the horizon
+            // with its prior junction, a piece no quintic can make legal,
+            // and the stretch that followed grew the stream's lag.
+            if (k0.t_us <= tr + 1000) {
+                // Commit through the knot: its piece is kept whole.
+                a.committed = a.piece;
+                a.origin = State{k0.p, k0.v, k0.a};
+                a.origin_us = k0.t_us;
+                a.before = a.tl.at(0); a.before_solved_us = k0.t_us; a.has_before = true;
+                a.tl.popFront();
+                for (size_t i = 0; i + 1 < a.n_sol; ++i) a.sol[i] = a.sol[i + 1];
+                if (a.n_sol) --a.n_sol;
+            } else {
+                // Commit the curve up to the horizon and re-plan from there.
+                a.committed = a.piece;
+                a.committed.end_us = tr;
+                a.origin = a.piece.at(tr);
+                a.origin_us = tr;
+            }
+            a.has_committed = true;
+        } else if (!a.explicit_brake && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) {
+            // The knot due at this instant retired inside that call and
+            // starved the stream: the brake engaged and moved the origin
+            // to its end. Solved from there, the new knot's piece began
+            // in the future and the carriage teleported to the brake's
+            // end (a 29 mm step on the playground's starved stream).
+            replanFromBrake(a, now_us);
+        }
     }
 
     bool refuse(const Knot& k, uint64_t now_us, float detail) {

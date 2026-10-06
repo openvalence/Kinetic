@@ -89,6 +89,11 @@ KINETIC_EXPORT int kinetic2_brake(kinetic2_handle* h, double now_us) {
     return h->engine.brake(toUs(now_us)) ? 1 : 0;
 }
 
+KINETIC_EXPORT uint32_t kinetic2_truncate_after(kinetic2_handle* h, double t_us, double now_us) {
+    if (!h) return 0;
+    return uint32_t(h->engine.truncateAfter(toUs(t_us), toUs(now_us)));
+}
+
 KINETIC_EXPORT void kinetic2_sample(kinetic2_handle* h, double now_us, kinetic2_state* out) {
     if (!h || !out) return;
     const uint64_t t = toUs(now_us);

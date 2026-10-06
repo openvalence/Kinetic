@@ -51,6 +51,10 @@ public:
 
     void clear() { _head = 0; _n = 0; }
 
+    // Keeps the oldest n knots and drops every later one (the engine's
+    // supersede flush).
+    void truncate(size_t n) { if (n < _n) _n = n; }
+
     // Removes the i-th knot, closing the gap. The engine uses it for a knot the
     // solver dropped as unreachable.
     void erase(size_t i) {

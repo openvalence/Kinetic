@@ -90,6 +90,12 @@ int kinetic2_submit(kinetic2_handle* h, double t_us, float p, int has_v, float v
 // refused. 1 when anything was moving.
 int kinetic2_brake(kinetic2_handle* h, double now_us);
 
+// The segments flush (Valence RFC-087): drops every pending knot at or after
+// t_us; the motion in flight hands off there, or at the reaction horizon when
+// t_us is not past it (kinetic2::Engine::truncateAfter). A knot after the
+// hand-off is then accepted. Returns the knots dropped; 0 changed nothing.
+uint32_t kinetic2_truncate_after(kinetic2_handle* h, double t_us, double now_us);
+
 // The state at now_us. Non-decreasing between resets.
 void kinetic2_sample(kinetic2_handle* h, double now_us, kinetic2_state* out);
 
