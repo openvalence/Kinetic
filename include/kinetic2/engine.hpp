@@ -237,6 +237,7 @@ private:
         State    origin{};         // the state the next piece starts from
         uint64_t origin_us = 0;
         Solved   sol[Capacity]{};  // the solved window, aligned with tl
+        jerk::Workspace ws{};      // the solver's banded system, this axis's own
         size_t   n_sol = 0;
         bool     solved_valid = false;
         Piece    piece{};
@@ -308,7 +309,7 @@ private:
         // knot solved for the first time. A sample keeps its lag from it.
         Prior prior[Capacity];
         for (size_t i = 0; i < n; ++i) prior[i] = i < a.n_sol ? Prior{a.sol[i].t_us, a.sol[i].v, a.sol[i].a} : Prior{};
-        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.has_before ? &a.before : nullptr, a.before_solved_us, prior);
+        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.has_before ? &a.before : nullptr, a.before_solved_us, prior);
         // A knot the solver dropped leaves the timeline for good.
         size_t m = 0;
         for (size_t i = 0; i < n; ++i) {

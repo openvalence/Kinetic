@@ -207,7 +207,18 @@ struct Chain {
     double p0 = 0.0, v0 = 0.0, a0 = 0.0;   // the origin, fixed
 };
 
-inline void solve(Chain& ch) {
+// The banded system's storage, owned by the caller (the engine keeps one per
+// axis). Never a static: two engines on two tasks would share it. Never
+// thread_local: ESP-IDF carves a task's thread-local block out of that task's
+// own stack, and ten kilobytes of it made every task need a ten kilobyte
+// stack; the IPC task has one, the board asserted in esp_ipc_init before
+// app_main and boot-looped (kin-6tz). Never on the stack: the motion task's.
+struct Workspace {
+    double A[kMaxUnknowns][2 * kHalfBand + 1];
+    double b[kMaxUnknowns];
+};
+
+inline void solve(Chain& ch, Workspace& ws) {
     if (ch.n == 0 || ch.n > kMaxKnots) return;
     int idx_v[kMaxKnots], idx_a[kMaxKnots];
     int m = 0;
@@ -217,8 +228,8 @@ inline void solve(Chain& ch) {
     }
     if (m == 0) return;
     // Banded storage: A[r][kHalfBand + (c - r)].
-    static thread_local double A[kMaxUnknowns][2 * kHalfBand + 1];
-    static thread_local double b[kMaxUnknowns];
+    auto& A = ws.A;
+    auto& b = ws.b;
     for (int r = 0; r < m; ++r) { b[r] = 0.0; for (int c = 0; c < 2 * kHalfBand + 1; ++c) A[r][c] = 0.0; }
     double K[6][6];
     for (size_t k = 0; k < ch.n; ++k) {
@@ -284,7 +295,7 @@ inline void solve(Chain& ch) {
 // starts from. Writes out[0..n) and reports every spend through `report`.
 template <typename Report>
 inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* knots, size_t n,
-                        const Config& cfg, Solved* out, Report&& report, const Knot* before = nullptr,
+                        const Config& cfg, Solved* out, Report&& report, jerk::Workspace& ws, const Knot* before = nullptr,
                         uint64_t before_solved_us = 0, const Prior* prior = nullptr) {
     if (n == 0) return;
     const Limits& L = cfg.limits;
@@ -463,7 +474,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
             ++m;
         }
         ch.n = m;
-        jerk::solve(ch);
+        jerk::solve(ch, ws);
         // Shape preservation: a free velocity may not exceed the monotone
         // band of its two secants (three times the smaller, same sign; zero
         // across a sign change), the Fritsch-Carlson condition, so a kink is
@@ -504,7 +515,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
             }
             if (v != ch.v[k]) { ch.v[k] = v; ch.fix_v[k] = true; clamped = true; }
         }
-        if (clamped) jerk::solve(ch);
+        if (clamped) jerk::solve(ch, ws);
         // Stoppable before the velocity ceiling, as before the rail: a
         // junction accelerating toward vmax must be able to shed that
         // acceleration under jmax before the velocity reaches it, or the
@@ -522,7 +533,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
             const double a_ok = std::sqrt(2.0 * double(L.jmax) * room);
             if (std::fabs(a) > a_ok) { ch.a[k] = (a < 0.0 ? -1.0 : 1.0) * a_ok; ch.fix_a[k] = true; a_clamped = true; }
         }
-        if (a_clamped) jerk::solve(ch);
+        if (a_clamped) jerk::solve(ch, ws);
         // Monotone repair: a piece whose knots rise (or fall) must not turn
         // back inside. A velocity sign change inside such a piece is the
         // accelerations' doing; halve both junction accelerations, pin them,
@@ -561,7 +572,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
                 ch.a[k] = round < 3 ? 0.5 * ch.a[k] : 0.0; ch.fix_a[k] = true;
             }
             if (!fixed) break;
-            jerk::solve(ch);
+            jerk::solve(ch, ws);
         }
         for (size_t k = 0; k < m; ++k) {
             const size_t i = map[k];
