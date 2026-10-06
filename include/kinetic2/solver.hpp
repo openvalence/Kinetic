@@ -505,6 +505,24 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
             if (v != ch.v[k]) { ch.v[k] = v; ch.fix_v[k] = true; clamped = true; }
         }
         if (clamped) jerk::solve(ch);
+        // Stoppable before the velocity ceiling, as before the rail: a
+        // junction accelerating toward vmax must be able to shed that
+        // acceleration under jmax before the velocity reaches it, or the
+        // next piece, whatever it turns out to be, runs past the ceiling. A
+        // stream at vmax left a junction at 94 percent of vmax still
+        // accelerating at 64 percent of amax; no later sample was reachable
+        // from it, every one was dropped, and the carriage sagged to rest
+        // inside a moving stream.
+        bool a_clamped = false;
+        for (size_t k = 0; k < m; ++k) {
+            if (ch.fix_a[k]) continue;
+            const double v = ch.v[k], a = ch.a[k];
+            if (a == 0.0 || (a < 0.0) != (v < 0.0)) continue;
+            const double room = std::fmax(0.0, double(L.vmax) - std::fabs(v));
+            const double a_ok = std::sqrt(2.0 * double(L.jmax) * room);
+            if (std::fabs(a) > a_ok) { ch.a[k] = (a < 0.0 ? -1.0 : 1.0) * a_ok; ch.fix_a[k] = true; a_clamped = true; }
+        }
+        if (a_clamped) jerk::solve(ch);
         // Monotone repair: a piece whose knots rise (or fall) must not turn
         // back inside. A velocity sign change inside such a piece is the
         // accelerations' doing; halve both junction accelerations, pin them,
@@ -576,19 +594,29 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     auto hasPrior = [&](size_t k) { return prior && prior[k].t_us != 0 && knots[k].sample; };
     // The time of sample k behind the knot before it (prev_k, at prev_t), or
     // behind the knot retired just before the window when there is none.
+    // A sample behind another whose prior time trails the replay rule by a
+    // whole cadence or more is placed by the rule again: a stream that began
+    // far from a resting carriage had its first samples stretched one by one,
+    // and those times, kept, spaced samples authored 10 ms apart at 112, 71,
+    // 33 and 28 ms; the smoothing spline wiggled through that, the monotone
+    // band zeroed a junction inside a moving stream, and every later sample
+    // was unreachable from the rest it left. The window's first sample keeps
+    // its time (the committed curve continued).
     auto sampleTime = [&](size_t k, uint64_t prev_t, size_t prev_k) -> uint64_t {
         uint64_t t = hasPrior(k) ? prior[k].t_us : knots[k].t_us;
         uint64_t want = prev_t + kMinSpanUs;
+        uint64_t spacing = 0;
         if (prev_k != size_t(-1)) {
             if (knots[prev_k].sample && knots[k].t_us > knots[prev_k].t_us) {
-                const uint64_t spacing = knots[k].t_us - knots[prev_k].t_us;
+                spacing = knots[k].t_us - knots[prev_k].t_us;
                 want = prev_t + replaySpacing(spacing, compression(prev_t, knots[prev_k].t_us, spacing));
             }
         } else if (before && before->sample && knots[k].t_us > before->t_us) {
-            const uint64_t spacing = knots[k].t_us - before->t_us;
+            spacing = knots[k].t_us - before->t_us;
             want = before_solved_us + replaySpacing(spacing, compression(before_solved_us, before->t_us, spacing));
             if (want < prev_t + kMinSpanUs) want = prev_t + kMinSpanUs;
         }
+        if (k > 0 && hasPrior(k) && spacing > 0 && t > want + spacing) t = want;
         return std::max(t, want);
     };
     auto floorSelf = [&](size_t i) { if (out[i].t_us < prev_us + kMinSpanUs) out[i].t_us = prev_us + kMinSpanUs; };
