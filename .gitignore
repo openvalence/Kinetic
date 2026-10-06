@@ -8,3 +8,4 @@ build-*/
 .beads-credential-key
 .beads/proxieddb/
 .beads.gate.lock
+playground/kinetic2.wasm

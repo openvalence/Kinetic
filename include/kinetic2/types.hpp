@@ -58,6 +58,14 @@ struct Knot {
     float    v      = 0.0f;     // window units/s, meaningful when has_v
     bool     has_v  = false;
     Family   family = Family::Unspecified;
+    // A sample (sources.hpp): its deadline is soft. It is never trimmed, only
+    // stretched, and a stretch moves this knot alone; later samples keep their
+    // own times and catch up (Kinetic 1 chased samples time-optimally).
+    bool     sample = false;
+    // A segment without an end velocity rests when nothing follows it (SPEC
+    // 9.6); a successor frees it. A sample never sets it: a stream's newest
+    // sample has a successor on the way.
+    bool     rest_if_last = false;
 };
 
 // The junction a knot renders, by the rules above. Unspecified behaves as C2.
@@ -102,7 +110,7 @@ struct Config {
 // and stay reserved); new kinds append at 11+.
 enum class AnomalyKind : uint8_t {
     None              = 0,
-    PlanFailed        = 1,   // detail: a sentinel below
+    PlanFailed        = 1,   // the knot was dropped. detail: a sentinel below, or the last attempt's worst ceiling ratio
     SettleEngaged     = 2,   // the timeline ran dry mid-motion: braked to rest. detail = v at engagement
     EndVelClamped     = 3,   // an authored end velocity exceeded vmax or the wall bound. detail = the clamped v
     DeadlineStretched = 4,   // Stretch moved a knot later. detail = seconds added

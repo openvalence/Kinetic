@@ -11,7 +11,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0x2ce1f4d526af88fcull   // accepted 2026-10-06: reaction horizon, minimum-jerk junctions, starvation brake
+#define KINETIC2_FINGERPRINT 0x7b1412ec62785464ull   // accepted 2026-10-06: stream replay (persisted samples, eased compression), rest-if-last segments, hard-stop hold
 #endif
 
 using namespace kinetic2;
@@ -688,4 +688,160 @@ TEST_CASE("a 60 Hz scrub submitted while sampling stays continuous and one behin
     CHECK(worst_jump <= 0.0f);
     CHECK(refused == 0);
     CHECK(s.back().p == doctest::Approx(p).epsilon(1e-3));
+}
+
+// ---- spent streams (val-log) --------------------------------------------------
+// The arbiter's scrub on the OSSM window: a 150 mm/s ramp, a hold, a 1.5 Hz
+// sweep of 60 mm on 400 mm, under its default ceilings (1000 mm/s, 50000
+// mm/s^2, 2e6 mm/s^3 normalized). Every knot here spends something.
+
+namespace {
+
+struct StreamRun {
+    float worst_jump = 0.0f;   // beyond what the velocity carries per tick
+    int   refused = 0;
+    int   dropped = 0;
+    float worst_lag_ms = 0.0f; // the newest knot's solved time behind its authored time, at any submit
+    int   worst_lag_at = -1;
+    float end_p = 0.0f;
+};
+
+StreamRun runArbiterScrub(Policy policy, float* out_last = nullptr) {
+    Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f}; cfg.policy = policy;
+    Engine<> e(cfg, 0.5f);
+    StreamRun r;
+    std::vector<State> s;
+    uint64_t t = 0;
+    auto sampleUntil = [&](uint64_t until) { for (; t < until; t += kMs) s.push_back(e.stateAt(0, t)); };
+    float p = 0.5f;
+    for (int i = 0; i < 240; ++i) {
+        p = i < 40 ? (200.0f + 2.5f * float(i + 1)) / 400.0f
+          : i < 60 ? 0.75f
+                   : 0.75f + 0.15f * std::sin(9.424778f * float(i - 60) / 60.0f);
+        const Knot k = knotFromSample(p, t, 16667);
+        if (!e.submit(k, t)) ++r.refused;
+        if (const size_t n = e.pending(0)) {
+            const uint64_t tail = e.solved(0, n - 1).t_us;
+            if (tail > k.t_us && float(tail - k.t_us) * 1e-3f > r.worst_lag_ms) { r.worst_lag_ms = float(tail - k.t_us) * 1e-3f; r.worst_lag_at = i; }
+        }
+        sampleUntil(t + (i % 3 == 2 ? 16 : 17) * kMs);
+    }
+    sampleUntil(t + 500 * kMs);
+    for (size_t i = 1; i < s.size(); ++i) {
+        const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+        r.worst_jump = std::max(r.worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
+    }
+    Anomaly a;
+    while (e.popAnomaly(a)) if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++r.dropped;
+    r.end_p = s.back().p;
+    if (out_last) *out_last = p;
+    return r;
+}
+
+}  // namespace
+
+TEST_CASE("a spent 60 Hz stream stays continuous, refuses nothing, drops nothing and tracks") {
+    for (Policy policy : {Policy::Stretch, Policy::Blend}) {
+        CAPTURE(int(policy));
+        float last = 0.0f;
+        const StreamRun r = runArbiterScrub(policy, &last);
+        MESSAGE("policy ", int(policy), " jump ", r.worst_jump * 400.0f, " mm, refused ", r.refused, ", dropped ", r.dropped,
+                ", worst lag ", r.worst_lag_ms, " ms at sample ", r.worst_lag_at, ", end ", r.end_p * 400.0f, " mm vs ", last * 400.0f);
+        CHECK(r.worst_jump <= 0.0f);
+        CHECK(r.refused == 0);
+        CHECK(r.dropped == 0);
+        // The stream's corners are infeasible on purpose (instant starts and
+        // stops): each one costs a stretch, and the replay closes it. Eight
+        // cadences is the bound; a lag that grew would fill the timeline.
+        CHECK(r.worst_lag_ms <= 135.0f);
+        // The stream ends moving (a sweep cut mid-swing): the engine brakes
+        // past its newest sample by at most the stop distance from the
+        // stream's speed there (RFC-105 (dd)).
+        const float v_end = (0.15f * std::sin(9.424778f * 179.0f / 60.0f) - 0.15f * std::sin(9.424778f * 178.0f / 60.0f)) / 0.016667f;
+        const float stop = v_end * v_end / (2.0f * 125.0f) + std::fabs(v_end) * 125.0f / (2.0f * 5000.0f);
+        CHECK(std::fabs(r.end_p - last) <= stop + 0.003f);
+    }
+}
+
+TEST_CASE("a lone far sample from rest is reached exactly, at rest, never dropped or trimmed") {
+    for (Policy policy : {Policy::Stretch, Policy::Blend}) {
+        CAPTURE(int(policy));
+        Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f}; cfg.policy = policy;
+        Engine<> e(cfg, 0.5f);
+        REQUIRE(e.submit(knotFromSample(0.75f, 0, 16667), 0));
+        const auto s = sweep(e, 0, 2000 * kMs);
+        float worst_jump = 0.0f, peak = 0.0f;
+        for (size_t i = 1; i < s.size(); ++i) {
+            const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+            worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
+            peak = std::max(peak, s[i].p);
+        }
+        int dropped = 0; Anomaly a;
+        while (e.popAnomaly(a)) if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++dropped;
+        MESSAGE("policy ", int(policy), " reached ", peak * 400.0f, " mm, end ", s.back().p * 400.0f, " mm, jump ", worst_jump * 400.0f);
+        CHECK(dropped == 0);
+        CHECK(worst_jump <= 0.0f);
+        // A sample is never trimmed (Blend is for segments): under either
+        // policy the lone sample is reached exactly, and at rest.
+        CHECK(peak == doctest::Approx(0.75f).epsilon(2e-3));
+        CHECK(s.back().p == doctest::Approx(0.75f).epsilon(2e-3));
+    }
+}
+
+TEST_CASE("a staircase of segments without end velocities, authored ahead, stays continuous and rests at the top") {
+    Config cfg;   // default ceilings
+    Engine<> e(cfg, 0.1f);
+    for (int k = 1; k <= 5; ++k)
+        REQUIRE(e.submit(knotFromSegment(0.1f + 0.15f * float(k), 300 * kMs, false, 0.0f, uint64_t(k - 1) * 300 * kMs, Family::C2), 0));
+    const auto s = sweep(e, 0, 2200 * kMs);
+    float worst_jump = 0.0f, lo = 1.0f, hi = 0.0f;
+    for (size_t i = 1; i < s.size(); ++i) {
+        const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+        worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
+        lo = std::min(lo, s[i].p); hi = std::max(hi, s[i].p);
+    }
+    CHECK(worst_jump <= 0.0f);
+    CHECK(lo >= 0.1f - 1e-4f);
+    CHECK(hi <= 0.85f + 1e-4f);
+    CHECK(s.back().p == doctest::Approx(0.85f).epsilon(1e-4));
+    CHECK(std::fabs(s.back().v) < 1e-4f);
+}
+
+TEST_CASE("a lone hard stop from rest holds, launches and lands: it never winds up backward") {
+    Config cfg;
+    Engine<> e(cfg, 0.1f);
+    REQUIRE(e.submit(knotAt(1500 * kMs, 0.5f, true, 0.0f, Family::C1), 0));
+    const auto s = sweep(e, 0, 1600 * kMs);
+    float worst_jump = 0.0f, lo = 1.0f, hi = 0.0f;
+    for (size_t i = 1; i < s.size(); ++i) {
+        const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+        worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
+        lo = std::min(lo, s[i].p); hi = std::max(hi, s[i].p);
+    }
+    CHECK(worst_jump <= 0.0f);
+    CHECK(lo >= 0.1f - 1e-4f);
+    CHECK(hi <= 0.5f + 1e-4f);
+    CHECK(s[1500].p == doctest::Approx(0.5f).epsilon(1e-4));
+    CHECK(std::fabs(s[1500].v) < 1e-3f);
+    CHECK(s[200].p == doctest::Approx(0.1f).epsilon(1e-4));   // holding, not crawling
+}
+
+TEST_CASE("a segment with no end velocity and no successor rests at its target; a successor frees it (SPEC 9.6)") {
+    Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f};
+    Engine<> e(cfg, 0.0f);
+    // 50 mm of 400 in 500 ms, unspecified end velocity, nothing after it.
+    REQUIRE(e.submit(knotFromSegment(0.125f, 500 * kMs, false, 0.0f, 0, Family::C2), 0));
+    const auto s = sweep(e, 0, 1200 * kMs);
+    float peak = 0.0f;
+    for (const State& st : s) peak = std::max(peak, st.p);
+    CHECK(peak == doctest::Approx(0.125f).epsilon(1e-4));
+    CHECK(s.back().p == doctest::Approx(0.125f).epsilon(1e-4));
+    CHECK(std::fabs(s[500].v) < 1e-4f);
+    CHECK_FALSE(e.isBusy(600 * kMs));
+    // The same segment with a successor queued behind it passes through moving.
+    Engine<> e2(cfg, 0.0f);
+    REQUIRE(e2.submit(knotFromSegment(0.125f, 500 * kMs, false, 0.0f, 0, Family::C2), 0));
+    REQUIRE(e2.submit(knotFromSegment(0.25f, 500 * kMs, false, 0.0f, 500 * kMs, Family::C2), 0));
+    CHECK(e2.stateAt(0, 500 * kMs).v > 0.05f);
+    CHECK(e2.stateAt(0, 1000 * kMs).p == doctest::Approx(0.25f).epsilon(1e-4));
 }

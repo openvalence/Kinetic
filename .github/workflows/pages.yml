@@ -1,0 +1,49 @@
+# The Kinetic² playground on GitHub Pages: builds kinetic2.wasm and publishes
+# playground/ beside it. The repo's Pages source must be GitHub Actions.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.11   # the emsdk that built the local module: same compiler, same numbers
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-wasm --target kinetic2_wasm
+      - name: Assemble site
+        run: |
+          mkdir site
+          cp -r playground/. site/
+          rm site/check.mjs site/README.md
+          cp build-wasm/wasm/kinetic2.wasm site/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

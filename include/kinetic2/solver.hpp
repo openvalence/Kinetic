@@ -18,7 +18,11 @@
 // - Zero ceiling = no authority: nothing is legal under it.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#ifdef K2_TRACE
+#include <cstdio>
+#endif
 #include <cstddef>
 #include <cstdint>
 
@@ -119,6 +123,15 @@ inline float worstRatio(const Piece& q, const Limits& L, float lo, float hi) {
 // What the solver decided for one knot: where and when the curve really passes,
 // and with what velocity and acceleration. p and t start as the knot's own and
 // move only by a spend.
+// What a knot keeps from the previous solve: its time and its junction
+// velocity and acceleration. A sample reached at its prior time with its
+// prior junction is the committed curve continued, exactly.
+struct Prior {
+    uint64_t t_us = 0;   // 0: solved for the first time
+    float    v = 0.0f;
+    float    a = 0.0f;
+};
+
 struct Solved {
     uint64_t t_us = 0;
     float    p = 0.0f, v = 0.0f, a = 0.0f;
@@ -142,6 +155,8 @@ struct Solved {
     Profile  ramp{};
     // The state the piece into this knot was judged from (tooling, and the
     // engine's consistency check: it must equal the previous solved knot).
+    // from_us may be later than that knot's time: a HARD head from rest holds
+    // there until from_us, then launches.
     State    from{};
     uint64_t from_us = 0;
 };
@@ -269,7 +284,8 @@ inline void solve(Chain& ch) {
 // starts from. Writes out[0..n) and reports every spend through `report`.
 template <typename Report>
 inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* knots, size_t n,
-                        const Config& cfg, Solved* out, Report&& report) {
+                        const Config& cfg, Solved* out, Report&& report, const Knot* before = nullptr,
+                        uint64_t before_solved_us = 0, const Prior* prior = nullptr) {
     if (n == 0) return;
     const Limits& L = cfg.limits;
     const float lo = std::fmin(0.0f, origin.p), hi = std::fmax(1.0f, origin.p);
@@ -310,7 +326,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     auto authored = [&](size_t i) -> float {
         const float v = knots[i].v;
         const float cl = boundForRail(v, out[i].p);
-        if (cl != v && !out[i].clamped) { out[i].clamped = true; report(AnomalyKind::EndVelClamped, out[i].t_us, out[i].p, cl); }
+        if (cl != v && !out[i].clamped) { out[i].clamped = true; report(AnomalyKind::EndVelClamped, i, out[i].t_us, out[i].p, cl); }
         return cl;
     };
     auto slopeAt = [&](size_t i) -> float {
@@ -321,9 +337,21 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         // secant into it; if nothing arrives by the time it is reached, the
         // engine brakes from there (starvation is the brake, RFC-105 (a)).
         if (i + 1 >= n) {
-            // Bounded like an authored velocity: within vmax and stoppable
-            // before the rail, since the engine may have to brake from here.
-            float v = std::fmax(-L.vmax, std::fmin(L.vmax, secant(i == 0 ? size_t(-1) : i - 1, i)));
+            if (k.rest_if_last) return 0.0f;   // SPEC 9.6: nothing follows, so it rests
+            // A sample behind another sample keeps the STREAM's velocity, the
+            // secant over the two authored times: the solved times lag it when
+            // the knot was stretched, and a secant over those lagged the
+            // stream further on every re-solve (a 150 mm/s ramp settled at a
+            // third of its speed). Anything else keeps the secant over the
+            // solved times. Bounded like an authored velocity: within vmax and
+            // stoppable before the rail, since the engine may have to brake
+            // from here.
+            float v;
+            if (k.sample && i > 0 && knots[i - 1].sample && !out[i - 1].dropped && knots[i].t_us > knots[i - 1].t_us)
+                v = (out[i].p - out[i - 1].p) / (float(knots[i].t_us - knots[i - 1].t_us) * 1e-6f);
+            else
+                v = secant(i == 0 ? size_t(-1) : i - 1, i);
+            v = std::fmax(-L.vmax, std::fmin(L.vmax, v));
             const float p = out[i].p;
             const float gap = std::fmin(hi - p, p - lo);
             auto stopDist = [&](float u) { return u * u / (2.0f * L.amax) + u * L.amax / (2.0f * L.jmax); };
@@ -346,6 +374,20 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     // the accepted chain: pinned where authored, hard, relaxed, or the bounded
     // secant of a free last knot; free otherwise. Dropped knots are skipped.
     // Knots before `first` are fixed at their solved values.
+    // Stream replay compression: a sample that lags sits closer behind the
+    // sample before it than it was sent, a tenth closer at ten cadences of
+    // lag or more and proportionally less below, so the replay rate changes
+    // by a percent per sample at most. At 60 Hz a piece's jerk is about
+    // three hundred thousand times the mismatch between its mean speed and
+    // the speeds at its ends: a rate step of a tenth in one sample bulged
+    // past the ceiling, was stretched, and the lag it was closing grew.
+    constexpr float kMaxCompress = 0.1f, kEaseCadences = 10.0f;
+    constexpr uint64_t kMinSpanUs = 1000;
+    auto compression = [&](uint64_t prev_solved, uint64_t prev_authored, uint64_t spacing) -> float {
+        const float lag = prev_solved > prev_authored ? float(prev_solved - prev_authored) : 0.0f;
+        return kMaxCompress * std::fmin(1.0f, lag / (kEaseCadences * float(spacing)));
+    };
+    auto replaySpacing = [&](uint64_t spacing, float c) { return std::max<uint64_t>(uint64_t(float(spacing) * (1.0f - c)), kMinSpanUs); };
     auto junctions = [&](size_t first) {
         jerk::Chain ch;
         ch.p0 = origin.p; ch.v0 = origin.v; ch.a0 = origin.a;
@@ -357,6 +399,55 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
             ch.p[m] = out[i].p;
             const bool hard = junctionOf(knots[i]) == Junction::Hard;
             if (i < first || hard) { ch.v[m] = out[i].v; ch.a[m] = out[i].a; ch.fix_v[m] = ch.fix_a[m] = true; }
+            else if (knots[i].sample && !knots[i].has_v) {
+                // An interior sample's junction is free (minimum jerk through
+                // the chain, inside the monotone band): the chain is then a
+                // smoothing spline through the samples. Pinning the Fritsch-
+                // Butland slope at every sample was a few percent off the
+                // sine it sampled, and at 60 Hz a piece's jerk is about three
+                // hundred thousand times that mismatch: every piece sat at
+                // the ceiling and stretched. The first sample keeps its prior
+                // junction (the committed curve), and the newest, with nothing
+                // after it, the stream's slope.
+                // The newest sample's velocity is free as well (the chain's
+                // natural end, inside the monotone band): pinned to the
+                // stream's slope it was a percent or two off the chain, and
+                // at a jerk ceiling of 500 that is a bulge past the ceiling
+                // on every piece (a 60 Hz sine crawled at a seventh of its
+                // speed). Free, it adapts, so a replay slowed by a stretch
+                // speeds back up.
+                // The newest sample's acceleration is the stream's own: the
+                // second difference of the last three authored samples (the
+                // knot retired before the window counts), bounded by amax,
+                // and zero with fewer. A resting acceleration there was
+                // carried into the committed junction at every sample, and a
+                // sine that needs 14 units/s^2 at its samples had to rebuild
+                // that inside one cadence: past the jerk ceiling at 500,
+                // every piece stretched and the stream crawled. A free one
+                // left the stream's first sample from rest still accelerating
+                // at 39, which the next piece could not take back.
+                double a_tail = 0.0;
+                if (i + 1 >= n && !out[i].pin_a) {
+                    size_t l1 = size_t(-1), l2 = size_t(-1);
+                    for (size_t k = i; k-- > 0;) { if (out[k].dropped || !knots[k].sample) continue; if (l1 == size_t(-1)) l1 = k; else { l2 = k; break; } }
+                    const bool has1 = l1 != size_t(-1) || (before && before->sample);
+                    const bool has2 = l2 != size_t(-1) || (l1 != size_t(-1) && before && before->sample);
+                    if (has1 && has2) {
+                        const double p1 = l1 != size_t(-1) ? out[l1].p : before->p, t1 = double(l1 != size_t(-1) ? knots[l1].t_us : before->t_us);
+                        const double p2 = l2 != size_t(-1) ? out[l2].p : before->p, t2 = double(l2 != size_t(-1) ? knots[l2].t_us : before->t_us);
+                        const double t0 = double(knots[i].t_us);
+                        if (t0 > t1 && t1 > t2) {
+                            const double d1 = (out[i].p - p1) / ((t0 - t1) * 1e-6), d2 = (p1 - p2) / ((t1 - t2) * 1e-6);
+                            a_tail = 2.0 * (d1 - d2) / ((t0 - t2) * 1e-6);
+                            a_tail = std::fmax(-double(L.amax), std::fmin(double(L.amax), a_tail));
+                        }
+                    }
+                }
+                ch.v[m] = out[i].pin_v ? out[i].v : 0.0;
+                ch.a[m] = out[i].pin_a ? out[i].a : a_tail;
+                ch.fix_v[m] = out[i].pin_v;
+                ch.fix_a[m] = out[i].pin_a || i + 1 >= n;
+            }
             else {
                 // Velocity: pinned when authored, relaxed, or the last knot's
                 // bounded secant; free otherwise. Acceleration: pinned when
@@ -379,6 +470,10 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         // never overshot. Accelerations are solved again under the clamped
         // velocities. A stream's secants agree, so the band is wide there and
         // the minimum-jerk velocities pass untouched.
+        // A sample at a sign change is exempt from the zero: a stream sampled
+        // densely reverses BETWEEN two samples, and a zero slope forced onto
+        // the nearest one bulged the piece (jerk) and stretched it at every
+        // peak of a sine. A sample on a plateau (a hold) still rests.
         bool clamped = false;
         for (size_t k = 0; k < m; ++k) {
             if (ch.fix_v[k]) continue;
@@ -386,7 +481,8 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
             const double dl = (ch.p[k] - pl) / std::fmax(ch.t[k] - tl, 1e-6);
             const double dr = k + 1 < m ? (ch.p[k + 1] - ch.p[k]) / std::fmax(ch.t[k + 1] - ch.t[k], 1e-6) : dl;
             double band = 0.0;
-            if (dl == 0.0 || dr == 0.0 || (dl < 0.0) != (dr < 0.0)) band = 0.0;
+            if (dl == 0.0 || dr == 0.0) band = 0.0;
+            else if ((dl < 0.0) != (dr < 0.0)) { if (knots[map[k]].sample) continue; band = 0.0; }
             else band = 3.0 * std::fmin(std::fabs(dl), std::fabs(dr));
             const double sgn = dl < 0.0 ? -1.0 : 1.0;
             double v = ch.v[k];
@@ -420,6 +516,14 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
                 const double vl = k ? ch.v[k - 1] : ch.v0, al = k ? ch.a[k - 1] : ch.a0;
                 const double T = ch.t[k] - tl;
                 if (!(T > 0.0)) continue;   // a plateau piece (equal knots) must stay flat: checked too
+                // A piece between two moving samples may crest between them:
+                // a stream sampled densely reverses between samples, and the
+                // repair pinned the junction accelerations at every peak of a
+                // sine, which bulged the piece and stretched it. A piece into
+                // or out of a resting sample (a hold, a dead stop) is still
+                // repaired: that is the overshoot the repair exists for.
+                if (knots[map[k]].sample && (k == 0 || knots[map[k - 1]].sample)
+                    && !(ch.fix_v[k] && ch.v[k] == 0.0) && !(k > 0 && ch.fix_v[k - 1] && ch.v[k - 1] == 0.0)) continue;
                 const Piece q = Piece::hermite(0, State{float(pl), float(vl), float(al)}, uint64_t(T * 1e6 + 0.5),
                                                State{float(ch.p[k]), float(ch.v[k]), float(ch.a[k])});
                 // At every extremum inside (0,1) the position must stay within
@@ -458,7 +562,59 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
     // Solve knot i from prev. rest_end: the knot ends the timeline (everything
     // after it was dropped), so it rests and no backward relaxation runs.
     // Returns false when the knot was dropped.
+    // Stream REPLAY. A sample solved before keeps its time (its prior), and
+    // the first one its prior junction too: the committed curve continued,
+    // exactly. A sample solved for the first time sits nine tenths of its
+    // authored spacing behind the sample before it, never before its own
+    // authored time: a stream that lags is replayed a tenth faster than it
+    // was sent, so the lag closes at the tail and nothing in flight moves.
+    // Pulling the knots in flight earlier instead put the whole catch-up
+    // into the first piece, which bulged (jerk) and was illegal whenever the
+    // stream ran near its own speed; a chain re-expanded behind a floored
+    // first knot never closed its lag at all. A sample behind one that was
+    // stretched past its prior follows it at nine tenths of the spacing.
+    auto hasPrior = [&](size_t k) { return prior && prior[k].t_us != 0 && knots[k].sample; };
+    // The time of sample k behind the knot before it (prev_k, at prev_t), or
+    // behind the knot retired just before the window when there is none.
+    auto sampleTime = [&](size_t k, uint64_t prev_t, size_t prev_k) -> uint64_t {
+        uint64_t t = hasPrior(k) ? prior[k].t_us : knots[k].t_us;
+        uint64_t want = prev_t + kMinSpanUs;
+        if (prev_k != size_t(-1)) {
+            if (knots[prev_k].sample && knots[k].t_us > knots[prev_k].t_us) {
+                const uint64_t spacing = knots[k].t_us - knots[prev_k].t_us;
+                want = prev_t + replaySpacing(spacing, compression(prev_t, knots[prev_k].t_us, spacing));
+            }
+        } else if (before && before->sample && knots[k].t_us > before->t_us) {
+            const uint64_t spacing = knots[k].t_us - before->t_us;
+            want = before_solved_us + replaySpacing(spacing, compression(before_solved_us, before->t_us, spacing));
+            if (want < prev_t + kMinSpanUs) want = prev_t + kMinSpanUs;
+        }
+        return std::max(t, want);
+    };
+    auto floorSelf = [&](size_t i) { if (out[i].t_us < prev_us + kMinSpanUs) out[i].t_us = prev_us + kMinSpanUs; };
+    // Places every knot after i for the junction solve: a sample by the rule
+    // above, a segment where it stands, each one tick past the knot before.
+    auto placeLater = [&](size_t i) {
+        size_t pk = i;
+        for (size_t k = i + 1; k < n; ++k) {
+            if (out[k].dropped) continue;
+            if (knots[k].sample) out[k].t_us = sampleTime(k, out[pk].t_us, pk);
+            if (out[k].t_us < out[pk].t_us + kMinSpanUs) out[k].t_us = out[pk].t_us + kMinSpanUs;
+            pk = k;
+        }
+    };
     auto solveKnot = [&](size_t i, bool rest_end) -> bool {
+        // A sample: its prior time, or its replay time when new; the first
+        // sample of the window keeps its prior junction as well.
+        if (knots[i].sample) {
+            out[i].t_us = sampleTime(i, prev_us, last);
+            if (i == 0 && hasPrior(0) && !out[0].pin_v && !out[0].pin_a) {
+                out[0].pin_v = out[0].pin_a = true; out[0].v = prior[0].v; out[0].a = prior[0].a;
+            }
+        }
+        floorSelf(i); placeLater(i);
+        // A segment with no end velocity and nothing after it rests (SPEC 9.6).
+        const bool rest = rest_end || (i + 1 >= n && knots[i].rest_if_last && !knots[i].has_v);
         junctions(i);
         // HARD: cruise as fast as the head can legally reach, then the fastest
         // legal brake landing at rest exactly on the knot. Bisection on the
@@ -467,8 +623,24 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         if (junctionOf(knots[i]) == Junction::Hard) {
             const float d = out[i].p - prev.p;
             const float sgn = d >= 0.0f ? 1.0f : -1.0f;
+            const bool from_rest = prev.v == 0.0f && prev.a == 0.0f;
+            // A head is accepted when legal AND monotone: no extremum of its
+            // position outside the band between its ends. A quintic given
+            // more time than it needs winds up backward first (a lone hard
+            // stop from 0.1 to 0.5 fell to the window edge before it moved).
+            auto headOk = [&](const Piece& h, float p0, float p1) {
+                if (referee::worstRatio(h, L, lo, hi) > 1.0f) return false;
+                float taus[12]; const int nt = referee::extremumTaus(h.c, taus);
+                const float b_lo = std::fmin(p0, p1) - 1e-5f, b_hi = std::fmax(p0, p1) + 1e-5f;
+                for (int j = 0; j < nt; ++j) {
+                    if (taus[j] <= 0.0f || taus[j] >= 1.0f) continue;
+                    const float pj = h.at(h.start_us + uint64_t(taus[j] * h.T * 1e6f)).p;
+                    if (pj < b_lo || pj > b_hi) return false;
+                }
+                return true;
+            };
             float v_lo = 0.0f, v_hi = L.vmax, v_ok = -1.0f;
-            Piece head_ok; uint64_t head_us_ok = 0; State head_s_ok{};
+            Piece head_ok; uint64_t head_us_ok = 0, from_us_ok = prev_us; State head_s_ok{};
             for (int it = 0; it < 16; ++it) {
                 const float vc = it == 0 ? 0.0f : 0.5f * (v_lo + v_hi);
                 const Profile br = Profile::brake(State{0.0f, sgn * vc, 0.0f}, 0, L);
@@ -477,21 +649,36 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
                 if (out[i].t_us <= prev_us + tb_us + 1000) { if (it) v_hi = vc; continue; }
                 const uint64_t tc = out[i].t_us - tb_us;
                 const State hs{out[i].p - br.end().p, sgn * vc, 0.0f};
-                const Piece head = Piece::hermite(prev_us, prev, tc, hs);
-                if (referee::worstRatio(head, L, lo, hi) <= 1.0f) { v_ok = vc; v_lo = vc; head_ok = head; head_us_ok = tc; head_s_ok = hs; }
+                // From rest the head starts as late as the ceilings allow: the
+                // carriage holds, launches, and brakes onto the knot. The
+                // shortest legal head is found by bisection on its duration
+                // (shorter is harder, so legality is monotone in it). A moving
+                // start has no choice of start.
+                uint64_t ts = prev_us;
+                if (from_rest) {
+                    uint64_t d_lo = 1000, d_hi = tc - prev_us;
+                    if (referee::worstRatio(Piece::hermite(tc - d_hi, prev, tc, hs), L, lo, hi) > 1.0f) { if (it == 0) break; v_hi = vc; continue; }
+                    for (int jt = 0; jt < 16 && d_hi > d_lo + 1000; ++jt) {
+                        const uint64_t mid = (d_lo + d_hi) / 2;
+                        if (referee::worstRatio(Piece::hermite(tc - mid, prev, tc, hs), L, lo, hi) <= 1.0f) d_hi = mid; else d_lo = mid;
+                    }
+                    ts = tc - d_hi;
+                }
+                const Piece head = Piece::hermite(ts, prev, tc, hs);
+                if (headOk(head, prev.p, hs.p)) { v_ok = vc; v_lo = vc; head_ok = head; head_us_ok = tc; head_s_ok = hs; from_us_ok = ts; }
                 else { if (it == 0) break; v_hi = vc; }
             }
             if (v_ok >= 0.0f) {
                 out[i].hard = true; out[i].head_us = head_us_ok; out[i].head = head_s_ok;
                 out[i].v = 0.0f; out[i].a = 0.0f; out[i].worst = referee::worstRatio(head_ok, L, lo, hi);
-                out[i].from = prev; out[i].from_us = prev_us;
+                out[i].from = prev; out[i].from_us = from_us_ok;
                 pp = prev; pp_us = prev_us; last = i;
                 prev = State{out[i].p, 0.0f, 0.0f};
                 prev_us = out[i].t_us;
                 return true;
             }
         }
-        if (rest_end) {
+        if (rest) {
             out[i].pin_a = true; out[i].a = 0.0f;
             if (!knots[i].has_v) { out[i].pin_v = true; out[i].v = 0.0f; }
         }
@@ -500,7 +687,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         // of |da| / jmax, centered on the knot, joins them. The knot is hit at
         // its time with its velocity. Falls through to the smooth path when
         // the head cannot legally reach the ramp's start.
-        if (cfg.corner == Corner::Cubic && !rest_end && knots[i].family == Family::C1 && knots[i].has_v
+        if (cfg.corner == Corner::Cubic && !rest && knots[i].family == Family::C1 && knots[i].has_v
             && knots[i].v != 0.0f && i + 1 < n) {
             const float vk = authored(i);
             const float Tin = float(out[i].t_us - prev_us) * 1e-6f;
@@ -540,12 +727,39 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
 
         Piece q; float worst = 0.0f;
         auto build = [&]() {
-            // The rail bound follows the knot: a Blend trim moves p toward the
-            // previous end state, which may be toward a wall.
+            // Every attempt re-solves the junctions: a spend moves this knot
+            // in time or position, and the velocity solved for the authored
+            // knot does not fit the moved one (a far sample stretched to a
+            // reachable time kept the secant of its authored 16 ms and was
+            // dropped as unreachable). The rail bound follows the knot too: a
+            // Blend trim moves p toward the previous end state, which may be
+            // toward a wall.
+            junctions(i);
             out[i].v = boundForRail(out[i].v, out[i].p);
             return Piece::hermite(prev_us, prev, out[i].t_us, State{out[i].p, out[i].v, out[i].a});
         };
-        auto judge = [&]() { q = build(); worst = referee::worstRatio(q, L, lo, hi); return worst <= 1.0f; };
+        auto judgeOnce = [&]() { q = build(); worst = referee::worstRatio(q, L, lo, hi);
+#ifdef K2_TRACE
+            std::printf("  judge i=%zu T=%.1fms prev(p%.6f v%.5f a%.4f) knot(p%.6f v%.5f a%.4f) worst=%.3g\n", i, double(out[i].t_us - prev_us) / 1000.0, prev.p, prev.v, prev.a, out[i].p, out[i].v, out[i].a, worst);
+#endif
+            return worst <= 1.0f; };
+        // The newest sample's free velocity is the chain's natural end,
+        // which swings past a velocity mismatch at the knot before it by
+        // seven eighths: a first sample solved two percent fast after a
+        // brake put the next one four percent slow, past a low acceleration
+        // ceiling inside one cadence, and no added time cures that (the
+        // secant only falls). Illegal free, the sample takes its piece's
+        // secant before any time is spent.
+        auto judge = [&]() {
+            if (judgeOnce()) return true;
+            if (knots[i].sample && !knots[i].has_v && !out[i].pin_v && i + 1 >= n && out[i].t_us > prev_us) {
+                out[i].pin_v = true;
+                out[i].v = boundForRail((out[i].p - prev.p) / (float(out[i].t_us - prev_us) * 1e-6f), out[i].p);
+                if (judgeOnce()) return true;
+                out[i].pin_v = false;
+            }
+            return false;
+        };
 
         // Reports of an attempt are held until the attempt that stands, so a
         // retried knot is counted once.
@@ -562,7 +776,7 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
             n_held = 0;
             out[i].share = 1.0f; out[i].stretched_s = 0.0f;
             if (judge()) return true;
-            if (cfg.policy == Policy::Blend) {
+            if (cfg.policy == Policy::Blend && !knots[i].sample) {
                 const float p_full = out[i].p;
                 float s_lo = cfg.amplitude_floor, s_hi = 1.0f, s_ok = -1.0f;
                 for (int it = 0; it < 14; ++it) {
@@ -577,19 +791,48 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
                 if (judge()) return true;
             }
             for (size_t k = i; k < n; ++k) out[k].base_us = out[k].t_us;
-            auto place = [&](uint64_t add) { for (size_t k = i; k < n; ++k) out[k].t_us = out[k].base_us + add; return judge(); };
             const uint64_t span = out[i].t_us - prev_us;
-            const float d = std::fabs(out[i].p - prev.p);
-            const float t_need = 2.0f * std::fmax(std::fmax(1.875f * d / L.vmax, std::sqrt(5.7735f * d / L.amax)),
-                                                  std::cbrt(60.0f * d / L.jmax));
-            const uint64_t t_hi = uint64_t(t_need * 1e6f) + 1000;
-            uint64_t add_lo = 0, add_hi = t_hi > span ? t_hi - span : 1000;
+            // A LONE sample (the only knot) stretched to four times its own
+            // span lands at rest: nothing says where the stream goes next, and
+            // the secant Stretch would otherwise minimize time against is the
+            // fastest legal arrival (a lone far sample ran past its point by
+            // its stop distance). A successor re-solves it moving. A stream's
+            // first sample from rest stretches less than that and flies
+            // through at the stream's speed (resting there, the next sample
+            // could not be reached flying and the ramp crawled).
+            const bool rest_when_stretched = i == 0 && n == 1 && knots[i].sample && !knots[i].has_v;
+            auto place = [&](uint64_t add) {
+                if (knots[i].sample) out[i].t_us = out[i].base_us + add;
+                else for (size_t k = i; k < n; ++k) out[k].t_us = out[k].base_us + add;
+                floorSelf(i); placeLater(i);
+                if (rest_when_stretched) {
+                    const bool r = add >= 3 * span;
+                    out[i].pin_v = r; out[i].pin_a = r;
+                    if (r) { out[i].v = 0.0f; out[i].a = 0.0f; }
+                }
+                return judge();
+            };
+            // Legality is not monotone in the time added: the junction values
+            // are solved again for every time, and a piece given too much
+            // time for its distance must dip (jerk) before a longer one is
+            // legal again. So the search climbs from a tenth of a tick by
+            // root two to the FIRST legal time, then bisects back to the
+            // illegal time before it (a bisection from the far end landed on
+            // the later boundary and stretched a 12 ms piece to 39; a
+            // doubling ladder stepped over the legal 10 to 14 ms window
+            // entirely; a climb from one tick stepped over the half-tick
+            // window a sample has when the carriage is already near its
+            // speed under a low acceleration ceiling, and a sample arriving
+            // during the engine's brake went three seconds out to rest).
             constexpr uint64_t kCap = 8000000;   // 8 s: past this the knot is unreachable
-            while (add_hi < kCap && !place(add_hi)) add_hi *= 2;
-            if (add_hi >= kCap) add_hi = kCap;
+            uint64_t add_lo = 0, add_hi = kCap;
             bool found = false;
-            if (place(add_hi)) {
-                found = true;
+            for (uint64_t add = 100; add < kCap; add = add + (add + 1) / 2 + add / 10) {   // about root two
+                if (place(add)) { add_hi = add; found = true; break; }
+                add_lo = add;
+            }
+            if (!found && place(kCap)) { add_hi = kCap; found = true; }
+            if (found) {
                 for (int it = 0; it < 18 && add_hi > add_lo + 1; ++it) {
                     const uint64_t mid = (add_lo + add_hi) / 2;
                     if (place(mid)) add_hi = mid; else add_lo = mid;
@@ -604,17 +847,63 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
         auto restore = [&]() {
             out[i].p = knots[i].p;
             for (size_t k = i; k < n; ++k) out[k].t_us = out[k].base_us;
+            floorSelf(i); placeLater(i);
+            if (knots[i].sample && !knots[i].has_v && !(i == 0 && hasPrior(0))) out[i].pin_v = false;
         };
         // Times as they stand now are the base a failed attempt restores to.
         for (size_t k = i; k < n; ++k) out[k].base_us = out[k].t_us;
 
+        // A sample's junction solved again with this knot in view (the
+        // junction before it stays as judged): the first sample after a
+        // brake, solved alone, ended two percent fast, and under a low
+        // acceleration ceiling no spend on the next sample could take that
+        // back inside a cadence. Its ladder then found the next legal time
+        // seconds out, past the sample and back to rest, and the stream
+        // queued behind that; zeroed instead, the stream was a staircase.
+        auto relaxJoint = [&]() -> bool {
+            if (last == size_t(-1) || out[last].hard || !knots[last].sample || knots[last].has_v) return false;
+            const bool pv = out[last].pin_v, pa = out[last].pin_a;
+            const float ov = out[last].v, oa = out[last].a;
+            out[last].pin_v = false; out[last].pin_a = false;
+            junctions(last);
+            const State np{out[last].p, boundForRail(out[last].v, out[last].p), out[last].a};
+            const Piece back = Piece::hermite(pp_us, pp, prev_us, np);
+#ifdef K2_TRACE
+            std::printf("  relaxJoint i=%zu last=%zu old(v%.5f a%.4f) new(v%.5f a%.4f) back=%.3g\n", i, last, ov, oa, np.v, np.a, referee::worstRatio(back, L, lo, hi));
+#endif
+            if (referee::worstRatio(back, L, lo, hi) > 1.0f || (np.v == ov && np.a == oa)) {
+                out[last].pin_v = pv; out[last].pin_a = pa; out[last].v = ov; out[last].a = oa;
+                return false;
+            }
+            out[last].v = np.v; out[last].a = np.a; out[last].pin_v = out[last].pin_a = true;
+            prev = np;
+            return true;
+        };
         bool legal = spend();
+        // A sample stretched past three of its spans is the ladder's far
+        // answer; the joint solve is tried first and kept when it stretches
+        // less.
+#ifdef K2_TRACE
+        std::printf("  spent i=%zu legal=%d stretched=%.1fms base_span=%.1fms last=%zd\n", i, int(legal), out[i].stretched_s * 1e3f, double(out[i].base_us - prev_us) / 1000.0, (ptrdiff_t)last);
+#endif
+        if (legal && knots[i].sample && last != size_t(-1)
+            && uint64_t(out[i].stretched_s * 1e6f) >= 3 * (out[i].base_us - prev_us)) {
+            const Solved keep_last = out[last]; const State keep_prev = prev; const Solved keep_i = out[i];
+            restore();   // the joint solve sees this knot at its base time, not the far one
+            if (relaxJoint()) {
+                const bool l2 = spend();
+                if (!(l2 && out[i].stretched_s < keep_i.stretched_s)) {
+                    out[last] = keep_last; prev = keep_prev;
+                    restore(); legal = spend();
+                }
+            } else legal = spend();
+        }
         // Backward relaxation. When no spend on this knot makes its piece
         // legal, the fault is the state it starts from: the last accepted
         // junction's acceleration (and, for a free knot, velocity) was chosen
         // with its own piece in view and this one not yet. Zero them when
         // that piece stays legal with the change, and spend again.
-        if (!legal && !rest_end && last != size_t(-1) && !out[last].hard) {
+        if (!legal && !rest && last != size_t(-1) && !out[last].hard) {
             auto relax = [&](bool alsoV) -> bool {
                 State np = prev; np.a = 0.0f; if (alsoV) np.v = 0.0f;
                 const Piece back = Piece::hermite(pp_us, pp, prev_us, np);
@@ -625,19 +914,20 @@ inline void solveWindow(const State& origin, uint64_t origin_us, const Knot* kno
                 return true;
             };
             if (relax(false)) { restore(); legal = spend(); }
+            if (!legal && relaxJoint()) { restore(); legal = spend(); }
             if (!legal && !knots[last].has_v && relax(true)) { restore(); legal = spend(); }
         }
         // Last resort on this side: an outward junction acceleration at the
         // knot itself.
         if (!legal && !out[i].pin_a) { out[i].a = 0.0f; out[i].pin_a = true; restore(); legal = spend(); }
 
-        for (int h = 0; h < n_held; ++h) report(held[h].k, out[i].t_us, out[i].p, held[h].detail);
+        for (int h = 0; h < n_held; ++h) report(held[h].k, i, out[i].t_us, out[i].p, held[h].detail);
         if (!legal) {
             // Unreachable: drop the knot rather than render past a ceiling.
             // The next piece starts where this one would have.
             restore();
             out[i].dropped = true; out[i].share = 1.0f; out[i].stretched_s = 0.0f; out[i].worst = worst;
-            report(AnomalyKind::PlanFailed, out[i].t_us, knots[i].p, worst);
+            report(AnomalyKind::PlanFailed, i, out[i].t_us, knots[i].p, worst);
             return false;
         }
         out[i].worst = worst;

@@ -55,7 +55,10 @@ struct Piece {
         State s;
         if (has_tail && t >= tail.start_us) return tail.at(t);
         if (T <= 0.0f) { s.p = c[0]; return s; }
-        float tau = float(t - start_us) * 1e-6f / T;
+        // Before its start the piece holds its start state: the unsigned
+        // difference wrapped and returned the END state (a hard-stop knot
+        // from rest sat at its launch state for the whole hold).
+        float tau = t <= start_us ? 0.0f : float(t - start_us) * 1e-6f / T;
         if (tau < 0.0f) tau = 0.0f;
         if (tau > 1.0f) tau = 1.0f;
         const float t2 = tau * tau, t3 = t2 * tau, t4 = t3 * tau, t5 = t4 * tau;

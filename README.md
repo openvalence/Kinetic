@@ -1,34 +1,36 @@
 # Kinetic
 
-A jerk-limited trajectory engine for one linear axis. Header-only C++, no
-hardware dependencies, deterministic. It is the motion planner of the
-OpenValence Nucleus firmware (OSSM Flagship), published on its own so the
-motion work can be reused in other projects.
+Kinetic is a header-only C++ library that plans jerk-limited trajectories for
+one linear axis. It has no hardware dependencies and its output is
+deterministic. It is the motion planner of the OpenValence Nucleus firmware
+(OSSM Flagship) and can be used outside Nucleus.
 
 ## The model
 
-- **One trajectory per command**, planned from the engine's ACTUAL
+- **One trajectory per command**, planned from the engine's actual
   position, velocity and acceleration at that instant. The caller samples it
   on its own clock.
-- **Event-driven, never clocked.** A plan is computed when a command arrives
+- **Event-driven planning.** A plan is computed when a command arrives
   (or once, when a moving plan ends with nothing after it). Sampling is
-  polynomial or profile evaluation, nothing more.
+  polynomial or profile evaluation.
 - **Waveform segments** (a command with a duration) are Hermite curves in the
   sender's declared family (C1 cubic or C2 quintic) over exactly the commanded
   duration, scanned against the velocity, acceleration and jerk ceilings and
   the window before adoption.
 - **Infeasible segments follow a declared policy.** `Blend` (the default)
-  keeps the deadline and spends shape and amplitude together, only as far as
-  the ceilings demand. `Stretch` keeps the whole stroke and overruns the
+  keeps the deadline and reduces shape and amplitude together, only as far as
+  the ceilings require. `Stretch` keeps the whole stroke and overruns the
   deadline.
-- **Amplitude is a floor.** `infeasible_amplitude_budget` bounds how much of a
+- **Amplitude floor.** `infeasible_amplitude_budget` bounds how much of a
   commanded stroke Blend may give up; the search never crosses it.
 - **The Ruckig guard.** A shape still illegal at the floor is handed to Ruckig
-  and planned time-optimally under the ceilings, late, and reported. Bare
+  and planned time-optimally under the ceilings; it arrives after the deadline
+  and records an anomaly. Bare
   points (no duration) are chased by Ruckig, replanned per point; a moving
   plan that starves is braked to rest by Ruckig's velocity interface.
-- **Limits are ceilings, never targets.** Every infeasible path records an
-  `Anomaly` that names the axis it spent.
+- **Limits.** Limits are upper bounds; the planner does not plan to reach
+  them. Every infeasible path records a motion anomaly that describes what
+  the planner gave up.
 
 ## Example
 
@@ -52,7 +54,7 @@ for (uint64_t t = now_us; t <= now_us + 300000; t += 1000)
     drive(engine.positionAt(t));          // sample on your own clock
 
 kinetic::Anomaly an;
-while (engine.popAnomaly(an))             // what the planner had to spend
+while (engine.popAnomaly(an))             // anomalies the planner recorded
     report(an.kind, an.detail);
 ```
 
@@ -66,7 +68,7 @@ apply at the next plan. The header documents each.
 
 | Quantity | Unit |
 |---|---|
-| position | normalized 0..1 across the caller's travel window |
+| position | normalized 0..1 across the caller's stroke window |
 | velocity, acceleration, jerk | window units per second, per second², per second³ |
 | limits | the same; derive them as mm limits divided by the window span |
 | time | microseconds, `uint64_t`, supplied by the caller (never read from a clock) |
@@ -76,26 +78,25 @@ Mapping the window to millimeters, steps or encoder counts is the caller's.
 
 ## Determinism
 
-Planning math is `double`; the public API is `float`. Same calls in give the
-same bits out on every IEEE-754 target, provided every translation unit that
+Planning math is `double`; the public API is `float`. The same sequence of calls
+gives bit-identical results on every IEEE-754 target, provided every translation unit that
 compiles the planner is built with `-ffp-contract=off` and without
 `-ffast-math`. The CMake target carries the flag as an INTERFACE option; any
 other build must set it.
 
-The ESP32-P4 is why this is a rule: GCC's default contraction emitted fused
-multiply-add instructions in the firmware's float paths there, and the machine
-then disagreed with the native and wasm builds by a few ULPs.
+GCC's default FP contraction emits fused multiply-add on targets such as the
+ESP32-P4, and results then differ from native and wasm builds by a few ULPs.
 
 The engine is single-threaded: every call on one `Engine` comes from one
 task. `commit()` nests KB-scale Ruckig temporaries, so the task that calls it
 needs a deep stack; measure its high-water mark before shrinking it.
 
-## Using it
+## Integration
 
 **Sibling checkout** (what Nucleus does): clone Kinetic beside your project,
 point the build at it with one of the forms below, and record the Kinetic
 commit sha in a pin file (Nucleus: `kinetic.pin`; its lint fails when the
-checkout's HEAD is not the pin). Changes land here first, then the pin moves.
+checkout's HEAD is not the pin). Changes are made in Kinetic first; the pin is then updated.
 
 **Vendor it**: copy `include/`, `third_party/ruckig/`, `LICENSE` and
 `NOTICE.md` into your tree. Never edit the copy.
@@ -126,9 +127,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Every kinematic assertion samples the produced trajectory on a 1 ms grid, so
-the ceilings are verified as sampled reality rather than trusted from the
-planner.
+Every kinematic assertion samples the produced trajectory on a 1 ms grid
+and checks those samples against the ceilings.
 
 ## WebAssembly
 
@@ -154,17 +154,25 @@ const out = k.malloc(64);
 k.kinetic_step(h, 0.001, out);                        // layout: kinetic_wasm.h
 ```
 
-Nucleus builds a different module, the whole machine (its motion arbiter
-around this engine) for its offline renderer; that one stays in Nucleus.
+Nucleus builds a separate module for its offline renderer: this engine wrapped
+in the firmware's motion arbiter (Nucleus `tools/kinetic-wasm/`). That module
+stays in Nucleus.
 
-## Not included
+The same build also produces `build-wasm/wasm/kinetic2.wasm`: Kinetic² behind
+`wasm/kinetic2_wasm.h`. Create a handle, configure the ceilings and planner
+options, reset at a position, submit knots in window units on your own clock,
+sample the state at a time, read the solved knots and the anomalies. Sampling
+retires knots the clock has passed, so sample with non-decreasing times
+between resets. `playground/` is a browser page over this module.
+
+## Scope
 
 Kinetic plans one axis inside a window it is given. These belong to the
 machine around it, and in OpenValence they live in Nucleus:
 
 - window ownership: homing, the stroke window's physical limits, the clamp
   that is the hard backstop downstream of the planner;
-- arbitration: which source owns motion, e-stop, pause, power gates;
+- arbitration: which source owns motion, ESTOP, pause, power gates;
 - the wire protocol: decoding Valence segments into `Command`s, pacing,
   schedule horizons;
 - step generation and the emitter.

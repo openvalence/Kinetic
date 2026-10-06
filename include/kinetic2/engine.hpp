@@ -55,11 +55,19 @@ public:
         // brake is the engine's own guess that nothing follows; a knot proves
         // it wrong, so the engine re-plans from where the carriage is.
         if (a.explicit_brake && k.t_us <= a.origin_us) return refuse(k, now_us, kDetailPast);
-        if (!a.explicit_brake && a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) {
-            const State s = a.piece.at(now_us);
-            a.origin = s; a.origin_us = now_us;
-            a.piece = Piece::hold(s.p, now_us); a.piece_valid = true;   // replaced by the solve below
-        }
+        // A starvation brake in flight is kept through the reaction horizon
+        // and the knot is solved from the state there, like any curve in
+        // flight (RFC-105 (bb)). The brake's end stays the origin only when
+        // the horizon is past it.
+        auto replanFromBrake = [&]() {
+            const uint64_t tr = now_us + _cfg.react_us;
+            if (tr < a.piece.end_us) {
+                a.committed = a.piece; a.committed.end_us = tr;
+                a.origin = a.piece.at(tr); a.origin_us = tr;
+                a.has_committed = true;
+            }
+        };
+        if (!a.explicit_brake && a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) replanFromBrake();
         if (a.explicit_brake && now_us >= a.origin_us) a.explicit_brake = false;
         if (a.tl.full()) return refuse(k, now_us, kDetailTimelineFull);
         // An axis at rest has been holding since its origin: the first piece
@@ -77,11 +85,16 @@ public:
             if (!a.tl.empty()) {
                 const uint64_t tr = now_us + _cfg.react_us;
                 const Solved& k0 = a.sol[0];
-                if (k0.t_us <= tr) {
+                // A knot within one tick past the horizon counts as reached:
+                // left pending, it was re-solved one tick past the horizon
+                // with its prior junction, a piece no quintic can make legal,
+                // and the stretch that followed grew the stream's lag.
+                if (k0.t_us <= tr + 1000) {
                     // Commit through the knot: its piece is kept whole.
                     a.committed = a.piece;
                     a.origin = State{k0.p, k0.v, k0.a};
                     a.origin_us = k0.t_us;
+                    a.before = a.tl.at(0); a.before_solved_us = k0.t_us; a.has_before = true;
                     a.tl.popFront();
                     for (size_t i = 0; i + 1 < a.n_sol; ++i) a.sol[i] = a.sol[i + 1];
                     if (a.n_sol) --a.n_sol;
@@ -93,6 +106,13 @@ public:
                     a.origin_us = tr;
                 }
                 a.has_committed = true;
+            } else if (!a.explicit_brake && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) {
+                // The knot due at this instant retired inside that call and
+                // starved the stream: the brake engaged and moved the origin
+                // to its end. Solved from there, the new knot's piece began
+                // in the future and the carriage teleported to the brake's
+                // end (a 29 mm step on the playground's starved stream).
+                replanFromBrake();
             }
         }
         if (!a.tl.push(k)) return refuse(k, now_us, kDetailPast);
@@ -156,6 +176,7 @@ public:
             const Solved& k = a.sol[0];
             a.origin = State{k.p, k.v, k.a};
             a.origin_us = k.t_us;
+            a.before = a.tl.at(0); a.before_solved_us = k.t_us; a.has_before = true;
             a.tl.popFront();
             for (size_t i = 0; i + 1 < a.n_sol; ++i) a.sol[i] = a.sol[i + 1];
             if (a.n_sol) --a.n_sol;
@@ -223,6 +244,17 @@ private:
         bool     explicit_brake = false;   // brake(): refuses knots before its end
         Piece    committed{};              // the curve kept through the reaction horizon
         bool     has_committed = false;
+        // Anomaly kinds already reported per pending knot (by its authored
+        // time): a re-solve finds the same spends again and must not report
+        // them again. Pruned as knots leave the timeline.
+        uint64_t rep_t[Capacity] = {};
+        uint16_t rep_m[Capacity] = {};
+        size_t   rep_n = 0;
+        // The knot retired last, as authored: a stream's previous sample,
+        // which the solver's derivatives at the first knot need.
+        Knot     before{};
+        uint64_t before_solved_us = 0;   // when it was reached
+        bool     has_before = false;
     };
 
     void resetAxis(size_t ax, float p, uint64_t now_us) {
@@ -236,6 +268,8 @@ private:
         a.piece_valid = true;
         a.explicit_brake = false;
         a.has_committed = false;
+        a.rep_n = 0;
+        a.has_before = false;
     }
 
     // Solve the whole pending window from the origin. Knots are copied out of
@@ -245,8 +279,36 @@ private:
         Knot tmp[Capacity];
         const size_t n = a.tl.size();
         for (size_t i = 0; i < n; ++i) tmp[i] = a.tl.at(i);
-        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol,
-                    [this](AnomalyKind k, uint64_t t, float target, float detail) { record(k, t, target, detail); });
+        // Forget the reported kinds of knots no longer pending.
+        {
+            const uint64_t oldest = n ? tmp[0].t_us : ~uint64_t(0);
+            size_t m = 0;
+            for (size_t i = 0; i < a.rep_n; ++i)
+                if (a.rep_t[i] >= oldest) { a.rep_t[m] = a.rep_t[i]; a.rep_m[m] = a.rep_m[i]; ++m; }
+            a.rep_n = m;
+        }
+        auto report = [this, &a, &tmp, n](AnomalyKind k, size_t i, uint64_t t, float target, float detail) {
+            static_assert(uint8_t(AnomalyKind::KnotRefused) < 16, "the reported mask is one halfword");
+            const uint16_t bit = uint16_t(1u << uint8_t(k));
+            if (i < n) {
+                const uint64_t key = tmp[i].t_us;
+                size_t j = 0;
+                while (j < a.rep_n && a.rep_t[j] != key) ++j;
+                if (j == a.rep_n) {
+                    if (a.rep_n == Capacity) { for (size_t q = 1; q < Capacity; ++q) { a.rep_t[q - 1] = a.rep_t[q]; a.rep_m[q - 1] = a.rep_m[q]; } --a.rep_n; j = a.rep_n; }
+                    a.rep_t[j] = key; a.rep_m[j] = 0; ++a.rep_n;
+                }
+                if (a.rep_m[j] & bit) return;
+                a.rep_m[j] |= bit;
+            }
+            record(k, t, target, detail);
+        };
+        // Each knot's time and junction acceleration from the previous solve
+        // (aligned with the ring: pops and erases shift both), zero time for a
+        // knot solved for the first time. A sample keeps its lag from it.
+        Prior prior[Capacity];
+        for (size_t i = 0; i < n; ++i) prior[i] = i < a.n_sol ? Prior{a.sol[i].t_us, a.sol[i].v, a.sol[i].a} : Prior{};
+        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.has_before ? &a.before : nullptr, a.before_solved_us, prior);
         // A knot the solver dropped leaves the timeline for good.
         size_t m = 0;
         for (size_t i = 0; i < n; ++i) {
@@ -267,8 +329,11 @@ private:
             a.origin.v = 0.0f; a.origin.a = 0.0f;
         } else {
             const Solved& k = a.sol[0];
+            // A HARD head solved from rest may start later than the origin:
+            // the piece holds the origin state until then (Piece::at clamps).
+            const uint64_t t0 = (k.hard && k.from_us > a.origin_us) ? k.from_us : a.origin_us;
             if (k.hard) {
-                a.piece = Piece::hermite(a.origin_us, a.origin, k.head_us, k.head);
+                a.piece = Piece::hermite(t0, a.origin, k.head_us, k.head);
                 a.piece.has_tail = true;
                 a.piece.tail = Profile::brake(k.head, k.head_us, _cfg.limits);
                 a.piece.end_us = k.t_us;

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kinetic² playground</title>
+<meta name="description" content="The Kinetic² motion planner, compiled to WebAssembly, in the browser.">
+<link rel="stylesheet" href="play.css">
+<script type="module" src="play.js"></script>
+</head>
+<body>
+<header class="top">
+  <h1>Kinetic² playground</h1>
+  <p class="tag">Kinetic², the motion planner of the OSSM Flagship firmware, compiled to WebAssembly.</p>
+  <p class="meta"><span id="version" class="mono">loading kinetic2.wasm</span> · <a href="https://github.com/openvalence/Kinetic">github.com/openvalence/Kinetic</a> · <a href="https://openvalence.org/">openvalence.org</a></p>
+</header>
+
+<main class="layout">
+  <section class="stage">
+    <div class="bar">
+      <button id="play" class="btn primary" title="Play / pause (Space)">Play</button>
+      <div class="seg" id="span" role="group" aria-label="Timeline span"></div>
+      <div class="seg" id="mode" role="group" aria-label="Submission model"></div>
+      <label id="latwrap" class="inline">latency <input id="lat" type="range" min="0" max="500" step="1"><output id="latout" class="mono"></output></label>
+      <button id="copy" class="btn" title="Copy a link to this setup">Copy link</button>
+    </div>
+    <div class="bar presets" id="presets" aria-label="Presets"></div>
+    <div class="plotwrap">
+      <div class="plot" id="plotbox">
+        <canvas id="plot"></canvas>
+        <canvas id="overlay"></canvas>
+      </div>
+      <canvas id="rail" aria-label="Carriage"></canvas>
+    </div>
+    <p id="readout" class="readout mono">&nbsp;</p>
+    <ul class="legend" id="legend"></ul>
+    <section class="card">
+      <h2>Anomalies <span id="ancount" class="muted"></span></h2>
+      <div class="tablewrap"><table id="anoms"><thead><tr><th>time</th><th>kind</th><th>target</th><th>meaning</th></tr></thead><tbody></tbody></table></div>
+    </section>
+  </section>
+
+  <aside class="side">
+    <section class="card" id="inspector">
+      <h2>Knot</h2>
+      <p id="insp-none" class="muted">Click the position trace to add a knot; click a knot to inspect it.</p>
+      <div id="insp-start" hidden>
+        <p class="muted">Start state: at rest at time 0.</p>
+        <label class="row">position <input id="i-p0" type="number" min="0" max="1" step="0.01"></label>
+      </div>
+      <div id="insp-knot" hidden>
+        <label class="row">time (s) <input id="i-t" type="number" min="0.001" step="0.001"></label>
+        <label class="row">position <input id="i-p" type="number" min="0" max="1" step="0.01"></label>
+        <label class="row">family <select id="i-fam"><option value="2">C2 quintic</option><option value="1">C1 cubic</option></select></label>
+        <label class="row">end velocity <select id="i-vmode"><option value="free">free</option><option value="set">set</option></select></label>
+        <label class="row" id="i-vrow">u/s <input id="i-v" type="number" step="0.1"></label>
+        <p id="i-hint" class="muted small"></p>
+        <h3>Solved</h3>
+        <dl id="i-solved" class="kv mono"></dl>
+        <button id="i-del" class="btn">Delete knot</button>
+      </div>
+    </section>
+    <section class="card">
+      <h2>Planner options</h2>
+      <div id="opts"></div>
+      <button id="defaults" class="btn">Defaults</button>
+    </section>
+  </aside>
+</main>
+
+<footer class="keys">
+  <span><kbd>click</kbd> add knot</span> <span><kbd>drag</kbd> move</span> <span><kbd>Shift</kbd> fine</span>
+  <span><kbd>Ctrl</kbd> snap 50 ms / 0.05</span> <span><kbd>Del</kbd> remove selected</span>
+  <span><kbd>right-click</kbd> remove</span> <span><kbd>Space</kbd> play / pause</span> <span><kbd>Esc</kbd> deselect</span>
+</footer>
+<p id="status" class="status" role="status"></p>
+</body>
+</html>

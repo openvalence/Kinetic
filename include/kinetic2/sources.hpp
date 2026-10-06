@@ -7,7 +7,9 @@
 //   past the newest. The latency is the hub's schedule_latency_us for the
 //   grant, exact, not a budget.
 // - A segment is a knot at anchor + duration carrying the target and the
-//   sender's end velocity; its family decides the junction (types.hpp).
+//   sender's end velocity; its family decides the junction (types.hpp). With
+//   no end velocity it rests when it is the last knot (SPEC 9.6) and runs
+//   through once a successor is queued.
 #pragma once
 
 #include <cstdint>
@@ -23,6 +25,7 @@ constexpr Knot knotFromSample(float p, uint64_t arrival_us, uint32_t latency_us)
     k.p = p;
     k.has_v = false;            // the solver's monotone slope: no overshoot between samples
     k.family = Family::C2;
+    k.sample = true;            // soft deadline: stretched alone, never trimmed
     return k;
 }
 
@@ -36,6 +39,7 @@ constexpr Knot knotFromSegment(float target, uint32_t duration_us, bool has_end_
     k.has_v = has_end_vel;
     k.v = has_end_vel ? end_vel : 0.0f;
     k.family = family;
+    k.rest_if_last = !has_end_vel;   // SPEC 9.6: unspecified with no successor is rest
     return k;
 }
 
