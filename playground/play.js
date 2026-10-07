@@ -18,7 +18,7 @@ const TOL = 1e-3;
 const KNOT_SAMPLE = 0x1, KNOT_REST_IF_LAST = 0x2;
 const SPEND = 'rgba(77,166,255,0.55)';   // the reality blue, dimmed so spend marks never hide the trace   // relative slack before a sample counts as over a ceiling
 
-const DEF = { vmax: 3, amax: 30, jmax: 2000, policy: 'blend', floor: 0.25, corner: 'continuous', react: 4, look: 250 };
+const DEF = { vmax: 3, amax: 30, jmax: 2000, policy: 'blend', floor: 0.25, corner: 'cubic', react: 4, look: 250 };
 const SPANS = [1, 2, 5, 10];
 const KIND = { 1: 'PlanFailed', 2: 'SettleEngaged', 3: 'EndVelClamped', 4: 'DeadlineStretched', 6: 'WaveformScaled', 10: 'DwellZeroed', 11: 'KnotRefused' };
 const SENTINEL = { '-99': 'kDetailNonFinite: a non-finite value', '-95': 'kDetailPast: at or before now or the newest knot', '-96': 'kDetailTimelineFull: all 64 knot slots are pending' };
@@ -121,7 +121,8 @@ function replay() {
     while (e < ev.length && Math.round(ev[e].at * 1e6) <= tus) {
       const { k, at } = ev[e++];
       const now = Math.round(at * 1e6);
-      const flags = S.mode === 'stream' ? KNOT_SAMPLE : k.v == null ? KNOT_REST_IF_LAST : 0;
+      // A knot marked `jog` is a live jog: a C1 sample at rest is the HARD junction.
+      const flags = S.mode === 'stream' || k.jog ? KNOT_SAMPLE : k.v == null ? KNOT_REST_IF_LAST : 0;
       const ok = K.kinetic2_submit(h, Math.round(k.t * 1e6), k.p, k.v == null ? 0 : 1, k.v ?? 0, k.fam, now, flags);
       submits.push({ k, at: now / 1e6, ok });
       drain();
@@ -483,17 +484,17 @@ reduced.addEventListener('change', motionPref);
 
 // ---- presets ---------------------------------------------------------------
 const PRESETS = {
-  stroke: { label: 'Stroke', title: '0.2 to 0.8 at 0.5 s, back to 0.2 at 1.0 s, hard stop at the end', make: () => ({
+  stroke: { label: 'Stroke', title: '0.2 to 0.8 at 0.5 s, back to 0.2 at 1.0 s, a C1 stop at the end', make: () => ({
     T: 2, mode: 'ahead', p0: 0.2, knots: [{ t: 0.5, p: 0.8, fam: 2, v: null }, { t: 1.0, p: 0.2, fam: 1, v: 0 }] }) },
-  staircase: { label: 'Staircase', title: 'Five steps of 0.15 every 300 ms, each a C1 hard stop', make: () => ({
+  staircase: { label: 'Staircase', title: 'Five steps of 0.15 every 300 ms, each a C1 knot at rest', make: () => ({
     T: 2, mode: 'ahead', p0: 0.1, knots: [1, 2, 3, 4, 5].map((i) => ({ t: 0.3 * i, p: +(0.1 + 0.15 * i).toFixed(2), fam: 1, v: 0 })) }) },
   scrub: { label: 'Scrub', title: 'A 60 Hz stream of a 1 Hz sine, streamed at 16 ms latency. Capped at 60 knots (1 s): the ABI holds 64 pending knots', make: () => ({
     T: 2, mode: 'stream', lat: 16, p0: 0.15, knots: Array.from({ length: 60 }, (_, i) => {
       const t = (i + 1) / 60;
       return { t: +t.toFixed(6), p: +(0.5 - 0.35 * Math.cos(2 * Math.PI * t)).toFixed(5), fam: 2, v: null };
     }) }) },
-  hardstop: { label: 'Hard stop', title: 'A C1 knot with v = 0 in mid flight, then onward', make: () => ({
-    T: 2, mode: 'ahead', p0: 0.1, knots: [{ t: 0.6, p: 0.5, fam: 1, v: 0 }, { t: 1.2, p: 0.9, fam: 2, v: null }] }) },
+  hardstop: { label: 'Hard stop', title: 'A live jog to 0.5 (a C1 sample at rest: the fastest move, braked onto it), then onward', make: () => ({
+    T: 2, mode: 'ahead', p0: 0.1, knots: [{ t: 0.6, p: 0.5, fam: 1, v: 0, jog: true }, { t: 1.2, p: 0.9, fam: 2, v: null }] }) },
   overreach: { label: 'Overreach', title: '0.05 to 0.95 in 150 ms: Blend trims it, Stretch moves it', make: () => ({
     T: 1, mode: 'ahead', p0: 0.05, knots: [{ t: 0.15, p: 0.95, fam: 2, v: null }] }) },
   starved: { label: 'Starved stream', title: 'Streamed, a knot every 100 ms for 0.5 s, then nothing: the brake engages', make: () => ({
@@ -515,7 +516,7 @@ function saveHash() {
     const o = S.o;
     const j = JSON.stringify({ v: 1, T: S.T, m: S.mode, l: S.lat, p0: S.p0,
       o: [o.vmax, o.amax, o.jmax, o.policy, o.floor, o.corner, o.react, o.look],
-      k: S.knots.map((k) => [k.t, k.p, k.fam, k.v]) });
+      k: S.knots.map((k) => (k.jog ? [k.t, k.p, k.fam, k.v, 1] : [k.t, k.p, k.fam, k.v])) });
     const b = btoa(j).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     history.replaceState(null, '', '#' + b);
   }, 250);
@@ -536,7 +537,8 @@ function loadHash() {
         policy: o[3] === 'stretch' ? 'stretch' : 'blend', floor: num(o[4], 0, 1, DEF.floor), corner: o[5] === 'cubic' ? 'cubic' : 'continuous',
         react: num(o[6], 0, 50, DEF.react), look: num(o[7], 50, 1000, DEF.look) },
       knots: (Array.isArray(j.k) ? j.k : []).slice(0, 128).filter((k) => Array.isArray(k) && Number.isFinite(k[0]) && Number.isFinite(k[1]))
-        .map((k) => ({ t: clamp(k[0], 0.001, 10), p: clamp(k[1], 0, 1), fam: k[2] === 1 ? 1 : 2, v: Number.isFinite(k[3]) ? clamp(k[3], -100, 100) : null })),
+        .map((k) => ({ t: clamp(k[0], 0.001, 10), p: clamp(k[1], 0, 1), fam: k[2] === 1 ? 1 : 2, v: Number.isFinite(k[3]) ? clamp(k[3], -100, 100) : null,
+                       ...(k[4] === 1 ? { jog: true } : {}) })),
     };
     return true;
   } catch {

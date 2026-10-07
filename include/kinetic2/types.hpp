@@ -44,7 +44,7 @@ enum class Family : uint8_t { Unspecified = 0, C1 = 1, C2 = 2, Step = 3 };
 enum class Junction : uint8_t {
     Smooth   = 0,  // no end velocity, C2: v and a free, the smoothest curve through
     Authored = 1,  // end velocity pinned; a continuous under C2, free to step under C1
-    Hard     = 2,  // end velocity 0 under C1: the fastest legal brake lands at the knot
+    Hard     = 2,  // a live jog (a C1 sample at rest): the fastest move to rest on the knot
 };
 
 // ---- Knot -------------------------------------------------------------------
@@ -69,19 +69,24 @@ struct Knot {
 };
 
 // The junction a knot renders, by the rules above. Unspecified behaves as C2.
+// Only a SAMPLE is Hard: an authored segment with v = 0 is a reversal or a
+// hold in the author's curve, rendered with the author's accelerations under
+// C1 (Corner::Cubic) and smoothly under C2. A C1 funscript reversal made
+// Hard braked to rest at every peak (Kinetic kin-ecn, kin-7jd).
 constexpr Junction junctionOf(const Knot& k) {
     if (!k.has_v) return Junction::Smooth;
-    if (k.family == Family::C1 && k.v == 0.0f) return Junction::Hard;
+    if (k.sample && k.family == Family::C1 && k.v == 0.0f) return Junction::Hard;
     return Junction::Authored;
 }
 
 // ---- Corner (RFC-105 planner option `corner`) --------------------------------
-// How an AUTHORED C1 knot with a nonzero velocity renders. Both exist until
-// the tuner proves which earns its place (operator 2026-10-05).
+// How an AUTHORED C1 knot renders. Cubic is the default: the machine matches
+// the author's curve (operator ruling 2026-10-07); Continuous stays as the
+// option.
 enum class Corner : uint8_t {
-    Continuous = 0,  // the junction acceleration is smoothed through (default)
+    Continuous = 0,  // the junction acceleration is smoothed through
     Cubic      = 1,  // each side keeps the author's cubic acceleration, joined
-                     // by a jerk-limited ramp centered on the knot
+                     // by a jerk-limited ramp centered on the knot (default)
 };
 
 // ---- Config -----------------------------------------------------------------
@@ -94,7 +99,7 @@ struct Config {
     Policy  policy          = Policy::Blend;
     float   amplitude_floor = 0.25f;   // Blend never trims a stroke below this share of it
     uint32_t lookahead_us   = 250000;  // how far past now the solver considers knots
-    Corner  corner          = Corner::Continuous;
+    Corner  corner          = Corner::Cubic;
     // A knot arriving while the axis moves re-plans from the state this far
     // ahead of now; the curve up to there is committed. Long enough that the
     // re-plan never starts inside a piece too short to bend legally, short

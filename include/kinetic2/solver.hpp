@@ -726,6 +726,15 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             const size_t i = map[k];
             out[i].v = ch.v[k];
             out[i].a = ch.a[k];
+            // The ceiling bound again, after the repair's solves moved the
+            // free values: a junction at vmax still accelerating outward ran
+            // past it on the next piece, which no time could cure (a C1
+            // corner's exit fed such a chain).
+            const float v = out[i].v, a = out[i].a;
+            if (a != 0.0f && (a < 0.0f) == (v < 0.0f)) {
+                const float a_ok = std::sqrt(2.0f * L.jmax * std::fmax(0.0f, L.vmax - std::fabs(v)));
+                if (std::fabs(a) > a_ok) out[i].a = (a < 0.0f ? -1.0f : 1.0f) * a_ok;
+            }
         }
     };
 
@@ -856,25 +865,71 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             out[i].pin_a = true; out[i].a = 0.0f;
             if (!knots[i].has_v) { out[i].pin_v = true; out[i].v = 0.0f; }
         }
-        // CORNER: an authored C1 knot still moving. Each side keeps the
+        // CORNER: an authored C1 knot, moving or not (a reversal is where the
+        // author's two cubics disagree most). Each side keeps the
         // acceleration the author's cubic has there; one constant-jerk phase
-        // of |da| / jmax, centered on the knot, joins them. The knot is hit at
-        // its time with its velocity. Falls through to the smooth path when
+        // of |da| / jmax, centered on the knot, joins them. A quintic Hermite
+        // through p, v and a at both ends, with the cubic's own end
+        // accelerations, IS that cubic, so a C1 script renders as its
+        // author's curve wherever the ceilings allow it. The newest knot has
+        // no right side yet: the piece into it ends with the left cubic's
+        // acceleration, and when its successor arrives the re-solve (the new
+        // knot and the one before, Engine::kResolveDepth) gives it the ramp.
+        // A single C2 acceleration there was the chain's compromise between
+        // two cubics 12 apart at a peak: every rise wobbled and every peak
+        // shelved (Kinetic kin-7jd). Falls through to the smooth path when
         // the head cannot legally reach the ramp's start.
         if (cfg.corner == Corner::Cubic && !rest && knots[i].family == Family::C1 && knots[i].has_v
-            && knots[i].v != 0.0f && i + 1 < n) {
+            && out[i].t_us > prev_us + 1000) {
             const float vk = authored(i);
             const float Tin = float(out[i].t_us - prev_us) * 1e-6f;
-            const float Tout = float(out[i + 1].t_us - out[i].t_us) * 1e-6f;
-            const float pk = out[i].p, pn = out[i + 1].p, vn = slopeAt(i + 1);
+            const float pk = out[i].p;
             // Cubic Hermite second derivatives at the shared knot.
             float a_l = (6.0f * (prev.p - pk) + Tin * (2.0f * prev.v + 4.0f * vk)) / (Tin * Tin);
-            float a_r = (6.0f * (pn - pk) - Tout * (4.0f * vk + 2.0f * vn)) / (Tout * Tout);
             a_l = std::fmax(-L.amax, std::fmin(L.amax, a_l));
-            a_r = std::fmax(-L.amax, std::fmin(L.amax, a_r));
+            float a_r = a_l;
+            bool right_ok = true;
+            if (i + 1 < n && out[i + 1].t_us > out[i].t_us) {
+                const float Tout = float(out[i + 1].t_us - out[i].t_us) * 1e-6f;
+                const float pn = out[i + 1].p, vn = slopeAt(i + 1);
+                a_r = (6.0f * (pn - pk) - Tout * (4.0f * vk + 2.0f * vn)) / (Tout * Tout);
+                // The right cubic itself must keep the ceilings: leaving with
+                // the acceleration of a cubic the next knot cannot follow
+                // made it unreachable (dropped), where the smooth path's
+                // chain trims it (Blend) instead.
+                const float a_e = (6.0f * (pk - pn) + Tout * (2.0f * vk + 4.0f * vn)) / (Tout * Tout);
+                const Piece right = Piece::hermite(out[i].t_us, State{pk, vk, a_r}, out[i + 1].t_us, State{pn, vn, a_e});
+                ++work;
+                right_ok = referee::worstRatio(right, L, lo, hi) <= 1.0f;
+                a_r = std::fmax(-L.amax, std::fmin(L.amax, a_r));
+            }
             const float Tr = std::fabs(a_r - a_l) / L.jmax, h = 0.5f * Tr;
             const uint64_t h_us = uint64_t(h * 1e6f + 0.5f);
-            if (Tr > 0.0f && out[i].t_us > prev_us + h_us + 1000) {
+            // Any knot may turn out to be the last (a dropped successor, a
+            // starved stream) and the engine then brakes from the state it
+            // leaves: that brake must keep the ceilings and the window, or the
+            // knot takes the smooth path, whose junctions are bounded so.
+            auto stoppable = [&](const State& x) { ++work; return Profile::brake(x, 0, L).worstRatio(L, lo, hi) <= 1.0001f; };
+            auto accept = [&](const Piece& head, const State& at_end) {
+                out[i].worst = referee::worstRatio(head, L, lo, hi);
+                out[i].from = prev; out[i].from_us = prev_us;
+                pp = prev; pp_us = prev_us; last = i; out[i].shift_us = shift; out[i].own_us = 0;
+                prev = at_end; prev_us = out[i].t_us;
+                return kAccepted;
+            };
+            if (!right_ok) {
+                // the smooth path below
+            } else if (h_us == 0) {
+                // No step to ramp (equal sides, or the newest knot): the
+                // knot carries the left acceleration.
+                const State k{pk, vk, a_l};
+                const Piece head = Piece::hermite(prev_us, prev, out[i].t_us, k);
+                ++work;
+                if (referee::worstRatio(head, L, lo, hi) <= 1.0f && stoppable(k)) {
+                    out[i].v = vk; out[i].a = a_l;
+                    return accept(head, k);
+                }
+            } else if (out[i].t_us > prev_us + h_us + 1000) {
                 const float j = (a_r - a_l) / Tr;
                 // Walk the mid state back to the ramp's start.
                 const float vs = vk - a_l * h - 0.5f * j * h * h;
@@ -886,15 +941,11 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
                 if (referee::worstRatio(head, L, lo, hi) <= 1.0f) {
                     Profile ramp; ramp.start_us = ts; ramp.s0 = start; ramp.n = 1; ramp.dt[0] = Tr; ramp.jerk[0] = j; ramp.ends_at_rest = false;
                     const State exit = Profile::step(start, j, Tr);
-                    if (ramp.worstRatio(L, lo, hi) <= 1.0f) {
+                    if (ramp.worstRatio(L, lo, hi) <= 1.0f && stoppable(exit)) {
                         out[i].corner = true; out[i].head_us = ts; out[i].head = start; out[i].ramp = ramp;
                         out[i].t_us = ts + uint64_t(Tr * 1e6f + 0.5f);
                         out[i].p = exit.p; out[i].v = exit.v; out[i].a = exit.a;
-                        out[i].worst = referee::worstRatio(head, L, lo, hi);
-                        out[i].from = prev; out[i].from_us = prev_us;
-                        pp = prev; pp_us = prev_us; last = i; out[i].shift_us = shift; out[i].own_us = 0;
-                        prev = exit; prev_us = out[i].t_us;
-                        return kAccepted;
+                        return accept(head, exit);
                     }
                 }
             }
@@ -1183,7 +1234,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
         // junction's acceleration (and, for a free knot, velocity) was chosen
         // with its own piece in view and this one not yet. Zero them when
         // that piece stays legal with the change, and spend again.
-        if (!legal && !cut && !rest && last != size_t(-1) && !out[last].hard) {
+        if (!legal && !cut && !rest && last != size_t(-1) && !out[last].hard && !out[last].corner) {
             auto relax = [&](bool alsoV) -> bool {
                 State np = prev; np.a = 0.0f; if (alsoV) np.v = 0.0f;
                 const Piece back = Piece::hermite(pp_us, pp, prev_us, np);

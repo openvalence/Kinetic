@@ -11,7 +11,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0x5b30240b503689cdull   // accepted 2026-10-07 (kin-hnp): the hard stop renders as Profile::point from its moving start
+#define KINETIC2_FINGERPRINT 0xeeb05ecb9e775781ull   // accepted 2026-10-07 (kin-7jd): the C1 segment at rest is an authored knot, no longer Hard
 #endif
 
 using namespace kinetic2;
@@ -75,8 +75,10 @@ TEST_CASE("knots are hit at their times and the curve is continuous") {
     CHECK(s[400].p == doctest::Approx(0.3f).epsilon(1e-4));
     CHECK(s[600].p == doctest::Approx(0.6f).epsilon(1e-4));
     CHECK(s[600].v == doctest::Approx(0.0f).epsilon(1e-3));
-    // Past the last knot: a hold at its position.
-    CHECK(s[700].p == doctest::Approx(0.6f));
+    // Past the last knot: a hold at its position (a C1 knot keeps the
+    // author's acceleration into it, and the brake from there settles within
+    // a hundred-thousandth of the window).
+    CHECK(s[700].p == doctest::Approx(0.6f).epsilon(1e-4));
     CHECK(s[700].v == 0.0f);
     CHECK_FALSE(e.isBusy(now + 700 * kMs));
     // Continuity: no sample moves farther than its own velocity could carry
@@ -339,7 +341,9 @@ TEST_CASE("a hard stop keeps its speed longer than a smooth stop and lands at re
     Config cfg; cfg.limits = {4.0f, 40.0f, 1000.0f};
     auto run = [&](Family f) {
         Engine<> e(cfg, 0.0f);
-        REQUIRE(e.submit(knotAt(500 * kMs, 0.8f, true, 0.0f, f), 0));
+        Knot k = knotAt(500 * kMs, 0.8f, true, 0.0f, f);
+        k.sample = f == Family::C1;   // Hard is a live jog: a C1 sample at rest
+        REQUIRE(e.submit(k, 0));
         return sweep(e, 0, 600 * kMs);
     };
     const auto hard = run(Family::C1), smooth = run(Family::C2);
@@ -408,7 +412,11 @@ TEST_CASE("segments become knots at anchor plus duration with the authored end v
     CHECK(k.p == 0.7f);
     CHECK(k.has_v); CHECK(k.v == -1.5f);
     CHECK(junctionOf(k) == Junction::Authored);
-    CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, true, 0.0f, 0, Family::C1)) == Junction::Hard);
+    // An authored C1 segment at rest is a reversal or a hold, never Hard;
+    // a C1 sample at rest (a live jog) is.
+    CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, true, 0.0f, 0, Family::C1)) == Junction::Authored);
+    Knot jog = knotFromSample(0.7f, 0, 250 * kMs); jog.has_v = true; jog.family = Family::C1;
+    CHECK(junctionOf(jog) == Junction::Hard);
     CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, false, 0.0f, 0, Family::C2)) == Junction::Smooth);
 }
 
@@ -569,8 +577,8 @@ TEST_CASE("corner: cubic keeps the author's acceleration step as a jerk-limited 
     float jpk = 0.0f;
     for (size_t i = 281; i <= 320; ++i) jpk = std::max(jpk, std::fabs(cubic[i].a - cubic[i - 1].a) / 1e-3f);
     CHECK(jpk == doctest::Approx(2000.0f).epsilon(0.05));
-    // The default is Continuous: a Config{} run matches Continuous bit for bit.
-    Config d; CHECK(d.corner == Corner::Continuous);
+    // The default is Cubic (operator ruling 2026-10-07).
+    Config d; CHECK(d.corner == Corner::Cubic);
 }
 
 // ---- the oscillation modulator (kin-b5g, RFC-103) -----------------------------
@@ -840,7 +848,9 @@ TEST_CASE("a staircase of segments without end velocities, authored ahead, stays
 TEST_CASE("a lone hard stop from rest holds, launches and lands: it never winds up backward") {
     Config cfg;
     Engine<> e(cfg, 0.1f);
-    REQUIRE(e.submit(knotAt(1500 * kMs, 0.5f, true, 0.0f, Family::C1), 0));
+    Knot k = knotAt(1500 * kMs, 0.5f, true, 0.0f, Family::C1);
+    k.sample = true;   // a live jog
+    REQUIRE(e.submit(k, 0));
     const auto s = sweep(e, 0, 1600 * kMs);
     float worst_jump = 0.0f, lo = 1.0f, hi = 0.0f;
     for (size_t i = 1; i < s.size(); ++i) {
@@ -1154,4 +1164,94 @@ TEST_CASE("a live jog redirected mid-move replaces the move in flight and turns 
     CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
     CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
     CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
+}
+
+// ---- a C1 script renders as its author's cubics (kin-7jd) --------------------------
+
+namespace {
+
+struct ScriptRun {
+    double v_err_max = 0.0, v_err_first = 0.0, v_peak = 0.0;
+    int dips = 0, refused = 0, stretched = 0, trimmed = 0, failed = 0;
+};
+
+// A 1.3 s sine of 0.3 of the window as Phosphor sends a funscript: a segment
+// per 100 ms knot with the PCHIP slope as its end velocity, each submitted
+// 250 ms before its start, under the 84 mm rig's ceilings. The rendered
+// velocity is compared on the 1 ms grid with the derivative of the script's
+// own PCHIP curve; v_err_max is taken after the first span (the carriage
+// starts at rest with no acceleration, the first cubic does not).
+ScriptRun runPchipSine(Family fam, Corner corner) {
+    Config cfg; cfg.limits = {1000.0f / 84.0f, 50000.0f / 84.0f, 1.0e7f / 84.0f}; cfg.corner = corner;
+    Engine<> e(cfg, 0.5f);
+    const double period = 1300.0, step = 100.0, amp = 0.3;
+    const int n = int(5 * period / step);
+    std::vector<double> t(n), p(n), m(n, 0.0);
+    for (int i = 0; i < n; ++i) { t[i] = i * step; p[i] = 0.5 + amp * std::sin(6.283185307 * t[i] / period); }
+    for (int i = 1; i + 1 < n; ++i) {
+        const double a = (p[i] - p[i - 1]) / step, b = (p[i + 1] - p[i]) / step;
+        if (a * b <= 0.0) continue;
+        m[i] = 2.0 / (1.0 / a + 1.0 / b);   // Fritsch-Carlson on equal spacing (per ms)
+    }
+    auto pchipV = [&](double ms) {   // window units per second
+        for (int i = 1; i < n; ++i) {
+            if (ms > t[i]) continue;
+            const double h = t[i] - t[i - 1], s = (ms - t[i - 1]) / h;
+            const double d00 = 6 * s * s - 6 * s, d10 = 3 * s * s - 4 * s + 1, d01 = -6 * s * s + 6 * s, d11 = 3 * s * s - 2 * s;
+            return (d00 * p[i - 1] + d10 * h * m[i - 1] + d01 * p[i] + d11 * h * m[i]) / h * 1000.0;
+        }
+        return 0.0;
+    };
+    ScriptRun r;
+    std::vector<float> v;
+    int next = 1;
+    const uint64_t end = uint64_t(t[n - 1]) * kMs;
+    for (uint64_t now = 0; now <= end; now += kMs) {
+        while (next < n && uint64_t(t[next - 1]) * kMs <= now + 250 * kMs) {
+            const Knot k = knotFromSegment(float(p[next]), uint32_t(step) * kMs, true, float(m[next] * 1000.0),
+                                           uint64_t(t[next - 1]) * kMs, fam);
+            if (!e.submit(k, now)) ++r.refused;
+            ++next;
+        }
+        v.push_back(e.stateAt(0, now).v);
+        Anomaly a;
+        while (e.popAnomaly(a)) {
+            if (a.kind == uint8_t(AnomalyKind::DeadlineStretched)) ++r.stretched;
+            if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++r.trimmed;
+            if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++r.failed;
+        }
+    }
+    for (size_t i = 0; i < v.size(); ++i) {
+        const double err = std::fabs(v[i] - pchipV(double(i)));
+        r.v_peak = std::fmax(r.v_peak, std::fabs(pchipV(double(i))));
+        if (i < size_t(step)) r.v_err_first = std::fmax(r.v_err_first, err);
+        else r.v_err_max = std::fmax(r.v_err_max, err);
+    }
+    // A dip: inside a run of one sign, |v| falls and rises again by more
+    // than 2 percent of where it was.
+    for (size_t i = 2; i + 2 < v.size(); ++i) {
+        const float a = v[i - 2], b = v[i], c = v[i + 2];
+        if (a * c <= 0.0f || a * b <= 0.0f) continue;
+        if (std::fabs(b) < 0.98f * std::fabs(a) && std::fabs(c) > std::fabs(b) + 0.02f * std::fabs(a)) ++r.dips;
+    }
+    return r;
+}
+
+}  // namespace
+
+TEST_CASE("a C1 PCHIP script with the cubic corner renders as its author's curve; C2 compromises at every knot") {
+    const ScriptRun c1 = runPchipSine(Family::C1, Corner::Cubic);
+    const ScriptRun c2 = runPchipSine(Family::C2, Corner::Continuous);
+    MESSAGE("C1 cubic: v error " << c1.v_err_max << " (" << 100.0 * c1.v_err_max / c1.v_peak << " % of peak " << c1.v_peak
+            << "), first span " << c1.v_err_first << "; C2 continuous: v error " << c2.v_err_max << " ("
+            << 100.0 * c2.v_err_max / c2.v_peak << " %), first span " << c2.v_err_first);
+    CHECK(c1.v_err_max <= 0.02 * c1.v_peak);
+    CHECK(c1.dips == 0);
+    CHECK(c1.refused == 0);
+    CHECK(c1.stretched == 0);
+    CHECK(c1.trimmed == 0);
+    CHECK(c1.failed == 0);
+    // The sender asking for C2 gets the chain's compromise: allowed to wobble,
+    // and an order of magnitude off the author's curve.
+    CHECK(c2.v_err_max > 10.0 * c1.v_err_max);
 }
