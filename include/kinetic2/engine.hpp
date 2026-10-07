@@ -87,8 +87,13 @@ public:
 
     // ---- supersede ----------------------------------------------------------
     // The segments flush (Valence SPEC 5.4 "Supersede, the segments flush",
-    // RFC-087): drops every pending knot authored at or after t_us and keeps
-    // the ones before it. The curve through the reaction horizon is committed
+    // RFC-087): drops every pending knot authored AFTER t_us and keeps the
+    // ones at or before it: a segment whose start is at or after t_us is
+    // replaced, the one ending exactly at t_us is not (SPEC 9.6, RFC-087), so
+    // a bundle that begins where the queue ends changes nothing. Dropping
+    // the knot at t_us and standing a C2 hand-off in its place turned every
+    // knot of a C1 script into a C2 junction, one bundle per span, and the
+    // author's corners were lost. The curve through the reaction horizon is committed
     // first and never moves (RFC-105 (bb)). When t_us lies past the horizon
     // and inside the dropped plan, a knot at t_us carries that plan's (p, v)
     // there, so the motion in flight hands off at t_us as it would to any
@@ -101,7 +106,7 @@ public:
     // move the flush replaces (kin-hnp).
     size_t truncateAfter(size_t axis, uint64_t t_us, uint64_t now_us) {
         Axis& a = _ax[axis];
-        if (a.tl.empty() || (a.tl.newest().t_us < t_us && !a.tl.newest().sample)) return 0;
+        if (a.tl.empty() || (a.tl.newest().t_us <= t_us && !a.tl.newest().sample)) return 0;
         _now_us = now_us;
         commitHorizon(axis, now_us);
         // The hand-off needs the plan at t_us: the whole window, unbounded (a
@@ -113,10 +118,10 @@ public:
             const Knot& k = a.tl.at(i);
             return k.sample && a.sol[i].t_us > k.t_us ? a.sol[i].t_us : k.t_us;
         };
-        if (n == 0 || due(n - 1) < t_us) return 0;
+        if (n == 0 || due(n - 1) <= t_us) return 0;
         const bool past_horizon = t_us > a.origin_us + 1000;
         size_t keep = 0;
-        if (past_horizon) while (keep < n && due(keep) < t_us) ++keep;
+        if (past_horizon) while (keep < n && due(keep) <= t_us) ++keep;
         if (keep == n) return 0;
         const bool handoff = past_horizon && (keep == 0 || a.sol[keep - 1].t_us < t_us);
         const State hs = handoff ? planAt(a, t_us) : State{};

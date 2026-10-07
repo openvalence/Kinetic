@@ -916,10 +916,14 @@ TEST_CASE("truncateAfter: a flush 40 ms out drops the queue from there and hands
         queueRamp(e); queueRamp(twin);
         std::vector<State> s = sweep(e, 0, 110 * kMs);
         (void)sweep(twin, 0, 110 * kMs);
-        // The seek at 110 ms: everything from 150 ms is replaced by one segment back down.
+        // The seek at 110 ms: every segment starting at or after 150 ms is replaced
+        // by one segment back down; the knot AT 150 ms ends the segment that
+        // started at 100 ms and stays (RFC-087): it is the hand-off.
         const uint64_t now = 110 * kMs, t_base = 150 * kMs;
-        CHECK(e.truncateAfter(t_base, now) == 3);                   // the knots at 150, 200 and 250 ms
-        CHECK(e.newest().t_us == t_base);                           // the hand-off knot
+        CHECK(e.truncateAfter(t_base, now) == 2);                   // the knots at 200 and 250 ms
+        CHECK(e.newest().t_us == t_base);                           // the author's knot at 150 ms
+        CHECK(e.newest().family == Family::C2);
+        const float v_base = e.solved(0, e.pending() - 1).v;        // its solved junction velocity
         const size_t kept = e.pending();
         REQUIRE(e.submit(knotFromSegment(0.15f, 300 * kMs, false, 0.0f, t_base, Family::C2), now));
         REQUIRE(e.pending() == kept + 1);
@@ -934,7 +938,8 @@ TEST_CASE("truncateAfter: a flush 40 ms out drops the queue from there and hands
         MESSAGE("policy " << int(pol) << " hand-off p " << s[150].p << " vs queued " << old_at_base.p << ", v " << s[150].v
                           << " vs " << old_at_base.v << ", worst jump " << worstJump(s) << ", end " << s.back().p);
         CHECK(s[150].p == doctest::Approx(old_at_base.p).epsilon(1e-4));
-        CHECK(s[150].v == doctest::Approx(old_at_base.v).epsilon(1e-3));
+        CHECK(s[150].v == doctest::Approx(v_base).epsilon(1e-3));
+        CHECK(s[150].v == doctest::Approx(old_at_base.v).epsilon(2e-2));
         CHECK(worstJump(s) <= 0.0f);
         const Peaks pk = peaksOf(s);
         CHECK(pk.v <= cfg.limits.vmax * 1.001f);
@@ -1254,4 +1259,29 @@ TEST_CASE("a C1 PCHIP script with the cubic corner renders as its author's curve
     // The sender asking for C2 gets the chain's compromise: allowed to wobble,
     // and an order of magnitude off the author's curve.
     CHECK(c2.v_err_max > 10.0 * c1.v_err_max);
+}
+
+// RFC-087: a bundle that begins exactly where the queue ends replaces nothing;
+// the knot at its first start is the end of a segment that started before it.
+// Dropping it stood a C2 hand-off knot in its place on every bundle, and a C1
+// script lost the author's corner at every knot (bench, 2026-10-06).
+TEST_CASE("truncateAfter keeps the knot at its time: a bundle starting where the queue ends changes nothing") {
+    Config cfg; cfg.limits = {3.0f, 30.0f, 2000.0f};
+    Engine<> e(cfg, 0.2f);
+    REQUIRE(e.submit(knotFromSegment(0.4f, 200000, true, 0.5f, 0, Family::C1), 0));
+    REQUIRE(e.submit(knotFromSegment(0.6f, 200000, true, 0.5f, 200000, Family::C1), 0));
+    (void)e.stateAt(0, 1000);
+    CHECK(e.pending(0) == 2);
+    CHECK(e.truncateAfter(400000, 1000) == 0);   // the queue ends at 400 ms: nothing after it
+    CHECK(e.pending(0) == 2);
+    CHECK(e.newest().t_us == 400000);
+    CHECK(e.newest().family == Family::C1);
+    CHECK(e.truncateAfter(200000, 1000) == 1);   // after 200 ms: the second span goes, the first knot stays
+    CHECK(e.pending(0) == 1);
+    CHECK(e.newest().t_us == 200000);
+    CHECK(e.newest().family == Family::C1);
+    REQUIRE(e.submit(knotFromSegment(0.7f, 200000, true, 0.0f, 200000, Family::C1), 1000));
+    CHECK(e.truncateAfter(300000, 1000) == 1);   // inside the span: the hand-off knot stands at 300 ms
+    CHECK(e.newest().t_us == 300000);
+    CHECK(e.newest().has_v);
 }
