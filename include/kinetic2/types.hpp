@@ -102,6 +102,16 @@ struct Config {
     // measured: 6 ms pieces spiraled into reversals, a committed knot froze a
     // start-up velocity into every later piece).
     uint32_t react_us       = 4000;
+    // The most work one solve does, the hard bound on its time, in referee
+    // passes (every extremum of one piece; four knots of a junction solve
+    // count as one). Sized for the P4's 1 ms motion tick: unbounded, the
+    // funscript, jog and 60 Hz stream mixes need at most 107, 66 and 23 per
+    // plan and 29, 6 and 4 on average (tests/bench_kinetic2). A knot the
+    // budget does not reach, or cuts, waits for the next tick; only the first
+    // knot of a solve is always finished, with the best legal answer the
+    // budget found, or dropped (PlanFailed, kDetailBudget). A solve may pass
+    // the budget by the judge in flight. 0: unbounded.
+    uint32_t solve_budget   = 96;
 };
 
 // ---- Anomaly ----------------------------------------------------------------
@@ -127,6 +137,7 @@ enum class AnomalyKind : uint8_t {
 inline constexpr float kDetailNonFinite   = -99.0f;
 inline constexpr float kDetailPast        = -95.0f;   // t_us at or before the newest knot
 inline constexpr float kDetailTimelineFull = -96.0f;
+inline constexpr float kDetailBudget       = -97.0f;   // the solve's judge budget ran out before a legal spend
 
 struct Anomaly {
     uint8_t  kind   = 0;      // AnomalyKind

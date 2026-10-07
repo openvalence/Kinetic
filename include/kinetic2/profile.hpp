@@ -67,6 +67,24 @@ struct Profile {
         // Decel-positive frame: u = -sgn v (<= 0, rising to 0), b = -sgn a.
         const float speed = std::fabs(s.v);
         const float b0 = -sgn * s.a;
+        // Decelerating past the ceiling already (a brake under a lower amax
+        // than the motion it interrupts): ramp the deceleration down to amax
+        // under jmax, hold it, ramp out. Holding the entry deceleration for
+        // the hold the ceiling sizes ran a 200 mm/s jog through rest and 258
+        // mm the other way (Nucleus val-9z5). Too slow to ramp out before
+        // rest, it falls to the overshoot branch below.
+        if (b0 > A) {
+            const float t1 = (b0 - A) / J;
+            const float du1 = b0 * t1 - 0.5f * J * t1 * t1;
+            const float t2 = (speed - du1 - A * A / (2.0f * J)) / A;
+            if (t2 >= 0.0f) {
+                pr.n = 3;
+                pr.dt[0] = t1;    pr.jerk[0] = sgn * J;
+                pr.dt[1] = t2;    pr.jerk[1] = 0.0f;
+                pr.dt[2] = A / J; pr.jerk[2] = sgn * J;
+                return pr;
+            }
+        }
         // Trapezoid at the ceiling?
         float t1 = (A - b0) / J;
         if (t1 < 0.0f) t1 = 0.0f;

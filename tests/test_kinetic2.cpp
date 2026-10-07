@@ -11,7 +11,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0x7b1412ec62785464ull   // accepted 2026-10-06: stream replay (persisted samples, eased compression), rest-if-last segments, hard-stop hold
+#define KINETIC2_FINGERPRINT 0x05fddc79c1b5de09ull   // accepted 2026-10-06 (kin-ys0): float junctions, spends from the referee's ratio, 8-knot chain, solve budget
 #endif
 
 using namespace kinetic2;
@@ -146,6 +146,36 @@ TEST_CASE("the brake profile stops exactly, from any entry state") {
         CHECK(pr.worstRatio(L, -10.0f, 10.0f) <= 1.001f);
         for (int i = 0; i < pr.n; ++i) CHECK(pr.dt[i] >= 0.0f);
     }
+}
+
+TEST_CASE("a brake under a lower amax than the deceleration in flight never reverses (Nucleus val-9z5)") {
+    // The arbiter rig on a 268 mm rail: a jog at 200 mm/s decelerating at
+    // 200 mm/s^2 is paused, and the pause brake is planned under the input
+    // amax of 20 mm/s^2 and the input jerk of 5e6 mm/s^3.
+    const float rail = 268.0f;
+    const Limits L{1000.0f / rail, 20.0f / rail, 5.0e6f / rail};
+    const State s0{0.5f, 0.75f, -0.75f};
+    const Profile pr = Profile::brake(s0, 0, L);
+    for (int i = 0; i < pr.n; ++i) CHECK(pr.dt[i] >= 0.0f);
+    float min_v = s0.v;
+    for (float t = 0.0f; t <= pr.duration(); t += 1e-4f) min_v = std::fmin(min_v, pr.atSeconds(t).v);
+    CHECK(min_v >= -1e-6f);
+    // The end by the phases in closed form: a ten second brake read through
+    // atSeconds() resolves its 4 us ramp-out only to float time at 10 s.
+    State end = s0;
+    for (int i = 0; i < pr.n; ++i) end = Profile::step(end, pr.jerk[i], pr.dt[i]);
+    CHECK(end.v == doctest::Approx(0.0f).epsilon(1e-3).scale(1.0));
+    CHECK(end.a == doctest::Approx(0.0f).epsilon(1e-3).scale(1.0));
+    // Ahead of the entry by no more than the stop from v under the ceilings
+    // plus the travel while the deceleration ramps down to amax.
+    const float v = s0.v, A = L.amax, J = L.jmax;
+    const float ramp_in = v * (-s0.a - A) / J;
+    CHECK(end.p > s0.p);
+    CHECK(end.p - s0.p <= v * v / (2.0f * A) + v * A / (2.0f * J) + ramp_in + 1e-5f);
+    // After the ramp the deceleration never exceeds amax.
+    float peak_a = 0.0f;
+    for (float t = (-s0.a - A) / J; t <= pr.duration(); t += 1e-4f) peak_a = std::fmax(peak_a, std::fabs(pr.atSeconds(t).a));
+    CHECK(peak_a <= A * 1.001f);
 }
 
 TEST_CASE("reset forgets everything and holds the new position") {
@@ -933,4 +963,44 @@ TEST_CASE("truncateAfter: a flush at now drops the whole window and hands off at
     queueRamp(idle);
     CHECK(idle.truncateAfter(300 * kMs, 0) == 0);
     CHECK(idle.pending() == 5);
+}
+
+// ---- the solve budget (kin-ys0) -------------------------------------------------
+
+TEST_CASE("solve budget: a bundle past it is solved over later ticks, never dropped, and renders as unbounded") {
+    // An RFC-087 bundle: 32 segments in one submit burst, most past the
+    // ceilings, solved at the next sample. The default budget cannot solve
+    // them in one tick; the knots it does not reach wait, and the motion is
+    // the unbounded engine's, bit for bit.
+    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f}; cfg.policy = Policy::Blend;
+    REQUIRE(cfg.solve_budget > 0);
+    Config unb = cfg; unb.solve_budget = 0;
+    Engine<> e(cfg, 0.5f), ref(unb, 0.5f);
+    uint64_t at = 0;
+    for (int i = 0; i < 32; ++i) {
+        at += (i % 3 == 0 ? 90 : 140) * kMs;
+        const float p = 0.5f + (i % 2 ? -1.0f : 1.0f) * (0.1f + 0.012f * float(i));
+        const Knot k = knotFromSegment(p, uint32_t(at), true, 0.0f, 0, Family::C2);
+        REQUIRE(e.submit(k, 0));
+        REQUIRE(ref.submit(k, 0));
+    }
+    std::vector<State> s, r;
+    std::vector<Anomaly> an;
+    for (uint64_t t = 0; t <= at + 500 * kMs; t += kMs) {
+        s.push_back(e.stateAt(0, t));
+        r.push_back(ref.stateAt(0, t));
+        Anomaly a;
+        while (e.popAnomaly(a)) an.push_back(a);
+    }
+    float last = 0.0f;
+    const int failed = countKind(an, AnomalyKind::PlanFailed, &last);
+    CHECK(failed == 0);
+    CHECK(countKind(an, AnomalyKind::WaveformScaled) > 0);
+    size_t differ = 0;
+    for (size_t i = 0; i < s.size(); ++i) if (std::memcmp(&s[i], &r[i], sizeof(State)) != 0) ++differ;
+    CHECK(differ == 0);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.10f);
 }

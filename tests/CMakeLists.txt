@@ -22,3 +22,11 @@ target_include_directories(test_kinetic2_oracle PRIVATE third_party)
 target_compile_options(test_kinetic2_oracle PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall>)
 add_test(NAME test_kinetic2_oracle COMMAND test_kinetic2_oracle)
+
+# The solver's cost per submit (kin-ys0): counts under KINETIC2_STATS, never a
+# test (it prints a table and always exits 0).
+add_executable(bench_kinetic2 bench_kinetic2.cpp)
+target_link_libraries(bench_kinetic2 PRIVATE kinetic::kinetic2)
+target_compile_definitions(bench_kinetic2 PRIVATE KINETIC2_STATS)
+target_compile_options(bench_kinetic2 PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>)

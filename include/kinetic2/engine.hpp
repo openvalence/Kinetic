@@ -8,10 +8,13 @@
 //   it, from the state the previous piece ends in, so the rendered curve is
 //   continuous in p and v by construction. Sampling is polynomial evaluation.
 // - Single-threaded: every call on one Engine comes from one task.
-// - The pending window is solved as a whole (solver.hpp) whenever it changes,
-//   lazily at the next sample: junction values, the referee, the spend. A
-//   piece is then one solved interval. The brake profile (kin-4gd) replaces
-//   the trapezoid estimate in brake(), marked below.
+// - The pending window is solved (solver.hpp) whenever it changes, lazily at
+//   the next sample: junction values, the referee, the spend. A piece is then
+//   one solved interval. The brake profile (kin-4gd) replaces the trapezoid
+//   estimate in brake(), marked below.
+// - A solve is bounded (Config::solve_budget): knots it did not reach wait
+//   for the next tick, never dropped for it. The knot being rendered toward
+//   is always solved; a knot not yet solved reads as authored (solved()).
 #pragma once
 
 #include <cmath>
@@ -41,8 +44,17 @@ public:
     void resetAt(float p, uint64_t now_us) { resetAt(0, p, now_us); }
 
     const Config& config() const { return _cfg; }
-    void setConfig(const Config& c) { _cfg = c; }
-    void setLimits(const Limits& l) { _cfg.limits = l; }
+    // A change the solver sees unsettles every pending knot: the next solve
+    // (at the next submit, as before) re-solves the whole window under it.
+    void setConfig(const Config& c) {
+        const bool same = c.limits.vmax == _cfg.limits.vmax && c.limits.amax == _cfg.limits.amax
+                       && c.limits.jmax == _cfg.limits.jmax && c.policy == _cfg.policy
+                       && c.amplitude_floor == _cfg.amplitude_floor && c.corner == _cfg.corner
+                       && c.solve_budget == _cfg.solve_budget;
+        _cfg = c;
+        if (!same) for (size_t ax = 0; ax < DoF; ++ax) _ax[ax].settled = 0;
+    }
+    void setLimits(const Limits& l) { Config c = _cfg; c.limits = l; setConfig(c); }
 
     // ---- the one entry ------------------------------------------------------
     // A knot strictly in the future and after the axis's newest knot. False
@@ -50,6 +62,7 @@ public:
     // overfills is a bug on its side, counted here, never absorbed.
     bool submit(size_t axis, const Knot& k, uint64_t now_us) {
         Axis& a = _ax[axis];
+        _now_us = now_us;
         if (!std::isfinite(k.p) || (k.has_v && !std::isfinite(k.v))) return refuse(k, now_us, kDetailNonFinite);
         if (k.t_us <= now_us) return refuse(k, now_us, kDetailPast);
         // Inside an explicit brake (pause, e-stop) the brake wins. A starvation
@@ -63,7 +76,9 @@ public:
         // starts now, not when the hold began. A brake in flight keeps its end.
         if (a.tl.empty() && a.origin_us < now_us) a.origin_us = now_us;
         commitHorizon(axis, now_us);
+        const size_t n0 = a.tl.size();
         if (!a.tl.push(k)) return refuse(k, now_us, kDetailPast);
+        unsettleFrom(a, n0);
         a.solved_valid = false;
         a.piece_valid = false;
         return true;
@@ -84,8 +99,12 @@ public:
     size_t truncateAfter(size_t axis, uint64_t t_us, uint64_t now_us) {
         Axis& a = _ax[axis];
         if (a.tl.empty() || a.tl.newest().t_us < t_us) return 0;
+        _now_us = now_us;
         commitHorizon(axis, now_us);
-        ensureSolved(a);   // may drop unreachable knots; sol is aligned with tl after it
+        // The hand-off needs the plan at t_us: the whole window, unbounded (a
+        // seek is rare; its cost is one solve of what is queued). May drop
+        // unreachable knots; sol is aligned with tl after it.
+        ensureSolved(a, true);
         const size_t n = a.tl.size();
         const bool past_horizon = t_us > a.origin_us + 1000;
         size_t keep = 0;
@@ -95,6 +114,7 @@ public:
         const State hs = handoff ? planAt(a, t_us) : State{};
         a.tl.truncate(keep);
         a.n_sol = keep;
+        unsettleFrom(a, keep);
         {
             size_t m = 0;
             for (size_t i = 0; i < a.rep_n; ++i)
@@ -128,11 +148,13 @@ public:
     // end, at rest, so a knot submitted meanwhile chains from there and one
     // before its end is refused as past.
     bool brake(uint64_t now_us) {
+        _now_us = now_us;
         for (size_t ax = 0; ax < DoF; ++ax) {
             Axis& a = _ax[ax];
             const State s = stateAt(ax, now_us);
             a.tl.clear();
             a.n_sol = 0;
+            a.settled = 0;
             a.solved_valid = true;
             a.has_committed = false;
             const Profile pr = Profile::brake(s, now_us, _cfg.limits);
@@ -150,6 +172,7 @@ public:
     // ---- sampling -----------------------------------------------------------
     State stateAt(size_t axis, uint64_t now_us) {
         Axis& a = _ax[axis];
+        _now_us = now_us;
         if (a.has_committed) {
             if (now_us < a.committed.end_us) return a.committed.at(now_us);
             a.has_committed = false;
@@ -172,14 +195,18 @@ public:
         ensureSolved(a);
         // A brake in flight renders until its end; the origin already sits there.
         if (a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) return a.piece.at(now_us);
-        while (!a.tl.empty() && a.sol[0].t_us <= now_us) {
+        while (!a.tl.empty()) {
+            if (a.n_sol == 0) ensureSolved(a);   // the next knot was deferred: it is solved now, whatever the budget
+            if (a.tl.empty() || a.sol[0].t_us > now_us) break;
             const Solved& k = a.sol[0];
             a.origin = State{k.p, k.v, k.a};
             a.origin_us = k.t_us;
             a.before = a.tl.at(0); a.before_solved_us = k.t_us; a.has_before = true;
+            const size_t cnt = a.tl.size();
             a.tl.popFront();
-            for (size_t i = 0; i + 1 < a.n_sol; ++i) a.sol[i] = a.sol[i + 1];
+            for (size_t i = 0; i + 1 < cnt; ++i) a.sol[i] = a.sol[i + 1];
             if (a.n_sol) --a.n_sol;
+            if (a.settled) --a.settled;
             a.piece_valid = false;
             // The last knot reached while still moving: a starved stream (or a
             // script that ended moving). The only honest rendering is the
@@ -204,10 +231,12 @@ public:
     // Motion left to render on any axis. Solves first: Stretch may have moved
     // the last knot past the time the sender asked for.
     bool isBusy(uint64_t now_us) {
+        _now_us = now_us;
         for (size_t ax = 0; ax < DoF; ++ax) {
             Axis& a = _ax[ax];
             if (a.has_committed && a.committed.end_us > now_us) return true;
             ensureSolved(a);
+            if (a.tl.size() > a.n_sol) return true;   // knots the budget deferred
             if (a.n_sol && a.sol[a.n_sol - 1].t_us > now_us) return true;
             if (a.tl.empty() && a.piece_valid && a.piece.has_tail && a.piece.end_us > now_us) return true;
             if (a.tl.empty() && std::fabs(a.origin.v) > 1e-6f) return true;   // never after a brake: its origin is at rest
@@ -217,7 +246,9 @@ public:
 
     size_t pending(size_t axis = 0) const { return _ax[axis].tl.size(); }
     // The solver's decision for pending knot i (tooling: the tuner shows the
-    // share and the stretch per knot). Solves first.
+    // share and the stretch per knot). Solves first; a knot the budget
+    // deferred reads as authored (its time, position and velocity, a = 0)
+    // until a later tick solves it.
     const Solved& solved(size_t axis, size_t i) { ensureSolved(_ax[axis]); return _ax[axis].sol[i]; }
 
     // ---- anomalies ----------------------------------------------------------
@@ -238,7 +269,11 @@ private:
         uint64_t origin_us = 0;
         Solved   sol[Capacity]{};  // the solved window, aligned with tl
         jerk::Workspace ws{};      // the solver's banded system, this axis's own
-        size_t   n_sol = 0;
+        size_t   n_sol = 0;        // solved knots; sol[n_sol..tl.size()) are deferred, as authored
+        // The leading solved knots whose solutions stand: a re-solve starts
+        // after them (solveWindow's `settled`). Never more than n_sol.
+        size_t   settled = 0;
+        uint64_t cut_us = ~uint64_t(0);   // the tick a solve stopped at the budget
         bool     solved_valid = false;
         Piece    piece{};
         bool     piece_valid = false;
@@ -258,9 +293,21 @@ private:
         bool     has_before = false;
     };
 
+    // Knot i is new (appended, or a flush's hand-off): it and the
+    // kResolveDepth knots before it are solved again, so a new knot shapes
+    // that many junctions behind it and no more; everything earlier stands.
+    // A full re-solve per submit cost a 64-knot queue tens of thousands of
+    // banded solves on a 1 ms tick (kin-ys0).
+    static constexpr size_t kResolveDepth = 1;
+    static void unsettleFrom(Axis& a, size_t i) {
+        const size_t s = i > kResolveDepth ? i - kResolveDepth : 0;
+        if (a.settled > s) a.settled = s;
+    }
+
     void resetAxis(size_t ax, float p, uint64_t now_us) {
         Axis& a = _ax[ax];
         a.tl.clear();
+        a.settled = 0;
         a.origin = State{p, 0.0f, 0.0f};
         a.origin_us = now_us;
         a.n_sol = 0;
@@ -273,12 +320,19 @@ private:
         a.has_before = false;
     }
 
-    // Solve the whole pending window from the origin. Knots are copied out of
-    // the ring once so the solver sees them contiguous.
-    void ensureSolved(Axis& a) {
+    // Solve the pending window from the origin, after the settled knots and
+    // within the budget; `full` ignores the budget. A solve the budget stopped
+    // continues at the next tick, once per tick. Knots are copied out of the
+    // ring once so the solver sees them contiguous.
+    void ensureSolved(Axis& a, bool full = false) {
         if (a.solved_valid) return;
-        Knot tmp[Capacity];
         const size_t n = a.tl.size();
+        {
+            size_t s0 = a.settled < a.n_sol ? a.settled : a.n_sol;
+            if (s0 > n) s0 = n;
+            if (!full && s0 > 0 && a.cut_us == _now_us) return;   // this tick's budget is spent
+        }
+        Knot tmp[Capacity];
         for (size_t i = 0; i < n; ++i) tmp[i] = a.tl.at(i);
         // Forget the reported kinds of knots no longer pending.
         {
@@ -309,15 +363,21 @@ private:
         // knot solved for the first time. A sample keeps its lag from it.
         Prior prior[Capacity];
         for (size_t i = 0; i < n; ++i) prior[i] = i < a.n_sol ? Prior{a.sol[i].t_us, a.sol[i].v, a.sol[i].a} : Prior{};
-        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.has_before ? &a.before : nullptr, a.before_solved_us, prior);
+        size_t settled = a.settled < a.n_sol ? a.settled : a.n_sol;
+        if (settled > n) settled = n;
+        const size_t stop = solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.has_before ? &a.before : nullptr,
+                                        a.before_solved_us, prior, settled, full);
         // A knot the solver dropped leaves the timeline for good.
-        size_t m = 0;
+        size_t m = 0, solved = 0;
         for (size_t i = 0; i < n; ++i) {
             if (a.sol[i].dropped) { a.tl.erase(m); continue; }
+            if (i < stop) ++solved;
             a.sol[m++] = a.sol[i];
         }
-        a.n_sol = m;
-        a.solved_valid = true;
+        a.n_sol = solved;
+        a.settled = solved;
+        a.solved_valid = stop >= n;
+        if (stop < n) a.cut_us = _now_us;
         a.piece_valid = false;
     }
 
@@ -408,9 +468,11 @@ private:
                 a.origin = State{k0.p, k0.v, k0.a};
                 a.origin_us = k0.t_us;
                 a.before = a.tl.at(0); a.before_solved_us = k0.t_us; a.has_before = true;
+                const size_t cnt = a.tl.size();
                 a.tl.popFront();
-                for (size_t i = 0; i + 1 < a.n_sol; ++i) a.sol[i] = a.sol[i + 1];
+                for (size_t i = 0; i + 1 < cnt; ++i) a.sol[i] = a.sol[i + 1];
                 if (a.n_sol) --a.n_sol;
+                if (a.settled) --a.settled;
             } else {
                 // Commit the curve up to the horizon and re-plan from there.
                 a.committed = a.piece;
@@ -441,6 +503,7 @@ private:
 
     Config   _cfg;
     Axis     _ax[DoF];
+    uint64_t _now_us = 0;   // the clock of the last call that carried one (the budget is per tick)
     Anomaly  _an[kAnomalyRing]{};
     size_t   _an_head = 0, _an_n = 0;
     uint16_t _an_seq = 0;
