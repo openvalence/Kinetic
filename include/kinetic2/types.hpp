@@ -110,7 +110,9 @@ struct Config {
     // budget does not reach, or cuts, waits for the next tick; only the first
     // knot of a solve is always finished, with the best legal answer the
     // budget found, or dropped (PlanFailed, kDetailBudget). A solve may pass
-    // the budget by the judge in flight. 0: unbounded.
+    // the budget by the judge in flight. 0: unbounded. FIXED BY THE MACHINE,
+    // never a catalog field: the one Config member a client may not tune
+    // (operator ruling 2026-10-06; it is the tick's budget, not a preference).
     uint32_t solve_budget   = 96;
 };
 
