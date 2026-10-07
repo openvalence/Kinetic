@@ -926,6 +926,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
         if (cfg.corner == Corner::Cubic && !rest && knots[i].family == Family::C1 && knots[i].has_v
             && out[i].t_us > prev_us + 1000) {
             const float vk = authored(i);
+            float vk_now = vk;   // a TRIM scales it with the share: a smaller copy of the author's cubic
             const float pk = out[i].p;
             const uint64_t t_k0 = out[i].t_us;
             // The right cubic's start acceleration is the next span's, which a
@@ -938,28 +939,20 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             // quintic, whose peak speed is a quarter higher, and every spend on
             // it was priced for that quintic: twice what the cubic asked
             // (Kinetic kin-g5u).
-            float right_T = 0.0f, right_pn = 0.0f, right_vn = 0.0f;
+            float right_T0 = 0.0f, right_pn = 0.0f, right_vn = 0.0f;
             bool has_right = false, right_ok = true;
             if (i + 1 < n && out[i + 1].t_us > out[i].t_us) {
                 const float Tout = float(out[i + 1].t_us - out[i].t_us) * 1e-6f;
                 const float pn = out[i + 1].p, vn = slopeAt(i + 1);
-                right_T = Tout; right_pn = pn; right_vn = vn;
+                right_T0 = Tout; right_pn = pn; right_vn = vn;
                 const float a_r_full = (6.0f * (pn - pk) - Tout * (4.0f * vk + 2.0f * vn)) / (Tout * Tout);
                 const float a_e = (6.0f * (pk - pn) + Tout * (2.0f * vk + 4.0f * vn)) / (Tout * Tout);
                 const Piece right = Piece::hermite(out[i].t_us, State{pk, vk, a_r_full}, out[i + 1].t_us, State{pn, vn, a_e});
                 ++work;
-                referee::Ratios rp{};
-                const float rw = referee::worstRatio(right, L, lo, hi, &rp);
-                right_ok = rw < 0.5f * referee::kIllegal;
-                // The right cubic as the next knot will render it: speed-bound
-                // alone it is saturated and keeps this acceleration; otherwise
-                // it is dilated by the root of the ratio that binds, and the
-                // ramp leaves with the dilated cubic's acceleration. Leaving
-                // with the authored one pinned a start the dilated head could
-                // not keep, and the next knot fell to the smooth path from a
-                // state at the acceleration ceiling.
-                if (right_ok && rw > 1.0f && !(rp.v > 1.0f && rp.a <= 1.0f && rp.j <= 1.0f))
-                    right_T = Tout * std::fmax(rp.v, std::fmax(std::sqrt(rp.a), std::cbrt(rp.j))) * 1.01f;
+                // Only a window excursion, which no spend sizes, refuses the corner
+                // here: the next knot renders its cubic saturated, dilated or
+                // trimmed, and attempt() below sizes the ramp for that.
+                right_ok = referee::worstRatio(right, L, lo, hi) < 0.5f * referee::kIllegal;
                 has_right = true;
             }
             // The stretch this knot inherited from the knots before it, against
@@ -993,23 +986,46 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
                 Try r;
                 const float Tin = float(t_k - prev_us) * 1e-6f;
                 const float pk_now = out[i].p;
-                float a_l = (6.0f * (prev.p - pk_now) + Tin * (2.0f * prev.v + 4.0f * vk)) / (Tin * Tin);
+                float a_l = (6.0f * (prev.p - pk_now) + Tin * (2.0f * prev.v + 4.0f * vk_now)) / (Tin * Tin);
                 r.a_over = std::fabs(a_l) / L.amax;
                 a_l = std::fmax(-L.amax, std::fmin(L.amax, a_l));
-                const float a_r = has_right
-                    ? std::fmax(-L.amax, std::fmin(L.amax, (6.0f * (right_pn - pk_now) - right_T * (4.0f * vk + 2.0f * right_vn)) / (right_T * right_T)))
-                    : a_l;
+                // The right cubic from the knot as it stands (a TRIM moves it), its
+                // span dilated by the root of the ratio that binds it when that is
+                // not speed alone, so the ramp leaves inside the ceilings; a ramp
+                // leaving AT the acceleration ceiling was never stoppable.
+                float a_r = a_l;
+                if (has_right) {
+                    float Tr_ = right_T0;
+                    a_r = (6.0f * (right_pn - pk_now) - Tr_ * (4.0f * vk_now + 2.0f * right_vn)) / (Tr_ * Tr_);
+                    const float a_e = (6.0f * (pk_now - right_pn) + Tr_ * (2.0f * vk_now + 4.0f * right_vn)) / (Tr_ * Tr_);
+                    referee::Ratios rp{};
+                    ++work;
+                    const float rw = referee::worstRatio(Piece::hermite(0, State{pk_now, vk_now, a_r}, uint64_t(Tr_ * 1e6f + 0.5f), State{right_pn, right_vn, a_e}), L, lo, hi, &rp);
+                    if (rw > 1.0f && rw < 0.5f * referee::kIllegal && !(rp.v > 1.0f && rp.a <= 1.0f && rp.j <= 1.0f)) {
+                        Tr_ = right_T0 * std::fmax(rp.v, std::fmax(std::sqrt(rp.a), std::cbrt(rp.j))) * 1.01f;
+                        a_r = (6.0f * (right_pn - pk_now) - Tr_ * (4.0f * vk_now + 2.0f * right_vn)) / (Tr_ * Tr_);
+                    }
+                    a_r = std::fmax(-L.amax, std::fmin(L.amax, a_r));
+                }
                 r.a_l = a_l;
                 r.Tr = std::fabs(a_r - a_l) / L.jmax;
-                const float h = 0.5f * r.Tr;
+                // A rest knot into a flat span (a hold follows) is the ramp's END,
+                // not its middle: the carriage reaches it at rest with no
+                // acceleration and the hold is a hold. Centered, the ramp left
+                // the knot with a residual velocity (34 mm/s on a 96 mm fall)
+                // that a quintic with a 5 s hold to fill integrated into a
+                // 40 mm bulge.
+                const bool rest_into_flat = std::fabs(vk_now) <= 1e-6f && std::fabs(a_r) <= 1e-6f && r.Tr > 0.0f;
+                const float h = rest_into_flat ? r.Tr : 0.5f * r.Tr;   // the ramp before the knot
                 r.h_us = uint64_t(h * 1e6f + 0.5f);
                 if (r.h_us == 0) {
-                    r.ts = t_k; r.start = State{pk_now, vk, a_l};
+                    r.ts = t_k; r.start = State{pk_now, vk_now, a_l};
                 } else {
                     if (t_k <= prev_us + r.h_us + 1000) return r;
                     r.j = (a_r - a_l) / r.Tr;
-                    // Walk the mid state back to the ramp's start.
-                    const float vs = vk - a_l * h - 0.5f * r.j * h * h;
+                    // Walk the knot's state back to the ramp's start, by the ramp
+                    // before the knot (half of it, or all of it).
+                    const float vs = vk_now - a_l * h - 0.5f * r.j * h * h;
                     const float ps = pk_now - vs * h - 0.5f * a_l * h * h - r.j * h * h * h / 6.0f;
                     r.start = State{ps, vs, a_l};
                     r.ts = t_k - r.h_us;
@@ -1048,7 +1064,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             auto take = [&](const Try& r, uint64_t add) -> bool {
                 if (r.h_us == 0) {
                     if (!stoppable(r.start)) return false;
-                    out[i].v = vk; out[i].a = r.a_l;
+                    out[i].v = vk_now; out[i].a = r.a_l;
                     book(r.start, r.ts, r.ts, add, r.w);
                     return true;
                 }
@@ -1070,19 +1086,35 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
                 // stroke, a few ms late where a rescale of the cubic is late by
                 // the whole ratio and a trim short by it (kin-g5u). The ramp
                 // follows the saturated head as one profile.
-                if (finite0 && !r0.legal && r0.parts.v > 1.0f && r0.parts.a <= 1.0f && r0.parts.j <= 1.0f) {
+                // The gate is the speed alone: the head quintic the referee probed
+                // carries the start state's acceleration into the cubic's with its
+                // own bend (a rise from a rest whose acceleration was not zero read
+                // 1.0x in acceleration and jerk and never saturated); the profile's
+                // ramp makes that step at the jerk ceiling and its referee decides.
+                if (finite0 && !r0.legal && r0.parts.v > 1.0f) {
                     Profile sat;
+                    bool cruising = false;
                     work += 3;   // two closed-form bisections and the referee
-                    const uint64_t Th_us = r0.ts - prev_us;
-                    if (Profile::saturate(prev, r0.start, float(Th_us) * 1e-6f, L, sat)) {
+                    uint64_t Th_us = r0.ts - prev_us;
+                    State target = r0.start;
+                    bool ok = Profile::saturate(prev, target, float(Th_us) * 1e-6f, L, sat, &cruising);
+                    // An end the author put at the ceiling is reached cruising:
+                    // the knot itself is the target then (no ramp follows), and
+                    // it lands at the ceiling with no acceleration.
+                    if (ok && cruising && r0.h_us > 0) {
+                        Th_us = t_k0 - prev_us;
+                        target = State{out[i].p, vk_now, r0.a_l};
+                        ok = Profile::saturate(prev, target, float(Th_us) * 1e-6f, L, sat, &cruising);
+                    }
+                    if (ok) {
                         sat.start_us = prev_us;
                         Profile whole = sat;
-                        if (r0.h_us == 0 || whole.add(r0.Tr, r0.j)) {
+                        if (cruising || r0.h_us == 0 || whole.add(r0.Tr, r0.j)) {
                             const float w = whole.worstRatio(L, lo, hi);
                             const State exit = whole.end();
                             const uint64_t dur_us = uint64_t(sat.duration() * 1e6f + 0.5f);
                             const uint64_t add = dur_us > Th_us ? dur_us - Th_us : 0;
-                            if (w <= 1.0001f && std::fabs(sat.end().p - r0.start.p) <= 1e-4f && within(add) && stoppable(exit)) {
+                            if (w <= 1.0001f && std::fabs(sat.end().p - target.p) <= 1e-4f && within(add) && stoppable(exit)) {
                                 out[i].hard = true; out[i].corner = false; out[i].ramp = whole;
                                 out[i].p = exit.p; out[i].v = exit.v; out[i].a = exit.a;
                                 return book(exit, t_k0 + add, prev_us + uint64_t(whole.duration() * 1e6f + 0.5f), add, w);
@@ -1125,6 +1157,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
                     float share = 0.998f / need;
                     for (int it = 0; it < 2 && share > 0.05f && share < 1.0f; ++it) {
                         out[i].p = prev.p + share * (p_full - prev.p);
+                        vk_now = vk * share;
                         const Try rt = attempt(t_k0);
                         if (rt.built && rt.legal) {
                             if (take(rt, 0)) {
@@ -1137,7 +1170,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
                         if (!(rt.built && rt.w < 0.5f * referee::kIllegal && rt.w > 0.0f)) break;
                         share *= 0.98f / rt.w;
                     }
-                    out[i].p = knots[i].p;
+                    out[i].p = knots[i].p; vk_now = vk;
                 }
             }
             out[i].t_us = t_k0; out[i].corner = false; out[i].hard = false;

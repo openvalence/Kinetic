@@ -115,10 +115,11 @@ struct Config {
     // passage that asks more than the machine without end would run ever
     // later, and past this it shortens. Time, not a share of the window: the
     // window is the operator's preference and never enters. 0: never late.
-    // 50 ms holds a stroke's clipped area at a fifth over the speed ceiling
-    // (5 ms at a sixth over, measured), never a passage at twice it, which
-    // shortens on the author's clock from its first stroke: uniform.
-    uint32_t late_budget_us = 50000;
+    // 100 ms holds a rise of two spans at a fifth over the speed ceiling
+    // (54 ms, measured: the sawtooth's rise whole, its slow fall gives the
+    // time back within three spans), never a passage at twice it, which
+    // shortens on the author's clock from its second stroke: uniform.
+    uint32_t late_budget_us = 100000;
     // The most work one solve does, the hard bound on its time, in referee
     // passes (every extremum of one piece; four knots of a junction solve
     // count as one). Sized for the P4's 1 ms motion tick: unbounded, the

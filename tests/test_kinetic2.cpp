@@ -1345,14 +1345,20 @@ TEST_CASE("a speed-bound C1 fall is saturated at the ceiling: the whole stroke, 
     CHECK(r.stretch_s <= 0.008f);                  // the clipped area: 4.6 ms by the model
     // The top on time, the whole stroke down within 10 ms of the knot.
     CHECK(std::fabs(r.p[375] - top) <= 0.01f);
-    float lowest = 1.0f; size_t at = 0;
-    for (size_t i = 376; i < 700; ++i) if (r.p[i] < lowest) { lowest = r.p[i]; at = i; }
-    CHECK(lowest <= 0.003f);
+    size_t at = 0;
+    for (size_t i = 376; i < 700; ++i) if (r.p[i] <= 0.003f) { at = i; break; }
+    CHECK(at >= 490);
     CHECK(at <= 512);
+    // The holds are holds: the bottom knot is reached at rest and the plan
+    // stays there (a centered corner ramp left it moving: a 40 mm bulge).
+    float bulge = 0.0f;
+    for (size_t i = 540; i < 745; ++i) bulge = std::fmax(bulge, std::fabs(r.p[i]));
+    for (size_t i = 1290; i < 1495; ++i) bulge = std::fmax(bulge, std::fabs(r.p[i]));
+    CHECK(bulge <= 0.004f);
     // The second stroke is the same spend, not a growing one.
-    float lowest2 = 1.0f; size_t at2 = 0;
-    for (size_t i = 1126; i < 1450; ++i) if (r.p[i] < lowest2) { lowest2 = r.p[i]; at2 = i; }
-    CHECK(lowest2 <= 0.003f);
+    size_t at2 = 0;
+    for (size_t i = 1126; i < 1450; ++i) if (r.p[i] <= 0.003f) { at2 = i; break; }
+    CHECK(at2 >= 1240);
     CHECK(at2 <= 1262);
     // The hold after the first fall gave its stretch back: the second rise's top is on the author's clock.
     CHECK(std::fabs(r.p[1125] - top) <= 0.01f);
@@ -1377,9 +1383,51 @@ TEST_CASE("an acceleration-bound C1 span is dilated by the root of its ratio, ne
     float top = 0.0f; size_t at = 0;
     for (size_t i = 0; i < 300; ++i) if (r.p[i] > top) { top = r.p[i]; at = i; }
     CHECK(top >= 0.345f);
-    CHECK(at <= 75);
+    CHECK(at <= 85);   // the hold after it is flat, so the whole ramp to rest comes before the knot
     size_t reached = 0;
     for (size_t i = 361; i < 700; ++i) if (r.p[i] <= 0.01f) { reached = i; break; }
     CHECK(reached >= 400);
     CHECK(reached <= 440);
+}
+
+TEST_CASE("a sawtooth rise from rest over the speed ceiling is saturated knot by knot, never trimmed to a staircase") {
+    // The lab's built-in sawtooth on a 500 mm window: 115 mm per 100 ms span
+    // on the rise (15 percent over 1000 mm/s on average), PCHIP end
+    // velocities the hub clamps to the ceiling, then a slow fall. The first
+    // span starts from rest; the second starts and ends at the ceiling.
+    Config cfg; cfg.limits = {1000.0f / 500.0f, 50000.0f / 500.0f, 5.0e6f / 500.0f}; cfg.corner = Corner::Cubic;
+    Engine<> e(cfg, 0.2f);
+    struct K { uint64_t start_ms, dur_ms; float p, v; };
+    const K ks[] = {{0, 100, 0.4308f, 2.0f}, {100, 100, 0.6615f, 1.538f}, {200, 100, 0.7769f, 0.0f}, {300, 100, 0.7192f, -0.577f},
+                    {400, 100, 0.6615f, -0.577f}, {500, 100, 0.6038f, -0.577f}, {600, 100, 0.5462f, -0.577f}, {700, 100, 0.4885f, -0.577f}};
+    size_t next = 0; int trimmed = 0, failed = 0, stretched = 0; float stretch_s = 0.0f, v_peak = 0.0f, p_peak = 0.0f; size_t at_peak = 0;
+    std::vector<float> v;
+    for (uint64_t now = 0; now <= 900 * kMs; now += kMs) {
+        while (next < 8 && ks[next].start_ms * kMs <= now + 110 * kMs) {
+            const K& k = ks[next++];
+            REQUIRE(e.submit(knotFromSegment(k.p, uint32_t(k.dur_ms) * kMs, true, k.v, k.start_ms * kMs, Family::C1), now));
+        }
+        const State st = e.stateAt(0, now);
+        v.push_back(st.v);
+        v_peak = std::fmax(v_peak, std::fabs(st.v));
+        if (st.p > p_peak) { p_peak = st.p; at_peak = now / kMs; }
+        Anomaly a;
+        while (e.popAnomaly(a)) {
+            if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++trimmed;
+            if (a.kind == uint8_t(AnomalyKind::DeadlineStretched)) { ++stretched; stretch_s = std::fmax(stretch_s, a.detail); }
+            if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++failed;
+        }
+    }
+    // The rise never reverses: no sample on it moves down.
+    int reversals = 0;
+    for (size_t i = 5; i < 300 && i < v.size(); ++i) if (v[i] < -0.05f) ++reversals;
+    MESSAGE("peak v " << v_peak << " of " << cfg.limits.vmax << ", peak p " << p_peak << " at " << at_peak << " ms, stretched " << stretched
+            << " (max " << stretch_s * 1e3f << " ms), trimmed " << trimmed << ", failed " << failed << ", reversals " << reversals);
+    CHECK(failed == 0);
+    CHECK(reversals == 0);
+    CHECK(v_peak <= cfg.limits.vmax * 1.001f);
+    CHECK(v_peak >= cfg.limits.vmax * 0.98f);
+    CHECK(p_peak >= 0.7769f - 0.02f);            // the whole stroke
+    CHECK(at_peak <= 300 + 70);                   // late by the clipped area, not a rescale
+    CHECK(trimmed <= 1);
 }
