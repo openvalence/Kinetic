@@ -11,7 +11,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0x05fddc79c1b5de09ull   // accepted 2026-10-06 (kin-ys0): float junctions, spends from the referee's ratio, 8-knot chain, solve budget
+#define KINETIC2_FINGERPRINT 0x5b30240b503689cdull   // accepted 2026-10-07 (kin-hnp): the hard stop renders as Profile::point from its moving start
 #endif
 
 using namespace kinetic2;
@@ -114,7 +114,7 @@ TEST_CASE("brake drops the future and stops as fast as the ceilings allow") {
     CHECK(e.pending() == 0);
     CHECK(e.isBusy(260 * kMs));
     const auto s = sweep(e, 250 * kMs, 1000 * kMs);
-    CHECK(s.back().v == 0.0f);
+    CHECK(std::fabs(s.back().v) <= 1e-5f);
     CHECK(s.back().p > mid.p);        // it stopped ahead of where it was
     CHECK(s.back().p < 0.9f);         // and short of the dropped knot
     // Peaks: the decel ceiling is reached (a real brake, not a glide) and
@@ -391,7 +391,7 @@ TEST_CASE("a sample stream renders one behind and never overshoots a dead stop")
     for (const State& x : s) hi = std::max(hi, x.p);
     CHECK(hi <= stop + 1e-4f);                    // no overshoot past the last sample
     CHECK(s.back().p == doctest::Approx(stop).epsilon(1e-4));
-    CHECK(s.back().v == 0.0f);
+    CHECK(std::fabs(s.back().v) <= 1e-5f);
     // One behind: the curve passes each moving sample `latency` after it arrived.
     const State at_k10 = e.stateAt(0, 10 * dt + latency);
     (void)at_k10;   // the engine's clock has moved on; the sweep is the record
@@ -1003,4 +1003,155 @@ TEST_CASE("solve budget: a bundle past it is solved over later ticks, never drop
     CHECK(pk.v <= cfg.limits.vmax * 1.001f);
     CHECK(pk.a <= cfg.limits.amax * 1.001f);
     CHECK(pk.j <= cfg.limits.jmax * 1.10f);
+}
+
+// ---- the HARD knot as a point-to-point profile (kin-hnp) -------------------------
+
+namespace {
+
+// A live jog on the 84 mm jog window: 200 mm/s, 200 mm/s^2, 5e6 mm/s^3.
+const Limits kJog{200.0f / 84.0f, 200.0f / 84.0f, 5.0e6f / 84.0f};
+
+// The profile sampled on the 1 ms grid, its end included exactly.
+std::vector<State> sampled(const Profile& pr) {
+    std::vector<State> s;
+    for (float t = 0.0f; t < pr.duration(); t += 1e-3f) s.push_back(pr.atSeconds(t));
+    s.push_back(pr.atSeconds(pr.duration()));
+    return s;
+}
+
+}  // namespace
+
+TEST_CASE("a HARD knot from a carriage moving away turns at once and lands at rest on it (the live jog)") {
+    // Nucleus "jog is live": the carriage runs away at 0.705 and the jog
+    // redirects 0.323 behind it.
+    const State s0{0.3946f, 0.705f, -1.13f};
+    const float target = 0.3946f - 0.323f;
+    float fastest = 0.0f;
+    const Profile pr = Profile::point(s0, target, 0, kJog, 0.0f, &fastest);
+    REQUIRE(pr.n > 0);
+    for (int i = 0; i < pr.n; ++i) CHECK(pr.dt[i] >= 0.0f);
+    CHECK(pr.duration() == doctest::Approx(fastest).epsilon(1e-4));
+    const auto s = sampled(pr);
+    // It reverses within the stop from 0.705 at amax plus the jerk ramp, and
+    // never turns back away once it has.
+    size_t rev = s.size();
+    for (size_t i = 0; i < s.size(); ++i) if (s[i].v < 0.0f) { rev = i; break; }
+    REQUIRE(rev < s.size());
+    CHECK(float(rev) * 1e-3f <= s0.v / kJog.amax + kJog.amax / kJog.jmax + 1e-3f);
+    for (size_t i = rev; i < s.size(); ++i) CHECK(s[i].v <= 1e-6f);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= kJog.vmax * 1.001f);
+    CHECK(pk.a <= kJog.amax * 1.001f);
+    CHECK(pk.j <= kJog.jmax * 1.10f);
+    CHECK(s.back().p == doctest::Approx(target).epsilon(1e-5));
+    CHECK(std::fabs(s.back().v) <= 1e-5f);
+    CHECK(std::fabs(s.back().a) <= 1e-4f);
+
+    // Through the solver: a jog sample whose estimated deadline is too early
+    // takes the profile's end as its time, unreported, rendered as that
+    // profile.
+    Knot k = knotFromSample(target, 1000000, 400000);
+    k.has_v = true; k.family = Family::C1;
+    Config cfg; cfg.limits = kJog; cfg.policy = Policy::Stretch;
+    Solved out[1];
+    jerk::Workspace ws{};
+    int reports = 0;
+    solveWindow(s0, 1000000, &k, 1, cfg, out, [&](AnomalyKind, size_t, uint64_t, float, float) { ++reports; }, ws);
+    CHECK(out[0].hard);
+    CHECK_FALSE(out[0].dropped);
+    CHECK(out[0].t_us == Profile::point(s0, target, 1000000, kJog).end_us());
+    CHECK(out[0].t_us > k.t_us);
+    CHECK(reports == 0);
+}
+
+TEST_CASE("a HARD knot ahead of a carriage moving toward it never slows before its brake") {
+    const State s0{0.2f, 0.786f, 0.0f};
+    const float target = 0.2f + 0.56f;
+    const Profile pr = Profile::point(s0, target, 0, kJog);
+    REQUIRE(pr.n > 0);
+    const auto s = sampled(pr);
+    // One deceleration, at the end: from the first sample that decelerates,
+    // the velocity only falls, and what is left is the stop from the peak.
+    size_t dec = s.size();
+    for (size_t i = 0; i < s.size(); ++i) if (s[i].a < -1e-3f * kJog.amax) { dec = i; break; }
+    REQUIRE(dec < s.size());
+    float vpk = 0.0f;
+    for (size_t i = 0; i < dec; ++i) { CHECK(s[i].a >= -1e-3f * kJog.amax); vpk = std::fmax(vpk, s[i].v); }
+    for (size_t i = dec + 1; i < s.size(); ++i) CHECK(s[i].v <= s[i - 1].v + 1e-6f);
+    const float stop = Profile::brake(State{0.0f, vpk, 0.0f}, 0, kJog).duration();
+    CHECK(pr.duration() - float(dec) * 1e-3f <= stop + 2e-3f);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= kJog.vmax * 1.001f);
+    CHECK(pk.a <= kJog.amax * 1.001f);
+    CHECK(s.back().p == doctest::Approx(target).epsilon(1e-5));
+    CHECK(std::fabs(s.back().v) <= 1e-5f);
+}
+
+TEST_CASE("a HARD knot with time to spare: from rest it holds then launches, moving it cruises slower, landing on time") {
+    const float target = 0.7f;
+    // From rest: the hold comes first and the move lands exactly at 1.2 s.
+    const Profile still = Profile::point(State{0.3f, 0.0f, 0.0f}, target, 0, kJog, 1.2f);
+    REQUIRE(still.n > 1);
+    CHECK(still.jerk[0] == 0.0f);
+    CHECK(still.duration() == doctest::Approx(1.2f).epsilon(1e-4));
+    CHECK(still.atSeconds(still.dt[0]).p == 0.3f);
+    // Moving toward it: never faster than it is going, on time, at rest.
+    const State s0{0.3f, 0.4f, 0.0f};
+    const Profile moving = Profile::point(s0, target, 0, kJog, 1.2f);
+    REQUIRE(moving.n > 0);
+    CHECK(moving.duration() == doctest::Approx(1.2f).epsilon(1e-3));
+    const auto s = sampled(moving);
+    for (const State& x : s) CHECK(x.v <= s0.v + 1e-5f);
+    CHECK(s.back().p == doctest::Approx(target).epsilon(1e-5));
+    // Past it: it stops beyond it, then comes back.
+    const Profile past = Profile::point(State{0.69f, 2.0f, 0.0f}, target, 0, kJog);
+    REQUIRE(past.n > 0);
+    const auto sp = sampled(past);
+    float pmax = 0.0f;
+    for (const State& x : sp) pmax = std::fmax(pmax, x.p);
+    CHECK(pmax > target);
+    CHECK(sp.back().p == doctest::Approx(target).epsilon(1e-5));
+    CHECK(peaksOf(sp).a <= kJog.amax * 1.001f);
+}
+
+TEST_CASE("a live jog redirected mid-move replaces the move in flight and turns at once") {
+    // As Nucleus sends a jog: flush at now (the hand-off is the reaction
+    // horizon), then a HARD sample due as soon as possible.
+    Config cfg; cfg.limits = kJog; cfg.policy = Policy::Stretch;
+    Engine<> e(cfg, 0.5f);
+    auto jog = [&](float target, uint64_t now) {
+        (void)e.truncateAfter(now, now);
+        const Knot h = e.newest();
+        Knot k = knotFromSample(target, h.t_us > now ? h.t_us : now, 1000);
+        k.has_v = true; k.family = Family::C1;
+        REQUIRE(e.submit(k, now));
+    };
+    std::vector<State> s;
+    jog(0.95f, 0);
+    for (uint64_t t = 0; t < 300 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+    const float v_turn = s.back().v;
+    REQUIRE(v_turn > 0.25f * kJog.vmax);   // still accelerating away
+    jog(0.3f, 300 * kMs);
+    CHECK(e.pending() == 1);   // the move in flight was replaced, never queued behind
+    for (uint64_t t = 300 * kMs; t <= 2000 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+    size_t rev = s.size();
+    for (size_t i = 300; i < s.size(); ++i) if (s[i].v < 0.0f) { rev = i; break; }
+    REQUIRE(rev < s.size());
+    // The curve runs on, still accelerating, through the reaction horizon;
+    // from there the stop at amax after the jerk ramp from +amax to -amax,
+    // to the 1 ms grid.
+    const float react = float(cfg.react_us) * 1e-6f, v_h = v_turn + kJog.amax * react;
+    const float bound = react + v_h / kJog.amax + 2.0f * kJog.amax / kJog.jmax + 3e-3f;
+    CHECK(float(rev - 300) * 1e-3f <= bound);
+    CHECK(worstJump(s) <= 0.0f);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= kJog.vmax * 1.001f);
+    CHECK(pk.a <= kJog.amax * 1.001f);
+    CHECK(s.back().p == doctest::Approx(0.3f).epsilon(1e-4));
+    CHECK(std::fabs(s.back().v) < 1e-4f);
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
+    CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
+    CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
 }

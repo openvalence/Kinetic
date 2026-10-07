@@ -177,9 +177,12 @@ Tally funscript(uint32_t budget, Corner corner, Family fam, bool gentle, const c
 // (B) Jog scrub: a slider swept across an 84 mm window at 20 Hz, each move a
 // sample at the park time from the newest knot (has_v, v = 0), Stretch, the
 // jog ceilings 200 mm/s and 200 mm/s^2 on a 268 mm rail. The queue grows
-// faster than it drains, as on the bench.
-Tally jogScrub(uint32_t budget) {
-    Tally t{"B jog scrub"};
+// faster than it drains, as on the bench. `live` is the jog as Nucleus now
+// sends it: each move supersedes the queue at the reaction horizon
+// (truncateAfter) and is a HARD knot (C1, v = 0) due as soon as possible,
+// so the solver's Profile::point sets its time.
+Tally jogScrub(uint32_t budget, bool live = false) {
+    Tally t{live ? "B live jog" : "B jog scrub"};
     Config cfg; cfg.limits = {200.0f / kRailMm, 200.0f / kRailMm, 5.0e6f / kRailMm}; cfg.policy = Policy::Stretch;
     cfg.solve_budget = budget;
     Engine<1, 64> e(cfg, 0.5f);
@@ -200,6 +203,12 @@ Tally jogScrub(uint32_t budget) {
                 const uint64_t from = newest_us > now ? newest_us : now;
                 Knot k = knotFromSample(target, from, parkUs(std::fabs(target - newest_p)));
                 k.has_v = true;
+                if (live) {
+                    (void)e.truncateAfter(now, now);
+                    const Knot h = e.newest();
+                    k = knotFromSample(target, h.t_us > now ? h.t_us : now, 1000);
+                    k.has_v = true; k.family = Family::C1;
+                }
                 if (e.submit(k, now)) { newest_us = k.t_us; newest_p = k.p; }
             });
         } else {
@@ -291,6 +300,7 @@ int main(int argc, char** argv) {
     print(funscript(budget, Corner::Continuous, Family::Unspecified, true, "A gentle"));
     print(funscript(budget, Corner::Cubic, Family::C1, true, "A gentle C1cub"));
     print(jogScrub(budget));
+    print(jogScrub(budget, true));
     print(stream60(budget, 0.25f, "C 60 Hz stream"));
     print(stream60(budget, 0.3f, "C+ 60 Hz past v"));
     print(fullWindow(budget));

@@ -204,8 +204,9 @@ struct Solved {
     // Unreachable under every spend: not rendered, reported PlanFailed; the
     // engine removes it from the timeline. Promise 3 outranks the knot.
     bool     dropped = false;
-    // HARD junction: the polynomial head ends at (head_us, head) and the brake
-    // profile from there lands at rest on the knot. CORNER (Corner::Cubic): the
+    // HARD junction: `ramp` is the whole move, Profile::point from the state
+    // before the knot, landing at rest on it at t_us (a hold first when it
+    // launches from rest with time to spare). CORNER (Corner::Cubic): the
     // head ends at the ramp's start and `ramp` carries the jerk-limited step;
     // t_us / p / v / a are then the ramp's END, where the next piece starts.
     bool     hard = false;
@@ -215,8 +216,6 @@ struct Solved {
     Profile  ramp{};
     // The state the piece into this knot was judged from (tooling, and the
     // engine's consistency check: it must equal the previous solved knot).
-    // from_us may be later than that knot's time: a HARD head from rest holds
-    // there until from_us, then launches.
     State    from{};
     uint64_t from_us = 0;
     // The time every later SEGMENT knot is moved by: the Stretch added at
@@ -419,7 +418,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
 
     if (settled > 0) {
         out[0].from = origin;
-        if (!out[0].hard || out[0].from_us < origin_us) out[0].from_us = origin_us;
+        out[0].from_us = origin_us;
     }
     uint64_t shift = settled > 0 ? out[settled - 1].shift_us : 0;
     for (size_t i = settled; i < n; ++i) {
@@ -813,69 +812,41 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
         floorSelf(i); placeLater(i);
         // A segment with no end velocity and nothing after it rests (SPEC 9.6).
         const bool rest = rest_end || (i + 1 >= n && knots[i].rest_if_last && !knots[i].has_v);
-        // HARD: cruise as fast as the head can legally reach, then the fastest
-        // legal brake landing at rest exactly on the knot. Bisection on the
-        // cruise speed; the head is a plain piece into the brake's start
-        // state. Falls through to the smooth path when even a crawl fails.
+        // HARD: the fastest legal move from wherever the carriage is to rest
+        // on the knot (Profile::point), from any start: moving toward it,
+        // away from it, or past it. The knot's time is its authored time, or
+        // the profile's end when that is later; time to spare is a hold
+        // before the launch from rest, or a slower cruise when moving. A live
+        // jog (a HARD sample: its deadline was the sender's estimate) takes
+        // the profile's end unreported; a segment reports the Stretch and
+        // moves the segments after it by the same time. A quintic head with a
+        // bisected cruise speed needed its crawl to be legal first, which a
+        // moving start near the deadline never was: the knot fell to one
+        // smooth quintic stretched to 1.5 s and a jog decayed instead of
+        // turning (Kinetic kin-hnp). Falls through to the smooth path only
+        // when the profile breaks a ceiling or the window.
         if (junctionOf(knots[i]) == Junction::Hard) {
-            const float d = out[i].p - prev.p;
-            const float sgn = d >= 0.0f ? 1.0f : -1.0f;
-            const bool from_rest = prev.v == 0.0f && prev.a == 0.0f;
-            // A head is accepted when legal AND monotone: no extremum of its
-            // position outside the band between its ends. A quintic given
-            // more time than it needs winds up backward first (a lone hard
-            // stop from 0.1 to 0.5 fell to the window edge before it moved).
-            auto headOk = [&](const Piece& h, float p0, float p1) {
-                work += 2;
-                if (referee::worstRatio(h, L, lo, hi) > 1.0f) return false;
-                float taus[12]; const int nt = referee::extremumTaus(h.c, taus);
-                const float b_lo = std::fmin(p0, p1) - 1e-5f, b_hi = std::fmax(p0, p1) + 1e-5f;
-                for (int j = 0; j < nt; ++j) {
-                    if (taus[j] <= 0.0f || taus[j] >= 1.0f) continue;
-                    const float pj = h.at(h.start_us + uint64_t(taus[j] * h.T * 1e6f)).p;
-                    if (pj < b_lo || pj > b_hi) return false;
-                }
-                return true;
-            };
-            // Every referee pass here is charged to the judge budget; the
-            // crawl (the first cruise speed) is always tried whole. Eight
-            // halvings put the cruise speed within 0.4 percent of vmax.
-            float v_lo = 0.0f, v_hi = L.vmax, v_ok = -1.0f;
-            Piece head_ok; uint64_t head_us_ok = 0, from_us_ok = prev_us; State head_s_ok{};
-            auto refereeHard = [&](const Piece& h) { ++work; return referee::worstRatio(h, L, lo, hi); };
-            for (int it = 0; it < 8; ++it) {
-                if (it > 0 && work >= (i == settled ? first_budget : budget)) break;
-                const float vc = it == 0 ? 0.0f : 0.5f * (v_lo + v_hi);
-                const Profile br = Profile::brake(State{0.0f, sgn * vc, 0.0f}, 0, L);
-                const float tb = br.duration();
-                const uint64_t tb_us = uint64_t(tb * 1e6f + 0.5f);
-                if (out[i].t_us <= prev_us + tb_us + 1000) { if (it) v_hi = vc; continue; }
-                const uint64_t tc = out[i].t_us - tb_us;
-                const State hs{out[i].p - br.end().p, sgn * vc, 0.0f};
-                // From rest the head starts as late as the ceilings allow: the
-                // carriage holds, launches, and brakes onto the knot. The
-                // shortest legal head is found by bisection on its duration
-                // (shorter is harder, so legality is monotone in it). A moving
-                // start has no choice of start.
-                uint64_t ts = prev_us;
-                if (from_rest) {
-                    uint64_t d_lo = 1000, d_hi = tc - prev_us;
-                    if (refereeHard(Piece::hermite(tc - d_hi, prev, tc, hs)) > 1.0f) { if (it == 0) break; v_hi = vc; continue; }
-                    for (int jt = 0; jt < 16 && d_hi > d_lo + 1000 && (it == 0 || work < (i == settled ? first_budget : budget)); ++jt) {
-                        const uint64_t mid = (d_lo + d_hi) / 2;
-                        if (refereeHard(Piece::hermite(tc - mid, prev, tc, hs)) <= 1.0f) d_hi = mid; else d_lo = mid;
-                    }
-                    ts = tc - d_hi;
-                }
-                const Piece head = Piece::hermite(ts, prev, tc, hs);
-                if (headOk(head, prev.p, hs.p)) { v_ok = vc; v_lo = vc; head_ok = head; head_us_ok = tc; head_s_ok = hs; from_us_ok = ts; }
-                else { if (it == 0) break; v_hi = vc; }
-            }
-            if (v_ok >= 0.0f) {
-                out[i].hard = true; out[i].head_us = head_us_ok; out[i].head = head_s_ok;
-                out[i].v = 0.0f; out[i].a = 0.0f; out[i].worst = referee::worstRatio(head_ok, L, lo, hi);
-                out[i].from = prev; out[i].from_us = from_us_ok;
-                pp = prev; pp_us = prev_us; last = i; out[i].shift_us = shift; out[i].own_us = 0;
+            const uint64_t avail = out[i].t_us > prev_us ? out[i].t_us - prev_us : 0;
+            float fastest = 0.0f;
+            const Profile pr = Profile::point(prev, out[i].p, prev_us, L, float(avail) * 1e-6f, &fastest);
+            work += 8;   // point() costs about seven referee passes (its two bisections), the check one
+            const float ratio = pr.n < 0 ? referee::kIllegal : pr.worstRatio(L, lo, hi);
+            const State end = pr.n > 0 ? pr.atSeconds(pr.duration()) : State{prev.p, 0.0f, 0.0f};
+            const bool late = uint64_t(fastest * 1e6f) > avail + 1;
+            if (ratio <= 1.0001f && std::fabs(end.p - out[i].p) <= 1e-5f) {
+                const uint64_t end_us = pr.end_us();
+                const uint64_t add = end_us > out[i].t_us ? end_us - out[i].t_us : 0;
+                if (add > 0 && !knots[i].sample) for (size_t k = i + 1; k < n; ++k) if (!knots[k].sample) out[k].t_us += add;
+                if (end_us > out[i].t_us) out[i].t_us = end_us;
+                placeLater(i);
+                out[i].hard = true; out[i].ramp = pr;
+                out[i].v = 0.0f; out[i].a = 0.0f; out[i].worst = ratio;
+                out[i].stretched_s = late ? float(add) * 1e-6f : 0.0f;
+                if (late && add > 0 && !knots[i].sample) report(AnomalyKind::DeadlineStretched, i, out[i].t_us, out[i].p, out[i].stretched_s);
+                out[i].from = prev; out[i].from_us = prev_us;
+                pp = prev; pp_us = prev_us; last = i;
+                if (!knots[i].sample) shift += add;
+                out[i].shift_us = shift; out[i].own_us = knots[i].sample ? 0 : add;
                 prev = State{out[i].p, 0.0f, 0.0f};
                 prev_us = out[i].t_us;
                 return kAccepted;

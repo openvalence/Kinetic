@@ -1,6 +1,7 @@
-// kinetic2/profile.hpp -- constant-jerk phase profiles: the brake
+// kinetic2/profile.hpp -- constant-jerk phase profiles: the brake and the
+// point-to-point move to rest (a HARD knot)
 // Constraints:
-// - A profile is up to four phases of constant jerk from a start state; the
+// - A profile is up to twelve phases of constant jerk from a start state; the
 //   state is integrated in closed form per phase, never stepped.
 // - brake() is the fastest legal stop from any (p, v, a) under amax and jmax:
 //   ramp to the decel ceiling, hold it, ramp out, so v and a reach 0 together.
@@ -21,7 +22,7 @@
 namespace kinetic2 {
 
 struct Profile {
-    static constexpr int kMaxPhases = 4;
+    static constexpr int kMaxPhases = 12;   // point(): see there
     uint64_t start_us = 0;
     State    s0{};
     int      n = 0;
@@ -117,6 +118,106 @@ struct Profile {
         const Profile rest = brake(mid0, 0, L);
         for (int i = 0; i < rest.n && pr.n < kMaxPhases; ++i) { pr.dt[pr.n] = rest.dt[i]; pr.jerk[pr.n] = rest.jerk[i]; ++pr.n; }
         return pr;
+    }
+
+    // Appends one phase; false when the profile is full.
+    bool add(float t, float j) {
+        if (!(t > 0.0f)) return true;
+        if (n >= kMaxPhases) return false;
+        dt[n] = t; jerk[n] = j; ++n;
+        return true;
+    }
+
+    // The fastest motion from any state s to rest at `target` under L, taking
+    // at least `at_least` seconds; `fastest` gets the least time it needs.
+    // - Moving toward the target, or away from it: one jerk-limited change of
+    //   velocity to the cruise speed (through zero, toward the target, when
+    //   moving away), the cruise, then brake() landing on the target. The
+    //   cruise speed is the highest whose run fits the distance, by bisection
+    //   on closed-form distances (no referee), 24 halvings: float resolution.
+    // - Unable to stop short of the target (already past it, or too fast):
+    //   brake() to rest past it, then the same from rest back to it.
+    // - Time to spare: from rest the carriage holds, then launches, landing
+    //   exactly at at_least; moving, the cruise is slowed to take at_least,
+    //   and when no cruise takes that long it lands early and rests there.
+    // At most 12 phases: a 4-phase brake, a hold, a 3-phase launch from rest,
+    // the cruise and a 3-phase stop. A full profile returns n = -1.
+    static Profile point(const State& s, float target, uint64_t start_us, const Limits& L, float at_least = 0.0f,
+                         float* fastest = nullptr) {
+        Profile pr; pr.start_us = start_us; pr.s0 = s;
+        float need = 0.0f;
+        if (L.vmax > 0.0f && L.amax > 0.0f && L.jmax > 0.0f) {
+            const Profile stop = brake(s, 0, L);
+            const State se = stop.n ? stop.atSeconds(stop.duration()) : State{s.p, 0.0f, 0.0f};
+            const float dir = target >= s.p ? 1.0f : -1.0f;
+            const bool passes = dir * (se.p - s.p) > dir * (target - s.p) + 1e-7f;
+            bool ok = true;
+            if (passes) {
+                for (int i = 0; i < stop.n; ++i) ok = ok && pr.add(stop.dt[i], stop.jerk[i]);
+                const float t0 = stop.duration();
+                float rest = 0.0f;
+                ok = ok && reach(pr, State{se.p, 0.0f, 0.0f}, target, L, at_least - t0, rest);
+                need = t0 + rest;
+            } else {
+                ok = reach(pr, s, target, L, at_least, need);
+            }
+            if (!ok) pr.n = -1;
+        }
+        if (fastest) *fastest = need;
+        return pr;
+    }
+
+    // point() without the overshoot: the fastest stop from s does not pass
+    // the target. Appends the phases; false when they do not fit.
+    static bool reach(Profile& pr, const State& s, float target, const Limits& L, float at_least, float& fastest) {
+        const float dir = target >= s.p ? 1.0f : -1.0f;
+        const float u = dir * s.v, b = dir * s.a, D = dir * (target - s.p);
+        const bool at_rest = s.v == 0.0f && s.a == 0.0f;
+        fastest = 0.0f;
+        if (at_rest && D <= 1e-7f) return pr.add(at_least, 0.0f);
+        // Displacement of a profile from p = 0; the change of velocity to w is
+        // the brake of the velocity relative to w, carried along at w.
+        auto disp = [](const Profile& q) { return q.n ? q.atSeconds(q.duration()).p : 0.0f; };
+        auto run = [&](float w, Profile& tr, Profile& st) {
+            tr = brake(State{0.0f, u - w, b}, 0, L);
+            st = brake(State{0.0f, w, 0.0f}, 0, L);
+            return disp(tr) + w * tr.duration() + disp(st);
+        };
+        Profile tr, st;
+        auto cruiseFor = [&](float w, float f) { return w > 1e-6f && f < D ? (D - f) / w : 0.0f; };
+        float w = L.vmax;
+        float f = run(w, tr, st);
+        if (f > D) {
+            float lo = 0.0f, hi = L.vmax;
+            for (int it = 0; it < 24; ++it) {
+                const float mid = 0.5f * (lo + hi);
+                if (run(mid, tr, st) <= D) lo = mid; else hi = mid;
+            }
+            w = lo;
+            f = run(w, tr, st);
+        }
+        float tc = cruiseFor(w, f);
+        fastest = tr.duration() + tc + st.duration();
+        float hold = 0.0f;
+        if (at_least > fastest) {
+            if (at_rest) hold = at_least - fastest;
+            else {
+                // The highest cruise speed that still takes at_least.
+                float lo = 0.0f, hi = w;
+                for (int it = 0; it < 24; ++it) {
+                    const float mid = 0.5f * (lo + hi);
+                    const float fm = run(mid, tr, st);
+                    if (fm <= D && tr.duration() + cruiseFor(mid, fm) + st.duration() >= at_least) lo = mid; else hi = mid;
+                }
+                if (lo > 0.0f) { w = lo; f = run(w, tr, st); tc = cruiseFor(w, f); }
+                else f = run(w, tr, st);
+            }
+        }
+        bool ok = pr.add(hold, 0.0f);
+        for (int i = 0; i < tr.n; ++i) ok = ok && pr.add(tr.dt[i], dir * tr.jerk[i]);
+        ok = ok && pr.add(tc, 0.0f);
+        for (int i = 0; i < st.n; ++i) ok = ok && pr.add(st.dt[i], dir * st.jerk[i]);
+        return ok;
     }
 
     // Worst (peak / ceiling) ratio over v, a and the window; jerk is at most

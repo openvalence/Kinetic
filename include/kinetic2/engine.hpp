@@ -95,10 +95,13 @@ public:
     // successor (SPEC 9.6) and a knot submitted after t_us chains from it; a
     // t_us within a tick of the horizon or before it drops the whole pending
     // window and the hand-off is the horizon. Never an anomaly: a flush is the
-    // sender's intent. Returns the knots dropped; 0 changed nothing.
+    // sender's intent. Returns the knots dropped; 0 changed nothing. A SAMPLE
+    // counts at its solved time when that is later: its deadline was soft,
+    // and a live jog authored before the flush but still under way is the
+    // move the flush replaces (kin-hnp).
     size_t truncateAfter(size_t axis, uint64_t t_us, uint64_t now_us) {
         Axis& a = _ax[axis];
-        if (a.tl.empty() || a.tl.newest().t_us < t_us) return 0;
+        if (a.tl.empty() || (a.tl.newest().t_us < t_us && !a.tl.newest().sample)) return 0;
         _now_us = now_us;
         commitHorizon(axis, now_us);
         // The hand-off needs the plan at t_us: the whole window, unbounded (a
@@ -106,9 +109,14 @@ public:
         // unreachable knots; sol is aligned with tl after it.
         ensureSolved(a, true);
         const size_t n = a.tl.size();
+        auto due = [&](size_t i) {
+            const Knot& k = a.tl.at(i);
+            return k.sample && a.sol[i].t_us > k.t_us ? a.sol[i].t_us : k.t_us;
+        };
+        if (n == 0 || due(n - 1) < t_us) return 0;
         const bool past_horizon = t_us > a.origin_us + 1000;
         size_t keep = 0;
-        if (past_horizon) while (keep < n && a.tl.at(keep).t_us < t_us) ++keep;
+        if (past_horizon) while (keep < n && due(keep) < t_us) ++keep;
         if (keep == n) return 0;
         const bool handoff = past_horizon && (keep == 0 || a.sol[keep - 1].t_us < t_us);
         const State hs = handoff ? planAt(a, t_us) : State{};
@@ -397,13 +405,11 @@ private:
     // The piece from state s at s_us into solved knot k.
     Piece pieceInto(const State& s, uint64_t s_us, const Solved& k) const {
         Piece q;
-        // A HARD head solved from rest may start later than s_us: the piece
-        // holds s until then (Piece::at clamps).
-        const uint64_t t0 = (k.hard && k.from_us > s_us) ? k.from_us : s_us;
+        // A HARD knot is its whole profile, which starts where the knot was
+        // solved from: an origin moved along it (the reaction horizon) is on
+        // the same curve.
         if (k.hard) {
-            q = Piece::hermite(t0, s, k.head_us, k.head);
-            q.has_tail = true;
-            q.tail = Profile::brake(k.head, k.head_us, _cfg.limits);
+            q = Piece::profile(k.ramp);
             q.end_us = k.t_us;
         } else if (k.corner) {
             q = Piece::hermite(s_us, s, k.head_us, k.head);
