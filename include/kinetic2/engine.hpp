@@ -50,7 +50,7 @@ public:
         const bool same = c.limits.vmax == _cfg.limits.vmax && c.limits.amax == _cfg.limits.amax
                        && c.limits.jmax == _cfg.limits.jmax && c.policy == _cfg.policy
                        && c.amplitude_floor == _cfg.amplitude_floor && c.corner == _cfg.corner
-                       && c.solve_budget == _cfg.solve_budget;
+                       && c.solve_budget == _cfg.solve_budget && c.late_budget_us == _cfg.late_budget_us;
         _cfg = c;
         if (!same) for (size_t ax = 0; ax < DoF; ++ax) _ax[ax].settled = 0;
     }
@@ -214,7 +214,7 @@ public:
             const Solved& k = a.sol[0];
             a.origin = State{k.p, k.v, k.a};
             a.origin_us = k.t_us;
-            a.before = a.tl.at(0); a.before_solved_us = k.t_us; a.has_before = true;
+            a.before = a.tl.at(0); a.before_solved_us = k.t_us; a.before_shift_us = k.shift_us; a.has_before = true;
             const size_t cnt = a.tl.size();
             a.tl.popFront();
             for (size_t i = 0; i + 1 < cnt; ++i) a.sol[i] = a.sol[i + 1];
@@ -303,6 +303,7 @@ private:
         // which the solver's derivatives at the first knot need.
         Knot     before{};
         uint64_t before_solved_us = 0;   // when it was reached
+        uint64_t before_shift_us = 0;    // the stretch it carried (solver.hpp, the placement rule)
         bool     has_before = false;
     };
 
@@ -379,7 +380,7 @@ private:
         size_t settled = a.settled < a.n_sol ? a.settled : a.n_sol;
         if (settled > n) settled = n;
         const size_t stop = solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.has_before ? &a.before : nullptr,
-                                        a.before_solved_us, prior, settled, full);
+                                        a.before_solved_us, a.before_shift_us, prior, settled, full);
         // A knot the solver dropped leaves the timeline for good.
         size_t m = 0, solved = 0;
         for (size_t i = 0; i < n; ++i) {
@@ -478,7 +479,7 @@ private:
                 a.committed = a.piece;
                 a.origin = State{k0.p, k0.v, k0.a};
                 a.origin_us = k0.t_us;
-                a.before = a.tl.at(0); a.before_solved_us = k0.t_us; a.has_before = true;
+                a.before = a.tl.at(0); a.before_solved_us = k0.t_us; a.before_shift_us = k0.shift_us; a.has_before = true;
                 const size_t cnt = a.tl.size();
                 a.tl.popFront();
                 for (size_t i = 0; i + 1 < cnt; ++i) a.sol[i] = a.sol[i + 1];

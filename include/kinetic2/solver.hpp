@@ -401,7 +401,8 @@ inline void solve(Chain& ch, Workspace& ws) {
 template <typename Report>
 inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* knots, size_t n,
                           const Config& cfg, Solved* out, Report&& report, jerk::Workspace& ws, const Knot* before = nullptr,
-                          uint64_t before_solved_us = 0, const Prior* prior = nullptr, size_t settled = 0, bool unbounded = false) {
+                          uint64_t before_solved_us = 0, uint64_t before_shift_us = 0, const Prior* prior = nullptr,
+                          size_t settled = 0, bool unbounded = false) {
     if (settled > n) settled = n;
     if (n == settled) return n;
     K2_STAT(windows, 1);
@@ -415,21 +416,56 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
     // twice the budget: the bound on one solve is then 2 * solve_budget.
     const uint32_t first_budget = budget > ~uint32_t(0) / 2 ? ~uint32_t(0) : 2 * budget;
     const float lo = std::fmin(0.0f, origin.p), hi = std::fmax(1.0f, origin.p);
+    constexpr uint64_t kMinSpanUs = 1000;   // one tick between knots, the floor of every span
 
     if (settled > 0) {
         out[0].from = origin;
         out[0].from_us = origin_us;
     }
-    uint64_t shift = settled > 0 ? out[settled - 1].shift_us : 0;
+    // THE PLACEMENT RULE. A segment is placed at its authored time plus what
+    // is left of the stretch the knot before it carries (shift_us: that knot's
+    // placed time less its authored one, the corner's half ramp excluded) once
+    // this span has given back what it can: a stretch moves every later
+    // segment with it, a new arrival included (one that arrived after the
+    // stretched knot retired kept its authored time, the next span lost the
+    // stretch and the next spend paid for it: a cascade; so the knot retired
+    // last carries its stretch here, before_shift_us), and every span after
+    // it catches up as far as its own ceilings allow (absorbable, below): a
+    // hold gives everything back, a span with margin runs that much faster
+    // than authored, a span at its ceiling nothing. The motion is on the
+    // author's clock again as soon as the author left room for it. placeLater
+    // applies the same rule to the knots after a spend.
+    auto absorbable = [&](size_t k, float prev_p, uint64_t prev_auth) -> uint64_t {
+        if (knots[k].t_us <= prev_auth) return 0;
+        const uint64_t span = knots[k].t_us - prev_auth;
+        const float d = std::fabs(knots[k].p - prev_p);
+        if (d <= 1e-6f) return span > kMinSpanUs ? span - kMinSpanUs : 0;   // a hold
+        // The fastest legal span for the stroke, as a rest-to-rest cubic
+        // (its speed 1.5 d / T, acceleration 6 d / T^2, jerk 12 d / T^3), five
+        // percent over; and never under three quarters of the authored span,
+        // so the catch-up is a step in pace the author's own margin bounds.
+        const float t_min = 1.05f * std::fmax(1.5f * d / L.vmax, std::fmax(std::sqrt(6.0f * d / L.amax), std::cbrt(12.0f * d / L.jmax)));
+        const uint64_t floor_us = std::max(uint64_t(t_min * 1e6f), (span * 3) / 4);
+        return span > floor_us ? span - floor_us : 0;
+    };
     for (size_t i = settled; i < n; ++i) {
-        // A segment solved before keeps the time its predecessors' stretches
-        // gave it: re-solved from its authored time after the stretched knot
-        // retired, it fell behind the origin and was stretched again from
-        // there (the plan in flight lost its hand-off).
-        uint64_t t = knots[i].t_us + (knots[i].sample ? 0 : shift);
-        if (!knots[i].sample && prior && prior[i].t_us != 0 && prior[i].t_us > out[i].own_us)
-            t = std::max(t, prior[i].t_us - out[i].own_us);
+        uint64_t t = knots[i].t_us;
+        if (!knots[i].sample) {
+            bool has_prev = false; uint64_t prev_t = 0, prev_shift = 0, prev_auth = 0; float prev_p = 0.0f;
+            if (i > settled || settled > 0) {
+                has_prev = true; prev_t = out[i - 1].t_us; prev_p = knots[i - 1].p; prev_auth = knots[i - 1].t_us;
+                prev_shift = out[i - 1].shift_us;
+            } else if (before && !before->sample) {
+                has_prev = true; prev_t = before_solved_us; prev_shift = before_shift_us; prev_p = before->p; prev_auth = before->t_us;
+            }
+            if (has_prev) {
+                const uint64_t give = absorbable(i, prev_p, prev_auth);
+                t = knots[i].t_us + (prev_shift > give ? prev_shift - give : 0);
+                if (t < prev_t + kMinSpanUs) t = prev_t + kMinSpanUs;
+            }
+        }
         out[i].t_us = t; out[i].p = knots[i].p;
+        out[i].shift_us = knots[i].sample ? 0 : t - knots[i].t_us; out[i].own_us = 0;
         out[i].share = 1.0f; out[i].stretched_s = 0.0f; out[i].worst = 0.0f; out[i].clamped = false;
         out[i].hard = false; out[i].corner = false; out[i].pin_v = false; out[i].pin_a = false; out[i].dropped = false;
     }
@@ -520,7 +556,6 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
     // the speeds at its ends: a rate step of a tenth in one sample bulged
     // past the ceiling, was stretched, and the lag it was closing grew.
     constexpr float kMaxCompress = 0.1f, kEaseCadences = 10.0f;
-    constexpr uint64_t kMinSpanUs = 1000;
     auto compression = [&](uint64_t prev_solved, uint64_t prev_authored, uint64_t spacing) -> float {
         const float lag = prev_solved > prev_authored ? float(prev_solved - prev_authored) : 0.0f;
         return kMaxCompress * std::fmin(1.0f, lag / (kEaseCadences * float(spacing)));
@@ -794,12 +829,22 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
     };
     auto floorSelf = [&](size_t i) { if (out[i].t_us < prev_us + kMinSpanUs) out[i].t_us = prev_us + kMinSpanUs; };
     // Places every knot after i for the junction solve: a sample by the rule
-    // above, a segment where it stands, each one tick past the knot before.
+    // above, a segment by the placement rule at the top of the solve (its
+    // authored span after the knot before it, a hold at its authored time),
+    // each one tick past the knot before. The one home of a stretch's reach:
+    // a knot moved later moves the segments after it through this.
+    // Knot i's time must be its placed time (authored plus stretch, not a
+    // corner's ramp end) when this runs.
     auto placeLater = [&](size_t i) {
         size_t pk = i;
         for (size_t k = i + 1; k < n; ++k) {
             if (out[k].dropped) continue;
             if (knots[k].sample) out[k].t_us = sampleTime(k, out[pk].t_us, pk);
+            else {
+                const uint64_t prev_shift = knots[pk].sample ? 0 : (out[pk].t_us > knots[pk].t_us ? out[pk].t_us - knots[pk].t_us : 0);
+                const uint64_t give = absorbable(k, knots[pk].p, knots[pk].t_us);
+                out[k].t_us = knots[k].t_us + (prev_shift > give ? prev_shift - give : 0);
+            }
             if (out[k].t_us < out[pk].t_us + kMinSpanUs) out[k].t_us = out[pk].t_us + kMinSpanUs;
             pk = k;
         }
@@ -845,7 +890,6 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             if (ratio <= 1.0001f && std::fabs(end.p - out[i].p) <= 1e-5f) {
                 const uint64_t end_us = pr.end_us();
                 const uint64_t add = end_us > out[i].t_us ? end_us - out[i].t_us : 0;
-                if (add > 0 && !knots[i].sample) for (size_t k = i + 1; k < n; ++k) if (!knots[k].sample) out[k].t_us += add;
                 if (end_us > out[i].t_us) out[i].t_us = end_us;
                 placeLater(i);
                 out[i].hard = true; out[i].ramp = pr;
@@ -854,8 +898,8 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
                 if (late && add > 0 && !knots[i].sample) report(AnomalyKind::DeadlineStretched, i, out[i].t_us, out[i].p, out[i].stretched_s);
                 out[i].from = prev; out[i].from_us = prev_us;
                 pp = prev; pp_us = prev_us; last = i;
-                if (!knots[i].sample) shift += add;
-                out[i].shift_us = shift; out[i].own_us = knots[i].sample ? 0 : add;
+                out[i].shift_us = knots[i].sample || out[i].t_us < knots[i].t_us ? 0 : out[i].t_us - knots[i].t_us;
+                out[i].own_us = knots[i].sample ? 0 : add;
                 prev = State{out[i].p, 0.0f, 0.0f};
                 prev_us = out[i].t_us;
                 return kAccepted;
@@ -882,75 +926,222 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
         if (cfg.corner == Corner::Cubic && !rest && knots[i].family == Family::C1 && knots[i].has_v
             && out[i].t_us > prev_us + 1000) {
             const float vk = authored(i);
-            const float Tin = float(out[i].t_us - prev_us) * 1e-6f;
             const float pk = out[i].p;
-            // Cubic Hermite second derivatives at the shared knot.
-            float a_l = (6.0f * (prev.p - pk) + Tin * (2.0f * prev.v + 4.0f * vk)) / (Tin * Tin);
-            a_l = std::fmax(-L.amax, std::fmin(L.amax, a_l));
-            float a_r = a_l;
-            bool right_ok = true;
+            const uint64_t t_k0 = out[i].t_us;
+            // The right cubic's start acceleration is the next span's, which a
+            // spend here moves whole (the later segments follow a stretch), so
+            // it stands for every attempt below. The right cubic may break a
+            // ceiling: the next knot renders it as the author's cubic anyway,
+            // saturated or dilated (below, at that knot), so only a window
+            // excursion, which no spend sizes, refuses the corner here. Leaving
+            // with a cubic's acceleration the next knot then fell to the smooth
+            // quintic, whose peak speed is a quarter higher, and every spend on
+            // it was priced for that quintic: twice what the cubic asked
+            // (Kinetic kin-g5u).
+            float right_T = 0.0f, right_pn = 0.0f, right_vn = 0.0f;
+            bool has_right = false, right_ok = true;
             if (i + 1 < n && out[i + 1].t_us > out[i].t_us) {
                 const float Tout = float(out[i + 1].t_us - out[i].t_us) * 1e-6f;
                 const float pn = out[i + 1].p, vn = slopeAt(i + 1);
-                a_r = (6.0f * (pn - pk) - Tout * (4.0f * vk + 2.0f * vn)) / (Tout * Tout);
-                // The right cubic itself must keep the ceilings: leaving with
-                // the acceleration of a cubic the next knot cannot follow
-                // made it unreachable (dropped), where the smooth path's
-                // chain trims it (Blend) instead.
+                right_T = Tout; right_pn = pn; right_vn = vn;
+                const float a_r_full = (6.0f * (pn - pk) - Tout * (4.0f * vk + 2.0f * vn)) / (Tout * Tout);
                 const float a_e = (6.0f * (pk - pn) + Tout * (2.0f * vk + 4.0f * vn)) / (Tout * Tout);
-                const Piece right = Piece::hermite(out[i].t_us, State{pk, vk, a_r}, out[i + 1].t_us, State{pn, vn, a_e});
+                const Piece right = Piece::hermite(out[i].t_us, State{pk, vk, a_r_full}, out[i + 1].t_us, State{pn, vn, a_e});
                 ++work;
-                right_ok = referee::worstRatio(right, L, lo, hi) <= 1.0f;
-                a_r = std::fmax(-L.amax, std::fmin(L.amax, a_r));
+                referee::Ratios rp{};
+                const float rw = referee::worstRatio(right, L, lo, hi, &rp);
+                right_ok = rw < 0.5f * referee::kIllegal;
+                // The right cubic as the next knot will render it: speed-bound
+                // alone it is saturated and keeps this acceleration; otherwise
+                // it is dilated by the root of the ratio that binds, and the
+                // ramp leaves with the dilated cubic's acceleration. Leaving
+                // with the authored one pinned a start the dilated head could
+                // not keep, and the next knot fell to the smooth path from a
+                // state at the acceleration ceiling.
+                if (right_ok && rw > 1.0f && !(rp.v > 1.0f && rp.a <= 1.0f && rp.j <= 1.0f))
+                    right_T = Tout * std::fmax(rp.v, std::fmax(std::sqrt(rp.a), std::cbrt(rp.j))) * 1.01f;
+                has_right = true;
             }
-            const float Tr = std::fabs(a_r - a_l) / L.jmax, h = 0.5f * Tr;
-            const uint64_t h_us = uint64_t(h * 1e6f + 0.5f);
+            // The stretch this knot inherited from the knots before it, against
+            // Config::late_budget_us: a time spend that would run past the
+            // budget is refused and the stroke is cut instead (TRIM below).
+            const uint64_t inherited = t_k0 > knots[i].t_us ? t_k0 - knots[i].t_us : 0;
+            // Under Stretch time is the policy's own currency and has no budget;
+            // under Blend the budget is where the deadline wins back (TRIM).
+            auto within = [&](uint64_t add) { return cfg.policy == Policy::Stretch || inherited + add <= cfg.late_budget_us; };
             // Any knot may turn out to be the last (a dropped successor, a
             // starved stream) and the engine then brakes from the state it
             // leaves: that brake must keep the ceilings and the window, or the
             // knot takes the smooth path, whose junctions are bounded so.
             auto stoppable = [&](const State& x) { ++work; return Profile::brake(x, 0, L).worstRatio(L, lo, hi) <= 1.0001f; };
-            auto accept = [&](const Piece& head, const State& at_end) {
-                out[i].worst = referee::worstRatio(head, L, lo, hi);
+            // One attempt with the knot at t_k: each side keeps the acceleration
+            // the author's cubic has there, one constant-jerk phase of |da| /
+            // jmax centered on the knot joins them, and the head runs to the
+            // ramp's start. A quintic Hermite through p, v and a at both ends,
+            // with the cubic's own end accelerations, IS that cubic. The newest
+            // knot has no right side yet: its piece ends with the left cubic's
+            // acceleration, and the re-solve when its successor arrives (the
+            // new knot and the one before, Engine::kResolveDepth) gives it the
+            // ramp. A single C2 acceleration there was the chain's compromise
+            // between two cubics 12 apart at a peak: every rise wobbled and
+            // every peak shelved (Kinetic kin-7jd).
+            // a_over: the cubic's own end acceleration over the ceiling (before
+            // the clamp), the ratio the dilation sizes from; the clamped head
+            // sits exactly on the ceiling and reads 1.00 whatever the time.
+            struct Try { bool built = false, legal = false; float w = 0.0f, a_over = 0.0f; referee::Ratios parts{}; float a_l = 0.0f, j = 0.0f, Tr = 0.0f; uint64_t h_us = 0, ts = 0; State start{}; Piece head{}; };
+            auto attempt = [&](uint64_t t_k) -> Try {
+                Try r;
+                const float Tin = float(t_k - prev_us) * 1e-6f;
+                const float pk_now = out[i].p;
+                float a_l = (6.0f * (prev.p - pk_now) + Tin * (2.0f * prev.v + 4.0f * vk)) / (Tin * Tin);
+                r.a_over = std::fabs(a_l) / L.amax;
+                a_l = std::fmax(-L.amax, std::fmin(L.amax, a_l));
+                const float a_r = has_right
+                    ? std::fmax(-L.amax, std::fmin(L.amax, (6.0f * (right_pn - pk_now) - right_T * (4.0f * vk + 2.0f * right_vn)) / (right_T * right_T)))
+                    : a_l;
+                r.a_l = a_l;
+                r.Tr = std::fabs(a_r - a_l) / L.jmax;
+                const float h = 0.5f * r.Tr;
+                r.h_us = uint64_t(h * 1e6f + 0.5f);
+                if (r.h_us == 0) {
+                    r.ts = t_k; r.start = State{pk_now, vk, a_l};
+                } else {
+                    if (t_k <= prev_us + r.h_us + 1000) return r;
+                    r.j = (a_r - a_l) / r.Tr;
+                    // Walk the mid state back to the ramp's start.
+                    const float vs = vk - a_l * h - 0.5f * r.j * h * h;
+                    const float ps = pk_now - vs * h - 0.5f * a_l * h * h - r.j * h * h * h / 6.0f;
+                    r.start = State{ps, vs, a_l};
+                    r.ts = t_k - r.h_us;
+                }
+                r.head = Piece::hermite(prev_us, prev, r.ts, r.start);
+                ++work;
+                r.w = referee::worstRatio(r.head, L, lo, hi, &r.parts);
+                // At the ceiling by a float's width is at the ceiling (the
+                // profile checks allow the same); over it by the cubic's own
+                // end acceleration is not, whatever the clamp made of it.
+                r.built = true; r.legal = r.w <= 1.0001f && r.a_over <= 1.0001f;
+#ifdef K2_TRACE
+                std::printf("  corner i=%zu t_k=%.1fms head T=%.1fms prev(p%.4f v%.3f a%.1f) start(p%.4f v%.3f a%.1f) Tr=%.1fms w=%.3g (v%.2f a%.2f j%.2f)\n", i, double(t_k - prev_us) / 1000.0, double(r.ts - prev_us) / 1000.0, prev.p, prev.v, prev.a, r.start.p, r.start.v, r.start.a, r.Tr * 1e3f, r.w, r.parts.v, r.parts.a, r.parts.j);
+#endif
+                return r;
+            };
+            // Books an accepted knot: the time it spent moves the later segments
+            // with it and is reported as the Stretch it is.
+            // Books an accepted knot: placed at nominal_us (its authored time plus
+            // the stretch it carries and spent), which moves the later segments
+            // through placeLater; it ends at final_us (a corner's ramp end).
+            auto book = [&](const State& exit, uint64_t nominal_us, uint64_t final_us, uint64_t add, float w) -> int {
+                out[i].t_us = nominal_us;
+                placeLater(i);
+                out[i].t_us = final_us;
+                out[i].worst = w;
+                out[i].stretched_s = float(add) * 1e-6f;
+                if (add > 0) report(AnomalyKind::DeadlineStretched, i, out[i].t_us, out[i].p, out[i].stretched_s);
                 out[i].from = prev; out[i].from_us = prev_us;
-                pp = prev; pp_us = prev_us; last = i; out[i].shift_us = shift; out[i].own_us = 0;
-                prev = at_end; prev_us = out[i].t_us;
+                pp = prev; pp_us = prev_us; last = i;
+                out[i].shift_us = nominal_us > knots[i].t_us ? nominal_us - knots[i].t_us : 0; out[i].own_us = add;
+                prev = exit; prev_us = out[i].t_us;
                 return kAccepted;
             };
-            if (!right_ok) {
-                // the smooth path below
-            } else if (h_us == 0) {
-                // No step to ramp (equal sides, or the newest knot): the
-                // knot carries the left acceleration.
-                const State k{pk, vk, a_l};
-                const Piece head = Piece::hermite(prev_us, prev, out[i].t_us, k);
-                ++work;
-                if (referee::worstRatio(head, L, lo, hi) <= 1.0f && stoppable(k)) {
-                    out[i].v = vk; out[i].a = a_l;
-                    return accept(head, k);
+            // Takes a built, legal attempt whose ramp and exit pass; false falls through.
+            auto take = [&](const Try& r, uint64_t add) -> bool {
+                if (r.h_us == 0) {
+                    if (!stoppable(r.start)) return false;
+                    out[i].v = vk; out[i].a = r.a_l;
+                    book(r.start, r.ts, r.ts, add, r.w);
+                    return true;
                 }
-            } else if (out[i].t_us > prev_us + h_us + 1000) {
-                const float j = (a_r - a_l) / Tr;
-                // Walk the mid state back to the ramp's start.
-                const float vs = vk - a_l * h - 0.5f * j * h * h;
-                const float ps = pk - vs * h - 0.5f * a_l * h * h - j * h * h * h / 6.0f;
-                const State start{ps, vs, a_l};
-                const uint64_t ts = out[i].t_us - h_us;
-                const Piece head = Piece::hermite(prev_us, prev, ts, start);
-                ++work;
-                if (referee::worstRatio(head, L, lo, hi) <= 1.0f) {
-                    Profile ramp; ramp.start_us = ts; ramp.s0 = start; ramp.n = 1; ramp.dt[0] = Tr; ramp.jerk[0] = j; ramp.ends_at_rest = false;
-                    const State exit = Profile::step(start, j, Tr);
-                    if (ramp.worstRatio(L, lo, hi) <= 1.0f && stoppable(exit)) {
-                        out[i].corner = true; out[i].head_us = ts; out[i].head = start; out[i].ramp = ramp;
-                        out[i].t_us = ts + uint64_t(Tr * 1e6f + 0.5f);
-                        out[i].p = exit.p; out[i].v = exit.v; out[i].a = exit.a;
-                        return accept(head, exit);
+                Profile ramp; ramp.start_us = r.ts; ramp.s0 = r.start; ramp.n = 1; ramp.dt[0] = r.Tr; ramp.jerk[0] = r.j; ramp.ends_at_rest = false;
+                const State exit = Profile::step(r.start, r.j, r.Tr);
+                if (!(ramp.worstRatio(L, lo, hi) <= 1.0f && stoppable(exit))) return false;
+                out[i].corner = true; out[i].head_us = r.ts; out[i].head = r.start; out[i].ramp = ramp;
+                out[i].p = exit.p; out[i].v = exit.v; out[i].a = exit.a;
+                book(exit, r.ts + r.h_us, r.ts + uint64_t(r.Tr * 1e6f + 0.5f), add, r.w);
+                return true;
+            };
+            if (right_ok) {
+                const Try r0 = attempt(t_k0);
+                if (r0.built && r0.legal && take(r0, 0)) return kAccepted;
+                const bool finite0 = r0.built && r0.w < 0.5f * referee::kIllegal;
+                // SATURATE: speed alone binds. The author's cubic with its speed
+                // clipped at the ceiling (Profile::saturate), the knot later by
+                // the cruise's cost: the closest curve the ceiling allows, whole
+                // stroke, a few ms late where a rescale of the cubic is late by
+                // the whole ratio and a trim short by it (kin-g5u). The ramp
+                // follows the saturated head as one profile.
+                if (finite0 && !r0.legal && r0.parts.v > 1.0f && r0.parts.a <= 1.0f && r0.parts.j <= 1.0f) {
+                    Profile sat;
+                    work += 3;   // two closed-form bisections and the referee
+                    const uint64_t Th_us = r0.ts - prev_us;
+                    if (Profile::saturate(prev, r0.start, float(Th_us) * 1e-6f, L, sat)) {
+                        sat.start_us = prev_us;
+                        Profile whole = sat;
+                        if (r0.h_us == 0 || whole.add(r0.Tr, r0.j)) {
+                            const float w = whole.worstRatio(L, lo, hi);
+                            const State exit = whole.end();
+                            const uint64_t dur_us = uint64_t(sat.duration() * 1e6f + 0.5f);
+                            const uint64_t add = dur_us > Th_us ? dur_us - Th_us : 0;
+                            if (w <= 1.0001f && std::fabs(sat.end().p - r0.start.p) <= 1e-4f && within(add) && stoppable(exit)) {
+                                out[i].hard = true; out[i].corner = false; out[i].ramp = whole;
+                                out[i].p = exit.p; out[i].v = exit.v; out[i].a = exit.a;
+                                return book(exit, t_k0 + add, prev_us + uint64_t(whole.duration() * 1e6f + 0.5f), add, w);
+                            }
+                        }
                     }
                 }
+                // DILATE: an acceleration or jerk ceiling binds (or the speed
+                // could not be saturated). The cubic given more time: its speed
+                // scales with 1 / T, its acceleration with 1 / T^2, its jerk with
+                // 1 / T^3, so the span at ratio 1 is T times the bound ratio's
+                // root; judged, one secant refinement. The whole cubic slows, the
+                // knot and the later segments move by the same time.
+                if (finite0 && !r0.legal) {
+                    const float need = std::fmax(std::fmax(r0.parts.v, std::sqrt(r0.a_over)), std::fmax(std::sqrt(r0.parts.a), std::cbrt(r0.parts.j)));
+                    const uint64_t Th_us = t_k0 - prev_us;
+                    uint64_t add = uint64_t(float(Th_us) * (need * 1.01f - 1.0f)) + 1;
+                    Try r1 = attempt(t_k0 + add);
+#ifdef K2_TRACE
+                    std::printf("  dilate i=%zu need=%.3f add=%.1fms built=%d legal=%d w=%.3g\n", i, need, double(add) / 1000.0, int(r1.built), int(r1.legal), r1.w);
+#endif
+                    if (r1.built && !r1.legal && r1.w < 0.5f * referee::kIllegal && r1.w < r0.w) {
+                        // The secant through the two judges at 0.998, never less
+                        // than a percent more time (a ratio at the ceiling by a
+                        // float's width moved the secant by nothing).
+                        const float x = float(add) * (r0.w - 0.998f) / (r0.w - r1.w);
+                        const uint64_t least = add + (Th_us + add) / 100 + 1;
+                        add = x > float(least) ? uint64_t(x) + 1 : least;
+                        r1 = attempt(t_k0 + add);
+                    }
+                    if (r1.built && r1.legal && within(add) && take(r1, add)) return kAccepted;
+                }
+                // TRIM (Blend): the budget is spent, or no time spend took. The cubic
+                // with its stroke cut by the ratio that binds, on time (the
+                // Blend spend sized for the cubic, not the quintic); refined
+                // once on the ratio it leaves.
+                if (finite0 && !r0.legal && cfg.policy != Policy::Stretch) {
+                    const float need = std::fmax(std::fmax(r0.parts.v, std::sqrt(r0.a_over)), std::fmax(std::sqrt(r0.parts.a), std::cbrt(r0.parts.j)));
+                    const float p_full = knots[i].p;
+                    float share = 0.998f / need;
+                    for (int it = 0; it < 2 && share > 0.05f && share < 1.0f; ++it) {
+                        out[i].p = prev.p + share * (p_full - prev.p);
+                        const Try rt = attempt(t_k0);
+                        if (rt.built && rt.legal) {
+                            if (take(rt, 0)) {
+                                out[i].share = share;
+                                report(AnomalyKind::WaveformScaled, i, out[i].t_us, out[i].p, share);
+                                return kAccepted;
+                            }
+                            break;
+                        }
+                        if (!(rt.built && rt.w < 0.5f * referee::kIllegal && rt.w > 0.0f)) break;
+                        share *= 0.98f / rt.w;
+                    }
+                    out[i].p = knots[i].p;
+                }
             }
+            out[i].t_us = t_k0; out[i].corner = false; out[i].hard = false;
         }
-
         Piece q; float worst = 0.0f; referee::Ratios parts{};
         uint64_t added = 0;   // the Stretch this knot spent, carried by later segments
         // The budget: this knot's first judge is always made; past its limit
@@ -1068,8 +1259,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             // could not be reached flying and the ramp crawled).
             const bool rest_when_stretched = i == 0 && n == 1 && knots[i].sample && !knots[i].has_v;
             auto place = [&](uint64_t add, bool again) {
-                if (knots[i].sample) out[i].t_us = out[i].base_us + add;
-                else for (size_t k = i; k < n; ++k) out[k].t_us = out[k].base_us + add;
+                out[i].t_us = out[i].base_us + add;
                 floorSelf(i); placeLater(i);
                 if (rest_when_stretched) {
                     const bool r = add >= 3 * span;
@@ -1274,8 +1464,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
         out[i].worst = worst;
         out[i].from = prev; out[i].from_us = prev_us;
         pp = prev; pp_us = prev_us; last = i;
-        if (!knots[i].sample) shift += added;
-        out[i].shift_us = shift;
+        out[i].shift_us = knots[i].sample || out[i].t_us < knots[i].t_us ? 0 : out[i].t_us - knots[i].t_us;
         out[i].own_us = added;
         prev = State{out[i].p, out[i].v, out[i].a};
         prev_us = out[i].t_us;

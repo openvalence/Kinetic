@@ -107,6 +107,18 @@ struct Config {
     // measured: 6 ms pieces spiraled into reversals, a committed knot froze a
     // start-up velocity into every later piece).
     uint32_t react_us       = 4000;
+    // THE LATENESS BUDGET: how far behind the author's clock the plan may
+    // run before a cubic spend keeps the deadline instead (the stroke cut by
+    // the ratio that binds). A stroke the ceilings refuse is rendered whole
+    // and late (saturated at the speed ceiling, or dilated), the lateness
+    // carried by the segments behind it and given back at the next hold; a
+    // passage that asks more than the machine without end would run ever
+    // later, and past this it shortens. Time, not a share of the window: the
+    // window is the operator's preference and never enters. 0: never late.
+    // 50 ms holds a stroke's clipped area at a fifth over the speed ceiling
+    // (5 ms at a sixth over, measured), never a passage at twice it, which
+    // shortens on the author's clock from its first stroke: uniform.
+    uint32_t late_budget_us = 50000;
     // The most work one solve does, the hard bound on its time, in referee
     // passes (every extremum of one piece; four knots of a junction solve
     // count as one). Sized for the P4's 1 ms motion tick: unbounded, the

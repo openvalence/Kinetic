@@ -11,7 +11,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0xeeb05ecb9e775781ull   // accepted 2026-10-07 (kin-7jd): the C1 segment at rest is an authored knot, no longer Hard
+#define KINETIC2_FINGERPRINT 0x4040d49b1f0c2fe3ull   // accepted 2026-10-07 (kin-7jd): the C1 segment at rest is an authored knot, no longer Hard
 #endif
 
 using namespace kinetic2;
@@ -315,12 +315,19 @@ TEST_CASE("Stretch keeps the stroke, moves the knot and everything after it") {
     CHECK(pk.hi >= 1.0f - 1e-3f);           // the full stroke happened
     float added = 0.0f;
     const auto an = drain(e);
-    CHECK(countKind(an, AnomalyKind::DeadlineStretched, &added) == 1);
+    CHECK(countKind(an, AnomalyKind::DeadlineStretched, &added) >= 1);
     CHECK(countKind(an, AnomalyKind::PlanFailed) == 0);
-    CHECK(added > 0.1f);
-    // The second knot moved by the same amount: it lands at 0.5 at 620 ms + added.
-    const size_t t2 = 620 + size_t(added * 1000.0f + 0.5f);
-    CHECK(s[t2].p == doctest::Approx(0.5f).epsilon(2e-3));
+    float first = 0.0f;
+    for (const Anomaly& a : an) if (a.kind == uint8_t(AnomalyKind::DeadlineStretched)) { first = a.detail; break; }
+    CHECK(first > 0.1f);
+    // The second knot moved with it, less what its own span gives back: a
+    // 500 ms span for half the travel has margin, so it catches up by at most
+    // a quarter of itself (the placement rule, kin-g5u) and lands at 0.5
+    // between 620 ms + first - 125 ms and 620 ms + first, never later.
+    size_t landed = 0;
+    for (size_t k = 620; k < s.size(); ++k) if (std::fabs(s[k].p - 0.5f) <= 2e-3f && std::fabs(s[k].v) <= 1e-2f) { landed = k; break; }
+    CHECK(landed >= 620 + size_t(first * 1000.0f) - 125);
+    CHECK(landed <= 620 + size_t(first * 1000.0f) + 1);
 }
 
 TEST_CASE("the rail is a wall: a reversal that would bulge past it is spent") {
@@ -1284,4 +1291,95 @@ TEST_CASE("truncateAfter keeps the knot at its time: a bundle starting where the
     CHECK(e.truncateAfter(300000, 1000) == 1);   // inside the span: the hand-off knot stands at 300 ms
     CHECK(e.newest().t_us == 300000);
     CHECK(e.newest().has_v);
+}
+
+// ---- the cubic spends (kin-g5u) ------------------------------------------------
+// An authored C1 cubic the ceilings refuse is spent on AS A CUBIC: speed-bound,
+// its speed is clipped at the ceiling and the knot lands later by the clipped
+// area (Profile::saturate); acceleration- or jerk-bound, the cubic is dilated by
+// the root of the bound ratio. Falling to the smooth quintic first priced every
+// spend for a curve a quarter faster: a 15 % overspeed cost 27 % of the stroke.
+namespace {
+struct SpendRun { int trimmed = 0, stretched = 0, failed = 0; float stretch_s = 0.0f, v_peak = 0.0f; std::vector<float> p, v; };
+struct Span { uint64_t start_ms, dur_ms; float p; };
+// Streams the spans as the player sends them, each 110 ms before its start, and samples every ms.
+template <size_t N>
+SpendRun runSpans(const Config& cfg, float p0, const Span (&spans)[N], uint64_t end_ms) {
+    Engine<> e(cfg, p0);
+    SpendRun r;
+    size_t next = 0;
+    for (uint64_t now = 0; now <= end_ms * kMs; now += kMs) {
+        while (next < N && spans[next].start_ms * kMs <= now + 110 * kMs) {
+            const Span& s = spans[next++];
+            REQUIRE(e.submit(knotFromSegment(s.p, uint32_t(s.dur_ms) * kMs, true, 0.0f, s.start_ms * kMs, Family::C1), now));
+        }
+        const State st = e.stateAt(0, now);
+        r.p.push_back(st.p); r.v.push_back(st.v);
+        r.v_peak = std::fmax(r.v_peak, std::fabs(st.v));
+        Anomaly a;
+        while (e.popAnomaly(a)) {
+            if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++r.trimmed;
+            if (a.kind == uint8_t(AnomalyKind::DeadlineStretched)) { ++r.stretched; r.stretch_s = std::fmax(r.stretch_s, a.detail); }
+            if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++r.failed;
+        }
+    }
+    return r;
+}
+}  // namespace
+
+TEST_CASE("a speed-bound C1 fall is saturated at the ceiling: the whole stroke, late by the clipped area, never trimmed") {
+    // The operator's fall (kin-g5u): 96 mm in 125 ms on a 150 mm window, rest to
+    // rest, whose cubic peaks at 1152 mm/s against 1000. A hold follows, then
+    // the same stroke again.
+    Config cfg; cfg.limits = {1000.0f / 150.0f, 50000.0f / 150.0f, 5.0e6f / 150.0f}; cfg.corner = Corner::Cubic;
+    const float top = 0.64f;
+    const Span spans[] = {{0, 375, top}, {375, 125, 0.0f}, {500, 250, 0.0f}, {750, 375, top}, {1125, 125, 0.0f}, {1250, 250, 0.0f}};
+    const SpendRun r = runSpans(cfg, 0.0f, spans, 1600);
+    MESSAGE("peak v " << r.v_peak << " of " << cfg.limits.vmax << ", stretched " << r.stretched << " (max " << r.stretch_s * 1e3f
+            << " ms), trimmed " << r.trimmed << ", failed " << r.failed);
+    CHECK(r.trimmed == 0);
+    CHECK(r.failed == 0);
+    CHECK(r.v_peak <= cfg.limits.vmax * 1.001f);
+    CHECK(r.v_peak >= cfg.limits.vmax * 0.98f);   // it cruises AT the ceiling
+    CHECK(r.stretched >= 1);
+    CHECK(r.stretch_s <= 0.008f);                  // the clipped area: 4.6 ms by the model
+    // The top on time, the whole stroke down within 10 ms of the knot.
+    CHECK(std::fabs(r.p[375] - top) <= 0.01f);
+    float lowest = 1.0f; size_t at = 0;
+    for (size_t i = 376; i < 700; ++i) if (r.p[i] < lowest) { lowest = r.p[i]; at = i; }
+    CHECK(lowest <= 0.003f);
+    CHECK(at <= 512);
+    // The second stroke is the same spend, not a growing one.
+    float lowest2 = 1.0f; size_t at2 = 0;
+    for (size_t i = 1126; i < 1450; ++i) if (r.p[i] < lowest2) { lowest2 = r.p[i]; at2 = i; }
+    CHECK(lowest2 <= 0.003f);
+    CHECK(at2 <= 1262);
+    // The hold after the first fall gave its stretch back: the second rise's top is on the author's clock.
+    CHECK(std::fabs(r.p[1125] - top) <= 0.01f);
+}
+
+TEST_CASE("an acceleration-bound C1 span is dilated by the root of its ratio, never trimmed") {
+    // 35 mm in 60 ms on a 100 mm window from rest: the cubic's acceleration is
+    // 583 window/s^2 against 500 (ratio 1.17), its speed and jerk legal. Dilated
+    // by sqrt(1.17) it is 4.8 ms late and whole.
+    Config cfg; cfg.limits = {1000.0f / 100.0f, 50000.0f / 100.0f, 5.0e6f / 100.0f}; cfg.corner = Corner::Cubic;
+    const Span spans[] = {{0, 60, 0.35f}, {60, 300, 0.35f}, {360, 60, 0.0f}, {420, 300, 0.0f}};
+    const SpendRun r = runSpans(cfg, 0.0f, spans, 800);
+    MESSAGE("stretched " << r.stretched << " (max " << r.stretch_s * 1e3f << " ms), trimmed " << r.trimmed << ", failed " << r.failed);
+    CHECK(r.trimmed == 0);
+    CHECK(r.failed == 0);
+    CHECK(r.stretched >= 1);
+    // The first span from rest also pays a jerk ramp (the carriage's a = 0 to
+    // the cubic's). A stretch is not carried to a knot that arrives after it
+    // (kin-g5u, the lateness budget is the open design), so the fall's span
+    // is shorter by that ramp and its own dilation pays for both.
+    CHECK(r.stretch_s <= 0.025f);
+    float top = 0.0f; size_t at = 0;
+    for (size_t i = 0; i < 300; ++i) if (r.p[i] > top) { top = r.p[i]; at = i; }
+    CHECK(top >= 0.345f);
+    CHECK(at <= 75);
+    size_t reached = 0;
+    for (size_t i = 361; i < 700; ++i) if (r.p[i] <= 0.01f) { reached = i; break; }
+    CHECK(reached >= 400);
+    CHECK(reached <= 440);
 }
