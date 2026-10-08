@@ -220,6 +220,54 @@ public:
     float positionAt(uint64_t now_us) { return stateAt(0, now_us).p; }
     float velocityAt(uint64_t now_us) { return stateAt(0, now_us).v; }
 
+    // ---- lookahead ----------------------------------------------------------
+    // The position at t0 + i * step_us for i in [0, n): bit for bit what
+    // stateAt(axis, t) returns at each of those times when nothing is
+    // submitted, truncated, braked or reset meanwhile and the times only
+    // advance (stateAt() replayed on copies). Solves a dirty window first and
+    // writes nothing else: it retires no knot, engages no brake, records no
+    // anomaly. One buildPiece per knot interval the times reach, never one
+    // per time. A time before the axis's last sample is not the plan.
+    void peek(size_t axis, uint64_t t0, uint32_t step_us, size_t n, float* p_out) {
+        Axis& a = _ax[axis];
+        ensureSolved(a);
+        const size_t nk = a.n_sol;
+        size_t k = 0;                 // the first knot still pending
+        bool committed = a.has_committed;
+        bool valid = a.piece_valid;
+        State o = a.origin;
+        uint64_t o_us = a.origin_us;
+        Piece pc = a.piece;
+        auto moving = [](const State& s) { return std::fabs(s.v) > 1e-6f || std::fabs(s.a) > 1e-6f; };
+        auto brakeFromOrigin = [&](uint64_t t) {
+            pc = Piece::profile(Profile::brake(o, o_us, _cfg.limits));
+            valid = true;
+            return pc.at(t).p;
+        };
+        auto at = [&](uint64_t t) {
+            if (committed) {
+                if (t < a.committed.end_us) return a.committed.at(t).p;
+                committed = false;
+                valid = false;
+                if (k == nk && moving(o)) return brakeFromOrigin(t);
+            }
+            if (k == nk && valid && pc.has_tail && t < pc.end_us) return pc.at(t).p;
+            while (k < nk && a.sol[k].t_us <= t) {
+                const Solved& s = a.sol[k++];
+                o = State{s.p, s.v, s.a};
+                o_us = s.t_us;
+                valid = false;
+                if (k == nk && moving(o)) return brakeFromOrigin(t);
+            }
+            if (!valid) {
+                pc = k == nk ? Piece::hold(o.p, o_us) : buildPiece(o, o_us, a.sol[k], _cfg.limits);
+                valid = true;
+            }
+            return pc.at(t).p;
+        };
+        for (size_t i = 0; i < n; ++i) p_out[i] = at(t0 + uint64_t(i) * step_us);
+    }
+
     // Motion left to render on any axis. Solves first: a HARD knot may land
     // after the time the sender asked for.
     bool isBusy(uint64_t now_us) {

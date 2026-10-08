@@ -4,6 +4,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest/doctest.h"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -601,6 +602,81 @@ TEST_CASE("fingerprint: the canonical run has not changed bits") {
     const uint64_t fp = fingerprint(s);
     MESSAGE("fingerprint 0x" << std::hex << fp);
     CHECK(fp == KINETIC2_FINGERPRINT);
+}
+
+// ---- peek (kin-4jb, Nucleus val-8rt: the planner's strip) --------------------
+
+TEST_CASE("peek: the plan ahead is what stateAt returns later, bit for bit, and changes nothing") {
+    // Free, authored and HARD knots, samples streamed while sampling (the
+    // committed curve), a last knot left moving (the starvation brake) and an
+    // explicit brake mid-move.
+    Config cfg; cfg.limits = {4.0f, 60.0f, 3000.0f};
+    Engine<> e(cfg, 0.3f);
+    constexpr size_t kAhead = 16;
+    constexpr uint64_t kEndMs = 1600;
+    auto bits = [](float x) { uint32_t b; std::memcpy(&b, &x, sizeof b); return b; };
+    auto act = [&](uint64_t ms) {
+        const uint64_t t = ms * kMs;
+        if (ms == 0) {
+            REQUIRE(e.submit(knotAt(150 * kMs, 0.9f), t));
+            REQUIRE(e.submit(knotAt(260 * kMs, 0.1f, true, -1.0f), t));
+            REQUIRE(e.submit(knotAt(400 * kMs, 0.6f, true, 0.0f, Family::C1), t));
+        } else if (ms == 420) {
+            Knot jog = knotFromSample(0.25f, t, 1000);
+            jog.has_v = true; jog.family = Family::C1;
+            REQUIRE(e.submit(jog, t));
+        } else if (ms >= 700 && ms <= 860 && (ms - 700) % 16 == 0) {
+            REQUIRE(e.submit(knotFromSample(0.25f + 0.02f * float((ms - 700) / 16 + 1), t, 40 * kMs), t));
+        } else if (ms == 900) {
+            REQUIRE(e.submit(knotAt(1000 * kMs, 0.5f, true, 1.5f), t));
+        } else if (ms == 1150) {
+            REQUIRE(e.submit(knotAt(1400 * kMs, 0.2f), t));
+        } else if (ms == 1250) {
+            e.brake(t);
+        } else {
+            return false;
+        }
+        return true;
+    };
+    std::vector<uint32_t> epoch, sampled;
+    std::vector<std::array<float, kAhead>> ahead;
+    uint32_t ep = 0, first_off = 0;
+    for (uint64_t ms = 0; ms <= kEndMs; ++ms) {
+        if (act(ms)) ++ep;
+        std::array<float, kAhead> out{};
+        e.peek(0, ms * kMs, uint32_t(kMs), kAhead, out.data());
+        const float p = e.stateAt(0, ms * kMs).p;
+        if (bits(out[0]) != bits(p)) ++first_off;
+        epoch.push_back(ep);
+        sampled.push_back(bits(p));
+        ahead.push_back(out);
+    }
+    CHECK(first_off == 0);
+    // Each strip against the samples taken after it, up to the next action.
+    size_t compared = 0, off = 0;
+    for (size_t m = 0; m < ahead.size(); ++m)
+        for (size_t i = 1; i < kAhead && m + i < ahead.size() && epoch[m + i] == epoch[m]; ++i) {
+            ++compared;
+            if (bits(ahead[m][i]) != sampled[m + i]) ++off;
+        }
+    MESSAGE("compared ", compared, " predictions, ", off, " off");
+    CHECK(off == 0);
+    CHECK(compared > 20000);
+
+    // The canonical run with a peek before every sample keeps its fingerprint.
+    Config fc; fc.limits = {4.0f, 60.0f, 3000.0f}; fc.policy = Policy::Blend; fc.amplitude_floor = 0.2f;
+    Engine<> f(fc, 0.3f);
+    REQUIRE(f.submit(knotAt(150 * kMs, 0.9f), 0));
+    REQUIRE(f.submit(knotAt(260 * kMs, 0.1f, true, -1.0f), 0));
+    REQUIRE(f.submit(knotAt(500 * kMs, 0.7f, true, 0.0f, Family::C1), 0));
+    REQUIRE(f.submit(knotAt(520 * kMs, 0.95f), 0));
+    REQUIRE(f.submit(knotAt(900 * kMs, 0.4f), 0));
+    std::vector<State> s;
+    float scratch[kAhead];
+    for (uint64_t t = 0; t <= 1000 * kMs; t += kMs) { f.peek(0, t, uint32_t(kMs), kAhead, scratch); s.push_back(f.stateAt(0, t)); }
+    f.brake(1000 * kMs);
+    for (uint64_t t = 1000 * kMs; t <= 1200 * kMs; t += kMs) { f.peek(0, t, uint32_t(kMs), kAhead, scratch); s.push_back(f.stateAt(0, t)); }
+    CHECK(fingerprint(s) == KINETIC2_FINGERPRINT);
 }
 
 // ---- the corner option (kin-jub, RFC-105 planner option `corner`) -------------
