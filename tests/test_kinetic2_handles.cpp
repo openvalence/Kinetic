@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kinetic2/engine.hpp"
@@ -291,27 +292,99 @@ TEST_CASE("smoothness 0 and 1 render the pchip and smooth styles bit for bit") {
     // piece the model fits was left over jmax). All four moved with kin-9od3:
     // the window wall at half the tolerance, end-acceleration asks held to
     // amax and dropped when no fit honors them, and (the engine) pieces built
-    // from the render's curve after an on-curve corner exit.
+    // from the render's curve after an on-curve corner exit. Both smooth
+    // hashes moved with kin-4o6r (0x614ccb89b4dc2c36 -> 0xc99cb88b53ab265c,
+    // 0xc68708be37c41d4e -> 0xf809a2cf0639093e): a crest under smooth is flat
+    // where it took Makima's angle; pchip is unchanged.
     CHECK(bareHash(0.0f) == 0x137dfc85e450fd0dull);
-    CHECK(bareHash(1.0f) == 0x614ccb89b4dc2c36ull);
+    CHECK(bareHash(1.0f) == 0xc99cb88b53ab265cull);
     CHECK(engineHash(0.0f) == 0xa6fac79f561c2021ull);
-    CHECK(engineHash(1.0f) == 0xc68708be37c41d4eull);
+    CHECK(engineHash(1.0f) == 0xf809a2cf0639093eull);
 }
 
-TEST_CASE("smoothness: overshoot between free knots grows with it from none at 0") {
+TEST_CASE("smoothness: crests and hold edges are flat at every value; the lengths change, not the extrema") {
     // The model's script: free knots well inside the ceilings, so no fit or
-    // trim hides what the lerp does.
+    // trim hides what the lerp does. Its through points stay inside their
+    // monotone band, so nothing overshoots (kin-4o6r).
     const handles_fixture::Case& c = fixture("sample");
-    float prev = -1.0f;
+    const std::vector<handles::HKnot> crisp = renderBare(c);
     for (int i = 0; i <= 10; ++i) {
         Config cfg;
         cfg.smoothness = float(i) / 10.0f;
-        const float o = overshoot(renderBare(c, cfg));
+        const std::vector<handles::HKnot> k = renderBare(c, cfg);
         CAPTURE(i);
-        MESSAGE("smoothness " << cfg.smoothness << ": overshoot " << o << " of the window, summed over the pieces");
-        if (i == 0) CHECK(o == 0.0f);
-        else CHECK(o > prev);
-        prev = o;
+        CHECK(overshoot(k) == 0.0f);
+        bool moved = false;
+        for (size_t j = 1; j + 1 < k.size(); ++j) {
+            if (k[j].cls == handles::KnotClass::Crest || k[j].cls == handles::KnotClass::Rest) CHECK(k[j].vel == 0.0f);
+            moved = moved || k[j].effIn != crisp[j].effIn || k[j].effOut != crisp[j].effOut || k[j].vel != crisp[j].vel;
+        }
+        CHECK(moved == (i > 0));
+    }
+}
+
+// ---- the operator's trough (kin-4o6r) -------------------------------------------
+
+namespace {
+
+// A sine-like script of free knots at 300 ms spans: a crest, then a trough of
+// two knots 40 ms apart (lo, then lo2), 640 ms a cycle. Streamed 125 ms ahead
+// of each knot's predecessor; with expect, each submit first sets the horizon
+// 500 ms on. Returns every 1 ms state.
+std::vector<State> troughRun(float lo, float lo2, float smoothness, bool expect, std::vector<Knot>& ks) {
+    ks.clear();
+    for (int cyc = 0; cyc < 6; ++cyc) {
+        const uint64_t t = 500 * kMs + uint64_t(cyc) * 640 * kMs;
+        for (const std::pair<uint64_t, float>& dp : {std::pair<uint64_t, float>{0, 0.9f}, {300, lo}, {340, lo2}}) {
+            Knot k; k.t_us = t + dp.first * kMs; k.p = dp.second; ks.push_back(k);
+        }
+    }
+    Config cfg;
+    cfg.limits = {6.0f, 200.0f, 20000.0f};
+    cfg.smoothness = smoothness;
+    Engine<> e(cfg, ks[0].p);
+    std::vector<State> s;
+    size_t next = 1;
+    for (uint64_t t = 0; t < ks.back().t_us + 600 * kMs; t += kMs) {
+        while (next < ks.size() && ks[next - 1].t_us <= t + 125 * kMs) {
+            if (expect) e.expect(t + 500 * kMs);
+            REQUIRE(e.submit(ks[next++], t));
+        }
+        s.push_back(e.stateAt(0, t));
+    }
+    return s;
+}
+
+}  // namespace
+
+TEST_CASE("smooth: a crest and a hold-edge trough are passed flat, never past (kin-4o6r)") {
+    // Before the ruling the smooth style gave a crest Makima's angle: the
+    // step pair's lower knot was passed 0.0015 of the window past at
+    // smoothness 1 (0.0043 with expect, and the crest 0.0130), its slope 0.37
+    // of the window per second.
+    for (const float lo : {0.1f, 0.13f}) {   // a hold pair; the operator's step pair
+        for (const float sm : {0.5f, 1.0f}) {
+            for (const bool expect : {false, true}) {
+                std::vector<Knot> ks;
+                const std::vector<State> s = troughRun(lo, 0.1f, sm, expect, ks);
+                CAPTURE(lo); CAPTURE(sm); CAPTURE(expect);
+                float past = 0.0f, slope = 0.0f;
+                // Interior cycles: the launch from rest and the last knot excluded.
+                for (size_t i = 1; i + 1 < ks.size(); ++i) {
+                    const size_t at = size_t(ks[i].t_us / kMs);
+                    const bool crest = i % 3 == 0, low = i % 3 == 2;
+                    if (crest) for (size_t j = at - 150; j <= at + 150; ++j) past = std::fmax(past, s[j].p - ks[i].p);
+                    if (low) for (size_t j = at - 190; j <= at + 150; ++j) past = std::fmax(past, ks[i].p - s[j].p);
+                    if (crest || low) slope = std::fmax(slope, std::fabs(s[at].v));
+                }
+                MESSAGE("trough " << lo << "/0.1, smoothness " << sm << std::string(expect ? ", expect" : "") << ": past a crest or trough knot " << past << ", slope there " << slope);
+                // 0.2 % of the window.
+                CHECK(past <= 0.002f);
+                // Zero in the render (above); the engine's corner ramp passes
+                // the knot within a thousandth of vmax.
+                CHECK(slope <= 6e-3f);
+            }
+        }
     }
 }
 

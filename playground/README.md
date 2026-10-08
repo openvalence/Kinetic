@@ -77,8 +77,8 @@ corner with two angles, G1 one angle with free lengths, G2 continuous
 acceleration (the angle for a through point, the lengths for a crest). The
 smoothness sets the defaults: at 0 (PCHIP) crests and hold edges stay G1 as
 drawn, the corner ramp takes their acceleration step, and through points are
-G2 by their angle; at 1 crests take Makima's angles and crests and hold edges
-are G2 by their lengths; between, the free angles and lengths of the two
+G2 by their angle; at 1 through points take Makima's angles and crests and
+hold edges stay flat, G2 by their lengths; between, the free angles and lengths of the two
 blend (the kernel's Config::smoothness). The
 ceilings, the window included, bound the lengths per piece: speed from above, acceleration and jerk
 from below. A piece no length satisfies may move its later knot inside the

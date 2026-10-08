@@ -82,9 +82,10 @@ public:
     // The stream owner's word that more knots follow until until_us (its
     // schedule horizon). A solve whose window last changed before until_us
     // renders the newest free knot through, toward a provisional successor
-    // (solver.hpp renderRun), instead of at rest; a HARD or authored knot is
-    // unchanged. Read at the next solve (a submit, a flush, a reseed): it
-    // never re-plans the curve in flight by itself. When no successor
+    // easing to rest by until_us (solver.hpp renderRun), instead of at rest;
+    // a HARD or authored knot is unchanged. Read at the next solve (a
+    // submit, a flush, a reseed): it never re-plans the curve in flight by
+    // itself. When no successor
     // arrives, the knot is reached moving and the starvation brake stops the
     // axis. 0 clears it, and so does a reset.
     void expect(size_t axis, uint64_t until_us) { _ax[axis].expect_us = until_us; }
@@ -452,7 +453,7 @@ private:
         const bool undoable = a.replan_open && n > 1;
         a.replan_open = false;
         if (undoable) keepReports(a);
-        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.expect_us > a.dirty_us);
+        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.expect_us > a.dirty_us ? a.expect_us : 0);
         a.n_sol = n;
         a.solved_valid = true;
         a.piece_valid = false;

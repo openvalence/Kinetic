@@ -80,7 +80,8 @@ struct Config {
     Limits   limits{};
     // How free knots render: 0 crisp (pchip: no overshoot between monotone
     // knots, acceleration may step at a crest), 1 smooth (acceleration
-    // continuous where the rules allow, overshoots by construction), the lerp
+    // continuous where the rules allow; a through point may overshoot, a
+    // crest or hold edge is never passed), the lerp
     // of the two between (handles.hpp; a mid value solves twice). 0..1.
     float    smoothness     = 0.0f;
     // The shortest handle a ceiling fit may leave a piece, share of its span:

@@ -24,7 +24,8 @@
   const TICK = 1e-3, HOLD_SPAN = 0.1;  // the kernel's kTick and kHoldSpan, s (railStop only)
   // smoothness: 0 is pchip, crests flat and G1 (PCHIP as drawn, the corner ramp takes
   // the acceleration step), through points G2 by their angle; 1 is smooth, Makima's
-  // angles, crests and hold edges G2 by their lengths; between, the lerp of the two
+  // angles at through points, crests and hold edges flat and G2 by their lengths
+  // (they are never passed; kin-4o6r); between, the lerp of the two
   // solves' free angles and lengths (the kernel's Config::smoothness, Valence RFC-108).
   // lfloor: the feel floor on a nudged handle length (a shorter handle is a harder
   // ramp); trim: how far a knot no length can reach may move toward the previous
@@ -154,7 +155,7 @@
     for (let i = 0; i < knots.length; i++) {
       const k = knots[i], prev = knots[i - 1], next = knots[i + 1], m = k.man;
       k.eff = k.cls === 'end' ? 'G1' : k.type !== 'auto' ? k.type : (k.cls === 'through' || smooth) ? 'G2' : 'G1';
-      const base = (k.cls === 'end' || k.cls === 'rest') ? 0 : smooth && knots.length > 3 ? makimaAngle(knots, i) : k.cls === 'through' ? pchipAngle(k, prev, next) : 0;
+      const base = k.cls !== 'through' ? 0 : smooth && knots.length > 3 ? makimaAngle(knots, i) : pchipAngle(k, prev, next);
       if (k.eff === 'G0') { k.vIn = m.vIn ?? k.dIn; k.vOut = m.vOut ?? k.dOut; }
       else { const v = m.v ?? base; k.vIn = k.vOut = v; }
       k.lIn = m.lIn ?? THIRD; k.lOut = m.lOut ?? THIRD;

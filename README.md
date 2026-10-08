@@ -61,10 +61,12 @@ A knot with no end velocity and no successor renders at rest: nothing says
 the motion goes on. A stream owner that knows more is coming says so with
 `expect(axis, until_us)`, before its submits: a solve whose window changed
 before `until_us` renders the newest free knot through, toward a provisional
-successor one span on along its last chord (held to the window and fit to the
-ceilings like any piece), so a stream passes same-direction knots at chord
-speed instead of slowing toward each one. The successor that arrives replaces
-it; a reversal re-plans as any knot does. When none arrives, the knot is
+successor at rest: its speed eases from the last chord's to 0 across the
+horizon left past the knot (at least that chord's span, never a deceleration
+over amax; held to the window and fit to the ceilings like any piece), so a
+stream passes same-direction knots near chord speed instead of slowing toward
+each one, and a reversal the stream did not declare finds the knot slower.
+The successor that arrives replaces it; a reversal re-plans as any knot does. When none arrives, the knot is
 reached moving and the starvation brake stops the axis. A knot with an end
 velocity is unchanged, `expect(axis, 0)` clears it, and without it the engine
 is bit for bit what it was.
@@ -77,7 +79,7 @@ is bit for bit what it was.
 | Member | Default | What it sets |
 |---|---|---|
 | `limits` | 3, 30, 500 | vmax, amax, jmax: ceilings, never targets |
-| `smoothness` | 0 | free knots: 0 crisp (PCHIP, no overshoot between monotone knots), 1 smooth (Makima, overshoots), the blend between |
+| `smoothness` | 0 | free knots: 0 crisp (PCHIP, no overshoot between monotone knots), 1 smooth (Makima's angle at through points, which may overshoot; crests and hold edges stay flat, continuous in acceleration by their handle lengths), the blend between |
 | `handle_floor` | 0.15 | the shortest handle a ceiling fit may leave, share of its span |
 | `trim_max` | 1 | the farthest a knot moves toward its predecessor to fit the ceilings, share of the window |
 | `react_us` | 4000 | how far ahead of now a knot arriving in motion re-plans from |

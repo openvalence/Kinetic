@@ -486,17 +486,17 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, int me, 
         // A start step under kStepS where a corner ramp ends reads over jmax
         // on the 1 ms grid when the tick before it is near jmax already: the
         // piece the engine builds carries it exactly, unless that takes the
-        // piece further over a ceiling or out of the window (every
-        // smoothness, kin-9od3).
+        // piece further over a ceiling or out of the window than the step
+        // reads on the grid (every smoothness, kin-9od3, kin-4o6r).
         if (r > 1 && out[r - 2].corner) {
             const Piece pl = buildPiece(st, st_us, o, c.lim);
             const uint64_t back = st_us > sp_us + kMinSpanUs ? st_us - kMinSpanUs : sp_us;
-            if (pl.T > 0.0f && !pl.has_lead && pl.q.da == 0.0f
-                && std::fabs(handles::aStartOf(pl.q) - buildPiece(sp, sp_us, out[r - 2], c.lim).at(back).a)
-                       > c.lim.jmax * handles::kTick * (1.0f + handles::kTol)) {
+            const float grid = pl.T > 0.0f ? std::fabs(handles::aStartOf(pl.q) - buildPiece(sp, sp_us, out[r - 2], c.lim).at(back).a)
+                                                 / (c.lim.jmax * handles::kTick) : 0.0f;
+            if (pl.T > 0.0f && !pl.has_lead && pl.q.da == 0.0f && grid > 1.0f + handles::kTol) {
                 o.exact_start = true;
                 const Piece ex = buildPiece(st, st_us, o, c.lim);
-                o.exact_start = handles::overOf(ex.q, ex.p0, c) <= std::fmax(1.0f + handles::kTol, handles::overOf(pl.q, pl.p0, c));
+                o.exact_start = handles::overOf(ex.q, ex.p0, c) <= std::fmax(grid, handles::overOf(pl.q, pl.p0, c));
             }
         }
         sp = st;
@@ -524,19 +524,23 @@ inline constexpr float kSlackFloor = 0.25f;
 // much the next time: a share no fit answers reaches kSlackFloor in at most
 // 28 such passes.
 inline constexpr float kSlackStep  = 0.95f;
-// more: a successor is expected (Engine::expect). The newest knot, free and
-// not a sample, then renders through toward a provisional successor one span
-// on along its last chord (held to the window): its angle is the style's
-// from its predecessors, fit and trimmed like any. The successor is never
-// emitted; with none arriving, the engine brakes from the knot.
+// until_us: a successor is expected until then (Engine::expect; 0 none). The
+// newest knot, free and not a sample, then renders through toward a
+// provisional successor at rest: its speed eases from the last chord's (held
+// to vmax) to 0 across the horizon left past the knot (at least its last span,
+// so its chord is never steeper than that span's; never a deceleration over
+// amax), so it lies half that speed times the horizon on (held to the window). Its angle is the style's from its
+// predecessors, fit and trimmed like any; an undeclared reversal finds the
+// knot slower than chord speed. The successor is never emitted; with none
+// arriving, the engine brakes from the knot.
 template <typename Report>
 inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, const handles::Cfg& c,
-                      Solved* out, size_t base, bool last, Report& report, Workspace& ws, bool more = false) {
+                      Solved* out, size_t base, bool last, Report& report, Workspace& ws, uint64_t until_us = 0) {
     K2_STAT(knots, cnt);
     handles::HKnot* k = ws.k;
     uint64_t* te = ws.t_us;
     const int me = int(cnt) + 1;
-    const bool through = more && last && !kn[cnt - 1].has_v && !kn[cnt - 1].sample;
+    const bool through = until_us != 0 && last && !kn[cnt - 1].has_v && !kn[cnt - 1].sample;
     const int m = me + (through ? 1 : 0);
     k[0] = handles::HKnot{};
     k[0].p = s.p; k[0].v = s.v; k[0].has_v = true; k[0].aIn = s.a;
@@ -549,12 +553,16 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
         k[r].p = K.p; k[r].v = K.v; k[r].has_v = K.has_v;
     }
     if (through) {
-        te[me] = te[me - 1] + (te[me - 1] - te[me - 2]);
+        const float v = handles::clampV((k[me - 1].p - k[me - 2].p) / (k[me - 1].t - k[me - 2].t), c);
+        uint64_t h_us = te[me - 1] - te[me - 2];
+        if (until_us > te[me - 1] + h_us) h_us = until_us - te[me - 1];
+        const uint64_t brake_us = uint64_t(std::fabs(v) / c.lim.amax * 1e6f) + 1;
+        if (h_us < brake_us) h_us = brake_us;
+        te[me] = te[me - 1] + h_us;
         k[me] = handles::HKnot{};
         k[me].t = float(te[me] - s_us) * 1e-6f;
-        k[me].p = std::fmin(c.hi, std::fmax(c.lo, 2.0f * k[me - 1].p - k[me - 2].p));
+        k[me].p = std::fmin(c.hi, std::fmax(c.lo, k[me - 1].p + 0.5f * v * float(h_us) * 1e-6f));
         k[me].has_v = true;
-        k[me].v = (k[me].p - k[me - 1].p) / (k[me].t - k[me - 1].t);
     }
     for (int r = 0; r < m; ++r)
         for (int x = 0; x < 3; ++x) { ws.last[r][x] = INFINITY; ws.ask[r][x] = 0.0f; }
@@ -729,11 +737,11 @@ inline bool chaseRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, 
 // knots[0..n) pending, in time order; origin is the state the first piece
 // starts from. Writes out[0..n) and reports every trim, every infeasible piece
 // and every clamped authored velocity through `report`. Returns n: a window is
-// always solved whole. more: a successor of the newest knot is expected
-// (renderRun).
+// always solved whole. until_us: a successor of the newest knot is expected
+// until then, 0 none (renderRun).
 template <typename Report>
 inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* knots, size_t n,
-                          const Config& cfg, Solved* out, Report&& report, Workspace& ws, bool more = false) {
+                          const Config& cfg, Solved* out, Report&& report, Workspace& ws, uint64_t until_us = 0) {
     if (n == 0) return 0;
     K2_STAT(windows, 1);
     handles::Cfg c;
@@ -770,7 +778,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
         }
         size_t j = i + 1;
         while (j < n && j - i < kWindowKnots && junctionOf(knots[j]) != Junction::Hard) ++j;
-        renderRun(s, s_us, knots + i, j - i, c, out + i, i, j == n, report, ws, more);
+        renderRun(s, s_us, knots + i, j - i, c, out + i, i, j == n, report, ws, until_us);
         s = State{out[j - 1].p, out[j - 1].v, out[j - 1].a};
         s_us = out[j - 1].t_us;
         i = j;

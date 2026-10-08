@@ -33,6 +33,11 @@
 // - At smoothness 0 a band-legal piece stays monotone at its scaled lengths
 //   (monoOver, kin-ay9): the band guarantees it only at a third. Above 0 only
 //   the window judges overshoot.
+// - Crests and hold edges are extrema at zero slope at every smoothness
+//   (operator ruling 2026-10-08, kin-4o6r): the smooth solve carries their G2
+//   in the handle lengths on both sides, never in the angle, so they are
+//   never passed. Only a through point takes an angle (Makima's under
+//   smooth) and may overshoot.
 // - Smoothness (Valence RFC-108 item 6): 0 renders the pchip solve and 1 the
 //   smooth solve, bit for bit; between, both are solved and every knot takes
 //   (1 - s) pchip + s smooth of its free angle and both lengths, then the
@@ -83,9 +88,9 @@ struct Cfg {
     float  lfloor  = 0.15f;    // feel floor on a nudged handle length
     float  trim    = 1.0f;     // farthest a knot moves toward its predecessor
     // Free knots: 0 pchip (crests and hold edges flat and G1, through points
-    // G2 by angle, no overshoot between monotone knots); 1 smooth (crests take
-    // Makima's angle, through points start from it and are G2 by angle, crests
-    // and hold edges G2 by their lengths where both sides accelerate the same
+    // G2 by angle, no overshoot between monotone knots); 1 smooth (through
+    // points start from Makima's angle and are G2 by angle, crests and hold
+    // edges flat and G2 by their lengths where both sides accelerate the same
     // way, else G1); the lerp between.
     float  smoothness = 0.0f;
     int    sweeps  = 4;        // G2 sweeps per solve
@@ -532,16 +537,17 @@ inline void band(const HKnot& m, float& lo, float& hi) {
 // An authored angle (has_v) is kept; every angle is held to +-vmax before any
 // length is tried. G2 sweeps: a through point solves its angle in closed form
 // (aEnd of the left piece and aStart of the right are both linear in it), a
-// crest or hold edge under smooth its lengths (ratio matched, product a ninth).
+// crest or hold edge under smooth its lengths (ratio matched, product a
+// ninth), its angle held at zero.
 inline void solveStyle(HKnot* k, int n, const Cfg& c, bool withDp, bool smooth) {
     classify(k, n, c, withDp);
     for (int i = 0; i < n; ++i) {
         HKnot& m = k[i];
         m.g2 = m.cls != KnotClass::End && (m.cls == KnotClass::Through || smooth);
+        // Every style: a crest and a hold edge are extrema at zero slope; only
+        // a through point takes an angle (Makima's under smooth, may overshoot).
         float base = 0.0f;
-        if (m.cls == KnotClass::Crest || m.cls == KnotClass::Through)
-            base = (smooth && n > 3) ? makimaAngle(k, n, i)
-                 : (m.cls == KnotClass::Through) ? pchipAngle(k, i) : 0.0f;
+        if (m.cls == KnotClass::Through) base = (smooth && n > 3) ? makimaAngle(k, n, i) : pchipAngle(k, i);
         // The first knot's angle under railStop is the live velocity (a
         // re-plan's origin), kept exactly.
         m.vel = (i == 0 && c.railStop && m.has_v) ? m.v : capV(m, clampV(m.has_v ? m.v : base, c));
