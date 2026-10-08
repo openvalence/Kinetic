@@ -5,7 +5,7 @@
 // - Time never gives: every knot is reached at its own time, or one tick
 //   after the knot before it when it was authored closer (kMinSpanUs, the
 //   floor of every span). A knot the ceilings cannot reach moves toward its
-//   predecessor in position only (handles::nudge), reported WaveformScaled
+//   predecessor in position only (handles::nudge), reported KnotTrimmed
 //   with the share of its chord kept. Angles are capped at what their spans
 //   stop and a trimmed knot's angle at its trimmed chord (kin-88m), so the
 //   whole trim is legal for speed, acceleration and the window; a G1 knot
@@ -569,7 +569,7 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
         if (o.clamped) report(AnomalyKind::EndVelClamped, idx, o.t_us, K.p, o.v);
         const float authoredPrev = r > 1 ? kn[r - 2].p : s.p;
         if (k[r].dp != 0.0f && std::fabs(K.p - authoredPrev) > c.holdEps)
-            report(AnomalyKind::WaveformScaled, idx, o.t_us, K.p, o.share);
+            report(AnomalyKind::KnotTrimmed, idx, o.t_us, K.p, o.share);
         if (o.infeasible) report(AnomalyKind::PieceOverCeiling, idx, o.t_us, K.p, o.worst);
     }
 }

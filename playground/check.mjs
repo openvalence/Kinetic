@@ -68,7 +68,7 @@ function ceilings(name, s, known) {
     + `${s.steps} p/v steps${s.steps ? ' (first at ' + (s.firstStep * 1000).toFixed(0) + ' ms)' : ''} over ${s.samples} samples`, known);
   const by = {};
   for (const a of s.anomalies) by[a.name] = (by[a.name] || 0) + 1;
-  console.log(`      p ${s.p.min.toFixed(4)}..${s.p.max.toFixed(4)}, dropped ${s.dropped}, refused ${s.refused}; anomalies: ${Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') || 'none'}`);
+  console.log(`      p ${s.p.min.toFixed(4)}..${s.p.max.toFixed(4)}, refused ${s.refused}; anomalies: ${Object.entries(by).map(([k, v]) => k + ' ' + v).join(', ') || 'none'}`);
 }
 
 await page.goto(url);

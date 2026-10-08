@@ -275,8 +275,7 @@ TEST_CASE("a legal script keeps every ceiling in sampled reality") {
     CHECK(pk.lo >= -1e-4f); CHECK(pk.hi <= 1.0f + 1e-4f);
     for (int i = 1; i <= 6; ++i) CHECK(s[size_t(i) * 500].p == doctest::Approx((i % 2) ? 0.8f : 0.2f).epsilon(1e-4));
     const auto an = drain(e);
-    CHECK(countKind(an, AnomalyKind::WaveformScaled) == 0);
-    CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
+    CHECK(countKind(an, AnomalyKind::KnotTrimmed) == 0);
     CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
 }
 
@@ -314,7 +313,7 @@ TEST_CASE("amplitude gives: an impossible stroke is trimmed on time to the ceili
     for (size_t k = 120; k < s.size(); ++k) CHECK(s[k].p == doctest::Approx(s[120].p).epsilon(1e-4));   // the hold is flat
     float share = 0.0f;
     const auto an = drain(e);
-    CHECK(countKind(an, AnomalyKind::WaveformScaled, &share) == 1);
+    CHECK(countKind(an, AnomalyKind::KnotTrimmed, &share) == 1);
     CHECK(share == doctest::Approx(s[120].p).epsilon(1e-3));
     CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
 }
@@ -338,8 +337,7 @@ TEST_CASE("a stroke past the ceilings is trimmed on time and the next knot keeps
     CHECK(s[620].p == doctest::Approx(0.5f).epsilon(1e-4));
     CHECK(std::fabs(s[620].v) <= 1e-3f);
     const auto an = drain(e);
-    CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
-    CHECK(countKind(an, AnomalyKind::WaveformScaled) == 1);
+    CHECK(countKind(an, AnomalyKind::KnotTrimmed) == 1);
     CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
 }
 
@@ -471,7 +469,7 @@ uint64_t fingerprint(const std::vector<State>& s) {
     return h;
 }
 
-struct Score { int knots = 0, hit = 0, missed = 0, off = 0, spent = 0, violations = 0, failed = 0, dropped = 0, junction = 0; int why[6] = {}; };
+struct Score { int knots = 0, hit = 0, missed = 0, off = 0, spent = 0, violations = 0, failed = 0, junction = 0; int why[6] = {}; };
 
 // Random knot sequences: free, authored and hard knots, legal and not, over a
 // random ceilings. Returns the sampled score.
@@ -523,8 +521,7 @@ Score randomRun(uint32_t seed, float smoothness) {
     if (pk.lo < -1e-3f || pk.hi > 1.0f + 1e-3f) { ++sc.violations; ++sc.why[3]; }
     for (const Anomaly& x : drain(e)) an.push_back(x);
     sc.failed = countKind(an, AnomalyKind::PieceOverCeiling);
-    sc.dropped = countKind(an, AnomalyKind::PlanFailed);
-    sc.spent = countKind(an, AnomalyKind::WaveformScaled);
+    sc.spent = countKind(an, AnomalyKind::KnotTrimmed);
     // Every knot is passed at its own time, at its solved (trimmed) position.
     for (size_t i = 0; i < sol.size(); ++i) {
         const Solved& o = sol[i];
@@ -553,18 +550,18 @@ TEST_CASE("property: random knot sequences never exceed a ceiling or the window 
     // Every set at smoothness 0, 0.25, 0.5, 0.75, 1 and a random value per run
     // (kin-rfw7): the smooth path is held to the bars pchip is.
     for (const float set : {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, -1.0f}) {
-        int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, dropped = 0, junction = 0, why[6] = {}, withFail = 0, withoutFail = 0;
+        int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, junction = 0, why[6] = {}, withFail = 0, withoutFail = 0;
         for (uint32_t seed = 1; seed <= 400; ++seed) {
             // The random set draws from its own sequence: the knots stay the seed's.
             const float sm = set >= 0.0f ? set : Rng(seed * 2654435761u).uni(0.0f, 1.0f);
             const Score sc = randomRun(seed, sm);
-            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; dropped += sc.dropped; junction += sc.junction;
+            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; junction += sc.junction;
             for (int w = 0; w < 6; ++w) why[w] += sc.why[w];
             if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
             if (sc.violations && (sc.why[0] || sc.why[1] || sc.why[3] || !sc.failed)) MESSAGE("smoothness " << sm << " seed " << seed << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed);
         }
         CAPTURE(set);
-        MESSAGE("smoothness " << (set >= 0.0f ? std::to_string(set) : std::string("random per run")) << ": " << runs << " runs, " << knots << " knots, " << hits << " hit at their time, " << missed << " feasible missed, " << off << " untrimmed off their position, " << spent << " trimmed, " << failed << " PieceOverCeiling, " << dropped << " PlanFailed, " << violations
+        MESSAGE("smoothness " << (set >= 0.0f ? std::to_string(set) : std::string("random per run")) << ": " << runs << " runs, " << knots << " knots, " << hits << " hit at their time, " << missed << " feasible missed, " << off << " untrimmed off their position, " << spent << " trimmed, " << failed << " PieceOverCeiling, " << violations
                 << " violations (v " << why[0] << ", a " << why[1] << ", j " << why[2] << ", window " << why[3] << ", rest " << why[4] << ", late " << why[5] << "); runs with violations: " << withFail << " reported, " << withoutFail << " silent; " << junction << " solved knots past vmax or amax");
         // Speed, acceleration and the window hold on every run: the angles are
         // bounded by what their spans stop and a trimmed knot's angle by its
@@ -582,7 +579,6 @@ TEST_CASE("property: random knot sequences never exceed a ceiling or the window 
         // Operator ruling owed (kin-y6e).
         CHECK(withoutFail == 0);
         CHECK(violations <= 17);
-        CHECK(dropped == 0);
         CHECK(why[5] == 0);
         CHECK(why[4] == 0);
         // A corner ramp passes a reachable knot: its walk-back settles, or keeps
@@ -881,7 +877,6 @@ namespace {
 struct StreamRun {
     float worst_jump = 0.0f;   // beyond what the velocity carries per tick
     int   refused = 0;
-    int   dropped = 0;
     float worst_lag_ms = 0.0f; // the newest knot's solved time off its authored time, at any submit
     int   worst_lag_at = -1;
     float end_p = 0.0f;
@@ -899,7 +894,6 @@ StreamRun runArbiterScrub(float* out_last = nullptr) {
     auto drainKinds = [&]() {
         Anomaly a;
         while (e.popAnomaly(a)) {
-            if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++r.dropped;
             if (a.kind == uint8_t(AnomalyKind::PieceOverCeiling)) ++r.over;
         }
     };
@@ -935,12 +929,11 @@ StreamRun runArbiterScrub(float* out_last = nullptr) {
 TEST_CASE("a spent 60 Hz stream stays continuous, refuses nothing, drops nothing and tracks") {
     float last = 0.0f;
     const StreamRun r = runArbiterScrub(&last);
-    MESSAGE("jump ", r.worst_jump * 400.0f, " mm, refused ", r.refused, ", dropped ", r.dropped,
+    MESSAGE("jump ", r.worst_jump * 400.0f, " mm, refused ", r.refused,
             ", worst lag ", r.worst_lag_ms, " ms at sample ", r.worst_lag_at, ", end ", r.end_p * 400.0f, " mm vs ", last * 400.0f,
             ", range ", r.pk.lo * 400.0f, "..", r.pk.hi * 400.0f, " mm, peaks v ", r.pk.v, " a ", r.pk.a, " j ", r.pk.j, ", over ", r.over);
     CHECK(r.worst_jump <= 0.0f);
     CHECK(r.refused == 0);
-    CHECK(r.dropped == 0);
     // Samples carry position only (operator ruling 2026-10-08, kin-j6g):
     // a run of samples renders as the fastest legal move to rest on the
     // newest, re-planned as each lands, never a Bezier, never trimmed.
@@ -977,13 +970,11 @@ TEST_CASE("a lone far sample from rest is the fastest legal move to it: late, ne
         worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
         peak = std::max(peak, s[i].p);
     }
-    int dropped = 0, trimmed = 0; Anomaly a;
+    int trimmed = 0; Anomaly a;
     while (e.popAnomaly(a)) {
-        if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++dropped;
-        if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++trimmed;
+        if (a.kind == uint8_t(AnomalyKind::KnotTrimmed)) ++trimmed;
     }
     MESSAGE("lands ", o.stretched_s * 1000.0f, " ms late, peak ", peak * 400.0f, " mm, jump ", worst_jump * 400.0f);
-    CHECK(dropped == 0);
     CHECK(trimmed == 0);
     CHECK(worst_jump <= 0.0f);
     const Peaks pk = peaksOf(s);
@@ -1292,7 +1283,7 @@ TEST_CASE("solve budget: a bundle over the ceilings renders whole, trimmed on ti
     float last = 0.0f;
     const int failed = countKind(an, AnomalyKind::PieceOverCeiling, &last);
     CHECK(failed == 0);
-    CHECK(countKind(an, AnomalyKind::WaveformScaled) > 0);
+    CHECK(countKind(an, AnomalyKind::KnotTrimmed) > 0);
     size_t differ = 0;
     for (size_t i = 0; i < s.size(); ++i) if (std::memcmp(&s[i], &r[i], sizeof(State)) != 0) ++differ;
     CHECK(differ == 0);
@@ -1450,7 +1441,6 @@ TEST_CASE("a live jog redirected mid-move replaces the move in flight and turns 
     const auto an = drain(e);
     CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
     CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
-    CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
 }
 
 // ---- a time-giving knot handed motion over its ceilings (kin-v9z, Nucleus val-hlj) ----
@@ -1591,7 +1581,7 @@ namespace {
 
 struct ScriptRun {
     double v_err_max = 0.0, v_err_first = 0.0, v_peak = 0.0, a_jump = 0.0;   // a_jump: largest acceleration change in 1 ms
-    int dips = 0, refused = 0, stretched = 0, trimmed = 0, failed = 0;
+    int dips = 0, refused = 0, trimmed = 0, failed = 0;
 };
 
 // A 1.3 s sine of 0.3 of the window as Phosphor sends a funscript: a segment
@@ -1640,8 +1630,7 @@ ScriptRun runPchipSine(bool open) {
         v.push_back(st.v);
         Anomaly a;
         while (e.popAnomaly(a)) {
-            if (a.kind == uint8_t(AnomalyKind::DeadlineStretched)) ++r.stretched;
-            if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++r.trimmed;
+            if (a.kind == uint8_t(AnomalyKind::KnotTrimmed)) ++r.trimmed;
             if (a.kind == uint8_t(AnomalyKind::PieceOverCeiling)) ++r.failed;
         }
     }
@@ -1672,7 +1661,6 @@ TEST_CASE("a PCHIP script renders as its author's curve; with no velocities its 
     CHECK(au.v_err_max <= 0.02 * au.v_peak);
     CHECK(au.dips == 0);
     CHECK(au.refused == 0);
-    CHECK(au.stretched == 0);
     CHECK(au.trimmed == 0);
     CHECK(au.failed == 0);
     // No velocities: every inner knot of the sine is a through point or a
@@ -1681,7 +1669,6 @@ TEST_CASE("a PCHIP script renders as its author's curve; with no velocities its 
     const float jmax = 1.0e7f / 84.0f;
     CHECK(g2.a_jump <= jmax * 1e-3f * 1.001f);
     CHECK(g2.refused == 0);
-    CHECK(g2.stretched == 0);
     CHECK(g2.failed == 0);
 }
 
@@ -1746,7 +1733,7 @@ TEST_CASE("truncateAfter keeps the knot at its time: a bundle starting where the
 // handle lengths give first (speed caps them from above, acceleration and jerk
 // from below), then the amplitude (the later knot moves toward the earlier).
 namespace {
-struct SpendRun { int trimmed = 0, stretched = 0, failed = 0; float stretch_s = 0.0f, v_peak = 0.0f, a_peak = 0.0f, j_peak = 0.0f; std::vector<float> p, v; };
+struct SpendRun { int trimmed = 0, failed = 0; float v_peak = 0.0f, a_peak = 0.0f, j_peak = 0.0f; std::vector<float> p, v; };
 struct Span { uint64_t start_ms, dur_ms; float p; };
 // Streams the spans as the player sends them, each 110 ms before its start, and samples every ms.
 template <size_t N>
@@ -1768,8 +1755,7 @@ SpendRun runSpans(const Config& cfg, float p0, const Span (&spans)[N], uint64_t 
         a_prev = st.a;
         Anomaly a;
         while (e.popAnomaly(a)) {
-            if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++r.trimmed;
-            if (a.kind == uint8_t(AnomalyKind::DeadlineStretched)) { ++r.stretched; r.stretch_s = std::fmax(r.stretch_s, a.detail); }
+            if (a.kind == uint8_t(AnomalyKind::KnotTrimmed)) ++r.trimmed;
             if (a.kind == uint8_t(AnomalyKind::PieceOverCeiling)) ++r.failed;
         }
     }
@@ -1790,7 +1776,6 @@ TEST_CASE("a speed-bound authored fall renders on time inside the ceilings: the 
     MESSAGE("peak v " << r.v_peak << " of " << cfg.limits.vmax << ", a " << r.a_peak << " of " << cfg.limits.amax << ", bottom "
             << r.p[500] << " at 500 ms and " << r.p[1250] << " at 1250 ms, trimmed " << r.trimmed << ", failed " << r.failed);
     CHECK(r.failed == 0);
-    CHECK(r.stretched == 0);
     CHECK(r.trimmed >= 1);
     CHECK(r.v_peak <= cfg.limits.vmax * 1.001f);
     CHECK(r.a_peak <= cfg.limits.amax * 1.001f);
@@ -1826,7 +1811,6 @@ TEST_CASE("an acceleration-bound authored span renders on time inside the ceilin
             << ", trimmed " << r.trimmed << ", failed " << r.failed);
     CHECK(r.trimmed >= 1);
     CHECK(r.failed == 0);
-    CHECK(r.stretched == 0);
     CHECK(r.v_peak <= cfg.limits.vmax * 1.001f);
     CHECK(r.a_peak <= cfg.limits.amax * 1.001f);
     CHECK(r.j_peak <= cfg.limits.jmax * 1.001f);
@@ -1855,7 +1839,7 @@ TEST_CASE("a sawtooth rise from rest over the speed ceiling renders on time with
     struct K { uint64_t start_ms, dur_ms; float p, v; };
     const K ks[] = {{0, 100, 0.4308f, 2.0f}, {100, 100, 0.6615f, 1.538f}, {200, 100, 0.7769f, 0.0f}, {300, 100, 0.7192f, -0.577f},
                     {400, 100, 0.6615f, -0.577f}, {500, 100, 0.6038f, -0.577f}, {600, 100, 0.5462f, -0.577f}, {700, 100, 0.4885f, -0.577f}};
-    size_t next = 0; int trimmed = 0, failed = 0, stretched = 0; float stretch_s = 0.0f, v_peak = 0.0f, p_peak = 0.0f; size_t at_peak = 0;
+    size_t next = 0; int trimmed = 0, failed = 0; float v_peak = 0.0f, p_peak = 0.0f; size_t at_peak = 0;
     std::vector<float> v;
     float p300 = 0.0f, p800 = 0.0f;
     for (uint64_t now = 0; now <= 900 * kMs; now += kMs) {
@@ -1871,18 +1855,15 @@ TEST_CASE("a sawtooth rise from rest over the speed ceiling renders on time with
         if (now == 800 * kMs) p800 = st.p;
         Anomaly a;
         while (e.popAnomaly(a)) {
-            if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++trimmed;
-            if (a.kind == uint8_t(AnomalyKind::DeadlineStretched)) { ++stretched; stretch_s = std::fmax(stretch_s, a.detail); }
+            if (a.kind == uint8_t(AnomalyKind::KnotTrimmed)) ++trimmed;
             if (a.kind == uint8_t(AnomalyKind::PieceOverCeiling)) ++failed;
         }
     }
     // The rise never reverses: no sample on it moves down.
     int reversals = 0;
     for (size_t i = 5; i < 300 && i < v.size(); ++i) if (v[i] < -0.05f) ++reversals;
-    MESSAGE("peak v " << v_peak << " of " << cfg.limits.vmax << ", peak p " << p_peak << " at " << at_peak << " ms, stretched " << stretched
-            << " (max " << stretch_s * 1e3f << " ms), trimmed " << trimmed << ", failed " << failed << ", reversals " << reversals << ", top " << p300 << " at 300 ms");
+    MESSAGE("peak v " << v_peak << " of " << cfg.limits.vmax << ", peak p " << p_peak << " at " << at_peak << " ms, trimmed " << trimmed << ", failed " << failed << ", reversals " << reversals << ", top " << p300 << " at 300 ms");
     CHECK(failed == 0);
-    CHECK(stretched == 0);
     CHECK(reversals == 0);
     CHECK(v_peak <= cfg.limits.vmax * 1.001f);
     CHECK(trimmed >= 1);                          // the trim is reported

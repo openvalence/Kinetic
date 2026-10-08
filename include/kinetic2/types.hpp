@@ -105,29 +105,22 @@ struct Config {
 };
 
 // ---- Anomaly ----------------------------------------------------------------
-// One event per axis spent, so the counts read as a diagnosis. Every number is
-// pinned; a kind marked never emitted stays reserved, new kinds append at 13+.
+// One event per axis spent, so the counts read as a diagnosis. Index-aligned
+// with Valence's motion-anomaly event kinds (RFC-108); new kinds append.
 enum class AnomalyKind : uint8_t {
-    None              = 0,
-    PlanFailed        = 1,   // the knot was dropped. Never emitted by Kinetic² (no knot is dropped); consumers read it as a drop
-    SettleEngaged     = 2,   // the timeline ran dry mid-motion: braked to rest. detail = v at engagement
-    EndVelClamped     = 3,   // an authored end velocity exceeded vmax or the wall bound. detail = the clamped v
-    DeadlineStretched = 4,   // a knot placed late. Never emitted by Kinetic² (time never gives)
-    WaveformFallback  = 5,   // reserved; never emitted
-    WaveformScaled    = 6,   // a knot trimmed toward its predecessor. detail = the share of its chord kept
-    WaveformCentered  = 7,   // reserved; never emitted
-    HandoffBounded    = 8,   // reserved; the solver owns junction velocities, so nothing to bound
-    WaveformSmoothed  = 9,   // reserved; never emitted
-    DwellZeroed       = 10,  // the same target re-commanded (a hold): its end velocity dropped
-    KnotRefused       = 11,  // a knot not accepted onto the timeline. detail: a sentinel below
-    PieceOverCeiling  = 12,  // a piece no trim makes legal renders at its least-over trim. detail = its worst ceiling ratio
+    None             = 0,
+    SettleEngaged    = 1,   // the timeline ran dry mid-motion: braked to rest. detail = v at engagement
+    EndVelClamped    = 2,   // an authored end velocity exceeded vmax or the wall bound. detail = the clamped v
+    KnotTrimmed      = 3,   // a knot trimmed toward its predecessor. detail = the share of its chord kept
+    DwellZeroed      = 4,   // the same target re-commanded (a hold): its end velocity dropped
+    KnotRefused      = 5,   // a knot not accepted onto the timeline. detail: a sentinel below
+    PieceOverCeiling = 6,   // a piece no trim makes legal renders at its least-over trim. detail = its worst ceiling ratio
 };
 
 // KnotRefused detail sentinels.
-inline constexpr float kDetailNonFinite   = -99.0f;
-inline constexpr float kDetailPast        = -95.0f;   // t_us at or before the newest knot
+inline constexpr float kDetailNonFinite    = -99.0f;
+inline constexpr float kDetailPast         = -95.0f;   // t_us at or before the newest knot
 inline constexpr float kDetailTimelineFull = -96.0f;
-inline constexpr float kDetailBudget       = -97.0f;   // reserved; never emitted by Kinetic²
 
 struct Anomaly {
     uint8_t  kind   = 0;      // AnomalyKind

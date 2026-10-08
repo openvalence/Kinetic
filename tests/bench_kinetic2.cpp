@@ -30,7 +30,7 @@ struct Rng {
 
 struct Tally {
     const char* name;
-    int plans = 0, refused = 0, dropped = 0, over = 0, trimmed = 0;
+    int plans = 0, refused = 0, over = 0, trimmed = 0;
     float share_sum = 0.0f;   // trim shares, summed
     int refused_full = 0, refused_past = 0;
     float lag_max_ms = -1.0f, lag_end_ms = 0.0f;   // streams: the newest knot's solved time behind its authored time
@@ -72,10 +72,9 @@ State idle(Engine<1, 64>& e, Tally& t, uint64_t now) {
 void drainInto(Engine<1, 64>& e, Tally& t) {
     Anomaly a;
     while (e.popAnomaly(a)) {
-        if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++t.dropped;
         if (a.kind == uint8_t(AnomalyKind::KnotRefused)) { ++t.refused; if (a.detail == kDetailTimelineFull) ++t.refused_full; if (a.detail == kDetailPast) ++t.refused_past; }
         if (a.kind == uint8_t(AnomalyKind::PieceOverCeiling)) ++t.over;
-        if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) { ++t.trimmed; t.share_sum += a.detail; }
+        if (a.kind == uint8_t(AnomalyKind::KnotTrimmed)) { ++t.trimmed; t.share_sum += a.detail; }
     }
 }
 
@@ -275,10 +274,10 @@ Tally fullWindow(uint32_t budget) {
 void print(const Tally& t) {
     const double n = t.plans ? double(t.plans) : 1.0;
     std::printf("%-17s plans %4d | renders/plan max %4llu mean %5.1f | knots max %3llu | host us max %8.1f mean %7.1f"
-                " | idle renders max %llu | refused %d (full %d, past %d) dropped %d over %d trimmed %d (mean share %.3f) | peak v %.3f a %.3f j %.3f\n",
+                " | idle renders max %llu | refused %d (full %d, past %d) over %d trimmed %d (mean share %.3f) | peak v %.3f a %.3f j %.3f\n",
                 t.name, t.plans, (unsigned long long)t.max_judges, double(t.judges) / n, (unsigned long long)t.max_knots,
                 t.max_wall_us, t.wall_us / n, (unsigned long long)t.idle_max_judges, t.refused, t.refused_full, t.refused_past,
-                t.dropped, t.over, t.trimmed, t.trimmed ? t.share_sum / float(t.trimmed) : 0.0f, t.worst_v, t.worst_a, t.worst_j);
+                t.over, t.trimmed, t.trimmed ? t.share_sum / float(t.trimmed) : 0.0f, t.worst_v, t.worst_a, t.worst_j);
     if (t.lag_max_ms >= 0.0f) std::printf("%-17s lag: max %.1f ms, at the end %.1f ms\n", "", t.lag_max_ms, t.lag_end_ms);
     if (t.dev_max_mm >= 0.0f) std::printf("%-17s vs PCHIP: max %.2f mm, mean %.3f mm, %.1f%% of ticks within 1 mm\n", "", t.dev_max_mm, t.dev_mean_mm, 100.0f * t.within1);
 }

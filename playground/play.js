@@ -20,7 +20,7 @@ const SPEND = 'rgba(77,166,255,0.55)';   // the reality blue, dimmed so spend ma
 
 const DEF = { vmax: 3, amax: 30, jmax: 2000, smooth: 0, floor: 0.15, trim: 1, react: 4 };
 const SPANS = [1, 2, 5, 10];
-const KIND = { 1: 'PlanFailed', 2: 'SettleEngaged', 3: 'EndVelClamped', 4: 'DeadlineStretched', 6: 'WaveformScaled', 10: 'DwellZeroed', 11: 'KnotRefused', 12: 'PieceOverCeiling' };
+const KIND = { 1: 'SettleEngaged', 2: 'EndVelClamped', 3: 'KnotTrimmed', 4: 'DwellZeroed', 5: 'KnotRefused', 6: 'PieceOverCeiling' };
 const SENTINEL = { '-99': 'kDetailNonFinite: a non-finite value', '-95': 'kDetailPast: at or before now or the newest knot', '-96': 'kDetailTimelineFull: all 64 knot slots are pending' };
 
 // ---- state -----------------------------------------------------------------
@@ -74,9 +74,8 @@ function cstr(ptr) {
 }
 
 // ---- replay ------------------------------------------------------------------
-// A drop is read from PlanFailed only (its target is the knot's authored p),
-// retirements from the front. Kinetic² never drops a knot; PieceOverCeiling
-// is a knot that renders and is never read as a drop.
+// Retirements from the front. PieceOverCeiling is a knot that renders,
+// never a drop.
 function replay() {
   const o = S.o;
   const cfgOk = K.kinetic2_configure(h, o.vmax, o.amax, o.jmax, o.smooth, o.floor, o.trim, Math.round(o.react * 1000));
@@ -87,17 +86,13 @@ function replay() {
   const n = Math.round(S.T * 1000) + 1;
   const P = new Float32Array(n), V = new Float32Array(n), A = new Float32Array(n), J = new Float32Array(n);
   const stepP = new Uint8Array(n), stepV = new Uint8Array(n);
-  const solved = new Map(), refused = new Set(), dropped = new Set(), live = [], anomalies = [], submits = [];
+  const solved = new Map(), refused = new Set(), live = [], anomalies = [], submits = [];
   let e = 0;
   const drain = () => {
     while (K.kinetic2_pop_anomaly(h, aBuf)) {
       const a = { t: dv.getFloat64(aBuf, true) / 1e6, target: dv.getFloat32(aBuf + 8, true),
         detail: dv.getFloat32(aBuf + 12, true), seq: dv.getUint16(aBuf + 16, true), kind: dv.getUint8(aBuf + 18) };
       anomalies.push(a);
-      if (a.kind === 1) {
-        const i = live.findIndex((k) => Math.fround(k.p) === a.target);
-        if (i >= 0) { dropped.add(live[i]); live.splice(i, 1); }
-      }
     }
   };
   const snap = () => {
@@ -151,7 +146,7 @@ function replay() {
     if (stepP[i] || stepV[i]) { steps++; if (firstStep == null) firstStep = i / 1000; }
   }
   replays++;
-  return { n, P, V, A, J, stepP, stepV, solved, refused, dropped, anomalies, submits, cfgOk,
+  return { n, P, V, A, J, stepP, stepV, solved, refused, anomalies, submits, cfgOk,
     max: { v: mv, a: ma, j: mj }, pmin, pmax, over, steps, firstStep };
 }
 
@@ -305,7 +300,7 @@ function knots(g, pn) {
     if (k.t > S.T + 1e-9) continue;
     const x = L.tx(k.t), y = pn.y(k.p), shape = k.jog ? 'diamond' : 'circle';
     const s = R.solved.get(k);
-    if (R.refused.has(k) || R.dropped.has(k) || (s && s.dropped)) {
+    if (R.refused.has(k) || (s && s.dropped)) {
       mark(g, shape, x, y, 6, null, C.hi);
       g.strokeStyle = C.hi; g.lineWidth = 1.5;
       g.beginPath(); g.moveTo(x - 3.5, y - 3.5); g.lineTo(x + 3.5, y + 3.5); g.moveTo(x + 3.5, y - 3.5); g.lineTo(x - 3.5, y + 3.5); g.stroke();
@@ -680,7 +675,6 @@ function inspector() {
     : 'Authored velocity: the knot passes at it.';
   const s = R.solved.get(k), dl = $('#i-solved');
   if (R.refused.has(k)) { dl.innerHTML = '<dt>status</dt><dd class="bad">refused (see anomalies)</dd>'; return; }
-  if (R.dropped.has(k)) { dl.innerHTML = '<dt>status</dt><dd class="bad">dropped: PlanFailed (see anomalies)</dd>'; return; }
   if (!s) { dl.innerHTML = '<dt>status</dt><dd>not submitted in this span</dd>'; return; }
   const row = (a, b, bad) => `<dt>${a}</dt><dd${bad ? ' class="bad"' : ''}>${b}</dd>`;
   dl.innerHTML = row('t', (s.t).toFixed(4) + ' s') + row('p', s.p.toFixed(4)) + row('v', s.v.toFixed(3) + ' u/s') + row('a', s.a.toFixed(2) + ' u/s²')
@@ -693,14 +687,12 @@ function meaning(a) {
   const d = a.detail;
   const sentinel = SENTINEL[String(Math.round(d))];
   switch (a.kind) {
-    case 1: return 'knot dropped' + (sentinel ? ': ' + sentinel : '');
-    case 2: return `braked at ${Math.abs(d).toFixed(2)} u/s: the timeline ran dry`;
-    case 3: return `end velocity cut to ${d.toFixed(2)} u/s`;
-    case 4: return `deadline moved ${(d * 1000).toFixed(0)} ms later`;
-    case 6: return `the trim kept ${(d * 100).toFixed(0)}% of the stroke`;
-    case 10: return 'same target re-commanded: a hold, its end velocity dropped';
-    case 11: return 'knot refused: ' + (sentinel || 'detail ' + d);
-    case 12: return 'no trim keeps this span inside a limit: it renders at its least-over trim, worst ceiling ratio '
+    case 1: return `braked at ${Math.abs(d).toFixed(2)} u/s: the timeline ran dry`;
+    case 2: return `end velocity cut to ${d.toFixed(2)} u/s`;
+    case 3: return `the trim kept ${(d * 100).toFixed(0)}% of the stroke`;
+    case 4: return 'same target re-commanded: a hold, its end velocity dropped';
+    case 5: return 'knot refused: ' + (sentinel || 'detail ' + d);
+    case 6: return 'no trim keeps this span inside a limit: it renders at its least-over trim, worst ceiling ratio '
       + (d >= 1e29 ? 'kIllegal' : d.toFixed(2));
     default: return 'detail ' + d;
   }
@@ -729,8 +721,8 @@ function render() {
   anomalies();
   window.__k2 = {
     replays, samples: R.n, max: { ...R.max }, ceil: { v: S.o.vmax, a: S.o.amax, j: S.o.jmax }, over: R.over,
-    p: { min: R.pmin, max: R.pmax }, steps: R.steps, firstStep: R.firstStep, dropped: R.dropped.size, refused: R.refused.size, anomalies: R.anomalies.map((a) => ({ ...a, name: KIND[a.kind] })),
-    knots: S.knots.map((k) => ({ ...k, solved: R.solved.get(k) || null, refused: R.refused.has(k), dropped: R.dropped.has(k) })),
+    p: { min: R.pmin, max: R.pmax }, steps: R.steps, firstStep: R.firstStep, refused: R.refused.size, anomalies: R.anomalies.map((a) => ({ ...a, name: KIND[a.kind] })),
+    knots: S.knots.map((k) => ({ ...k, solved: R.solved.get(k) || null, refused: R.refused.has(k) })),
     start: S.p0, mode: S.mode, T: S.T, layout: L && { x0: L.x0, x1: L.x1, y0: L.panels[0].y0, y1: L.panels[0].y1, lo: L.panels[0].lo, hi: L.panels[0].hi },
   };
 }
