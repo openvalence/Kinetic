@@ -8,6 +8,10 @@
 //   When the entry acceleration already overshoots the stop (v would cross 0
 //   before a can ramp to 0), a first phase ramps a to 0 and the stop is
 //   planned again from there, the one case that needs the fourth phase.
+// - brake() and point() start from an acceleration inside amax (startOf()):
+//   an entry past it (a piece over a ceiling, a ceiling lowered under the
+//   motion) starts at amax. Unwound at jmax instead, it gained a^2/2J of
+//   speed: 38 window units/s from 3892 at the factory set (kin-554).
 // - Jerk never exceeds jmax by construction; |a| peaks at a phase boundary;
 //   |v| and p peak at a boundary or where a or v cross 0 inside a phase. The
 //   referee here checks exactly those points.
@@ -57,9 +61,16 @@ struct Profile {
     }
     State end() const { return atSeconds(duration() + 1.0f); }
 
+    // s with its acceleration held to amax: where every profile starts.
+    static State startOf(State s, const Limits& L) {
+        if (std::fabs(s.a) > L.amax) s.a = std::copysign(L.amax, s.a);
+        return s;
+    }
+
     // The fastest legal stop from s under L. A state already at rest gives an
     // empty profile.
-    static Profile brake(const State& s, uint64_t start_us, const Limits& L) {
+    static Profile brake(const State& entry, uint64_t start_us, const Limits& L) {
+        const State s = startOf(entry, L);
         Profile pr; pr.start_us = start_us; pr.s0 = s;
         const float J = L.jmax, A = L.amax;
         if (std::fabs(s.v) < 1e-9f && std::fabs(s.a) < 1e-9f) return pr;
@@ -68,24 +79,6 @@ struct Profile {
         // Decel-positive frame: u = -sgn v (<= 0, rising to 0), b = -sgn a.
         const float speed = std::fabs(s.v);
         const float b0 = -sgn * s.a;
-        // Decelerating past the ceiling already (a brake under a lower amax
-        // than the motion it interrupts): ramp the deceleration down to amax
-        // under jmax, hold it, ramp out. Holding the entry deceleration for
-        // the hold the ceiling sizes ran a 200 mm/s jog through rest and 258
-        // mm the other way (Nucleus val-9z5). Too slow to ramp out before
-        // rest, it falls to the overshoot branch below.
-        if (b0 > A) {
-            const float t1 = (b0 - A) / J;
-            const float du1 = b0 * t1 - 0.5f * J * t1 * t1;
-            const float t2 = (speed - du1 - A * A / (2.0f * J)) / A;
-            if (t2 >= 0.0f) {
-                pr.n = 3;
-                pr.dt[0] = t1;    pr.jerk[0] = sgn * J;
-                pr.dt[1] = t2;    pr.jerk[1] = 0.0f;
-                pr.dt[2] = A / J; pr.jerk[2] = sgn * J;
-                return pr;
-            }
-        }
         // Trapezoid at the ceiling?
         float t1 = (A - b0) / J;
         if (t1 < 0.0f) t1 = 0.0f;
@@ -142,8 +135,9 @@ struct Profile {
     //   and when no cruise takes that long it lands early and rests there.
     // At most 12 phases: a 4-phase brake, a hold, a 3-phase launch from rest,
     // the cruise and a 3-phase stop. A full profile returns n = -1.
-    static Profile point(const State& s, float target, uint64_t start_us, const Limits& L, float at_least = 0.0f,
+    static Profile point(const State& entry, float target, uint64_t start_us, const Limits& L, float at_least = 0.0f,
                          float* fastest = nullptr) {
+        const State s = startOf(entry, L);
         Profile pr; pr.start_us = start_us; pr.s0 = s;
         float need = 0.0f;
         if (L.vmax > 0.0f && L.amax > 0.0f && L.jmax > 0.0f) {

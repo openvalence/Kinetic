@@ -62,8 +62,11 @@ public:
         if (a.explicit_brake && k.t_us <= a.origin_us) return refuse(k, now_us, kDetailPast);
         // An explicit brake in flight is kept whole: the knot chains from its
         // end. Dropped with the piece, the plan stepped to the brake's end (a
-        // jog or a return submitted during a pause brake, kin-v9z).
-        if (a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) {
+        // jog or a return submitted during a pause brake, kin-v9z). A curve
+        // committed through its knot is never a brake, whatever tail it ends
+        // in: re-planned, its knot was dropped (a reversal passed moving,
+        // kin-554).
+        if (a.tl.empty() && !a.has_committed && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) {
             if (a.explicit_brake) { a.committed = a.piece; a.has_committed = true; }
             else replanFromBrake(a, now_us);
         }
@@ -501,8 +504,11 @@ private:
             // Never a chased sample: committed through, the stream would come
             // to its rest at every sample instead of re-planning toward the newest.
             const bool chased = a.tl.at(0).sample && !a.tl.at(0).has_v;
-            const bool fixed = !chased && (a.tl.at(0).has_v || a.tl.size() > 1) && k0.base_us <= tr + span / 2;
-            if (k0.t_us <= tr + 1000 || k0.base_us <= tr + 1000 || fixed) {
+            // A HARD knot (a live jog, a chase run) is reached at its solved
+            // time, never its authored one: committed through on that, a jog's
+            // whole move stood and the next jog waited it out (kin-g1f).
+            const bool fixed = !chased && !k0.hard && (a.tl.at(0).has_v || a.tl.size() > 1) && k0.base_us <= tr + span / 2;
+            if (k0.t_us <= tr + 1000 || (!k0.hard && k0.base_us <= tr + 1000) || fixed) {
                 // Commit through the knot: its piece is kept whole.
                 a.committed = a.piece;
                 boundary(a, State{k0.p, k0.v, k0.a}, k0.t_us);

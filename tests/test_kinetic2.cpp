@@ -159,13 +159,15 @@ TEST_CASE("a brake under a lower amax than the deceleration in flight never reve
     const Limits L{1000.0f / rail, 20.0f / rail, 5.0e6f / rail};
     const State s0{0.5f, 0.75f, -0.75f};
     const Profile pr = Profile::brake(s0, 0, L);
+    // The deceleration past amax is held to it where the brake starts (kin-554).
+    CHECK(pr.s0.a == -L.amax);
     for (int i = 0; i < pr.n; ++i) CHECK(pr.dt[i] >= 0.0f);
     float min_v = s0.v;
     for (float t = 0.0f; t <= pr.duration(); t += 1e-4f) min_v = std::fmin(min_v, pr.atSeconds(t).v);
     CHECK(min_v >= -1e-6f);
     // The end by the phases in closed form: a ten second brake read through
     // atSeconds() resolves its 4 us ramp-out only to float time at 10 s.
-    State end = s0;
+    State end = pr.s0;
     for (int i = 0; i < pr.n; ++i) end = Profile::step(end, pr.jerk[i], pr.dt[i]);
     CHECK(end.v == doctest::Approx(0.0f).epsilon(1e-3).scale(1.0));
     CHECK(end.a == doctest::Approx(0.0f).epsilon(1e-3).scale(1.0));
@@ -472,7 +474,7 @@ uint64_t fingerprint(const std::vector<State>& s) {
     return h;
 }
 
-struct Score { int knots = 0, hit = 0, missed = 0, off = 0, spent = 0, violations = 0, failed = 0, dropped = 0; int why[6] = {}; };
+struct Score { int knots = 0, hit = 0, missed = 0, off = 0, spent = 0, violations = 0, failed = 0, dropped = 0, junction = 0; int why[6] = {}; };
 
 // Random knot sequences: free, authored and hard knots, legal and not, over a
 // random policy and ceilings. Returns the sampled score.
@@ -504,6 +506,8 @@ Score randomRun(uint32_t seed, Policy policy) {
     for (size_t i = 0; i < ks.size(); ++i) {
         sol.push_back(e.solved(0, i));
         if (!sol.back().hard && !onTime(sol.back())) { ++sc.violations; ++sc.why[5]; }
+        // The state the next piece and a starvation brake start from (kin-554).
+        if (std::fabs(sol.back().v) > cfg.limits.vmax * (1.0f + handles::kTol) || std::fabs(sol.back().a) > cfg.limits.amax * (1.0f + handles::kTol)) ++sc.junction;
     }
     // Drained before sampling too: the ring keeps 16 and a solve reports at once.
     auto an = drain(e);
@@ -549,11 +553,11 @@ Score randomRun(uint32_t seed, Policy policy) {
 }  // namespace
 
 TEST_CASE("property: random knot sequences never exceed a ceiling or the window and are never late, under either policy") {
-    int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, dropped = 0, why[6] = {}, withFail = 0, withoutFail = 0;
+    int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, dropped = 0, junction = 0, why[6] = {}, withFail = 0, withoutFail = 0;
     for (uint32_t seed = 1; seed <= 400; ++seed) {
         for (const Policy pol : {Policy::Blend, Policy::Stretch}) {
             const Score sc = randomRun(seed, pol);
-            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; dropped += sc.dropped;
+            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; dropped += sc.dropped; junction += sc.junction;
             for (int w = 0; w < 6; ++w) why[w] += sc.why[w];
             if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
             if (sc.violations && (withFail + withoutFail) <= 6) MESSAGE("seed " << seed << " policy " << int(pol) << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed);
@@ -567,6 +571,10 @@ TEST_CASE("property: random knot sequences never exceed a ceiling or the window 
     CHECK(why[0] == 0);
     CHECK(why[1] == 0);
     CHECK(why[3] == 0);
+    // No knot hands the next piece or a brake a state past vmax or amax, even
+    // after a piece over a ceiling (kin-554).
+    MESSAGE(junction << " solved knots past vmax or amax");
+    CHECK(junction == 0);
     // Constraint: a G1 knot whose corner ramp has no room in its spans keeps
     // an acceleration step (a 1 ms jerk spike) and is reported
     // PieceOverCeiling: 34 of 800 runs as of 2026-10-08. Acceptance (c) bars
@@ -1433,11 +1441,19 @@ TEST_CASE("a live jog handed motion its ceilings cannot stop renders as its prof
     CHECK(o.hard);
     const State h = o.ramp.s0;   // the hand-off: the reaction horizon on the chase
     REQUIRE(std::fabs(h.v) > kSlowJog.vmax);
+    // The profile starts from the chase's acceleration held to the jog's amax:
+    // unwound at jmax from the chase's, it gained a^2/2J of speed (kin-554).
+    CHECK(std::fabs(h.a) <= kSlowJog.amax);
     const float stop = Profile::brake(h, 0, kSlowJog).end().p;
     REQUIRE(stop > 1.0f);
     const uint64_t end = o.t_us + 100 * kMs;
     const auto s = sweep(e, now, end);
-    const Peaks pk = peaksOf(s), b = reachOf(h, kSlowJog);
+    // The chase in flight keeps its own acceleration up to the hand-off.
+    const size_t at = size_t((o.ramp.start_us - now) / kMs);
+    REQUIRE(at >= 1);
+    const Peaks pk = peaksOf(s);
+    Peaks b = reachOf(h, kSlowJog);
+    b.a = std::max(std::fabs(s[at - 1].a), kSlowJog.amax) * 1.001f;
     MESSAGE("hand-off v ", h.v, " a ", h.a, ", stop at ", stop, "; peaks v ", pk.v, " a ", pk.a, " p ", pk.lo, "..", pk.hi);
     // The fastest stop the jog's ceilings allow, then the jog: nothing faster
     // than the hand-off can reach, nothing past that stop.
@@ -1825,4 +1841,174 @@ TEST_CASE("a sawtooth rise from rest over the speed ceiling renders on time with
     CHECK(p_peak <= 0.7192f + 3e-3f);   // its authored angle falls: the crest lies just before it
     // The fall's knots are reachable from the trimmed top: they never move.
     CHECK(std::fabs(p800 - 0.4885f) <= 1e-3f);
+}
+
+// ---- a bundle start microseconds off the newest knot (kin-554) -----------------
+// Nucleus resolves each bundle's start from the sender's stamp, so a span that
+// tiles the previous one in the sender's clock lands a few microseconds early
+// or late on the hub's. The factory set on a 100 mm window: 1200 mm/s, 1e5
+// mm/s^2, 2e7 mm/s^3.
+namespace {
+const Limits kFactory{12.0f, 1000.0f, 2.0e5f};
+
+// The reversals of the operator's ADSR play on the hub (2026-10-08): every end
+// velocity 0, each span sent 125 ms before its start, flushing from there as
+// Nucleus does, its start skewed by skew_us from the newest knot. Returns the
+// sampled positions from rest at 0.05.
+std::vector<float> reversals(int64_t skew_us, Family fam) {
+    Config cfg; cfg.limits = kFactory;
+    Engine<> e(cfg, 0.05f);
+    const float ps[] = {0.95f, 0.05f, 0.95f, 0.05f, 0.95f, 0.05f, 0.95f, 0.05f};
+    const uint64_t durs[] = {300, 633, 300, 634, 300, 300, 600, 633};
+    std::vector<float> p;
+    uint64_t newest = 100 * kMs, start = newest;
+    size_t next = 0;
+    for (uint64_t now = 0; now <= 4500 * kMs; now += kMs) {
+        while (next < 8 && start <= now + 125 * kMs) {
+            if (next) {
+                start = uint64_t(int64_t(newest) + skew_us);
+                (void)e.truncateAfter(start, now);
+            }
+            const Knot k = knotFromSegment(ps[next], uint32_t(durs[next] * kMs), true, 0.0f, start, fam);
+            REQUIRE(e.submit(k, now));
+            newest = k.t_us;
+            start = newest;
+            ++next;
+        }
+        p.push_back(e.stateAt(0, now).p);
+    }
+    return p;
+}
+}  // namespace
+
+TEST_CASE("a flush microseconds before the newest knot keeps it: a committed reversal is never re-planned as a brake (kin-554)") {
+    // Early by 3 us, truncateAfter committed the reversal it could not drop and
+    // returned 0; the submit after it read the committed corner ramp as a
+    // starvation brake and re-planned from the horizon, dropping the reversal:
+    // the curve ran past 0.95 to 1.29 on the hub.
+    for (const Family fam : {Family::Unspecified, Family::C1}) {
+        for (const int64_t skew : {int64_t(-3), int64_t(-30), int64_t(-900), int64_t(0), int64_t(3)}) {
+            const std::vector<float> p = reversals(skew, fam);
+            float lo = 1.0f, hi = 0.0f;
+            for (float x : p) { lo = std::fmin(lo, x); hi = std::fmax(hi, x); }
+            CAPTURE(int(fam)); CAPTURE(skew);
+            CHECK(hi <= 0.95f + 1e-3f);
+            CHECK(lo >= 0.05f - 1e-3f);
+        }
+    }
+}
+
+TEST_CASE("a hold microseconds after a moving knot: its junction stays inside the ceilings and nothing winds up (kin-554)") {
+    // A late bundle start becomes a hold (Nucleus's rule for a gap). After a
+    // knot authored moving, the hold is a 1 ms piece to rest at the same place,
+    // over amax by construction; its end acceleration (3892 window units/s^2 on
+    // the rig) handed to the next piece wound up a^2/2J = 38 w/s in its lead
+    // ramp and ran the plan to 2.96 windows.
+    // As Nucleus's arbiter rig met it: the hold and its successor arrive in
+    // the later half of the piece into the moving knot, committed through then.
+    Config cfg; cfg.limits = kFactory;
+    Engine<> e(cfg, 0.2f);
+    REQUIRE(e.submit(knotAt(150 * kMs, 0.55f, true, 1.946f, Family::C1), 0));
+    std::vector<State> s = sweep(e, 0, 80 * kMs);
+    REQUIRE(e.submit(knotAt(150 * kMs + 3, 0.55f, true, 0.0f, Family::C2), 80 * kMs));
+    REQUIRE(e.submit(knotAt(418 * kMs + 3, 0.9f, true, 0.0f, Family::C1), 80 * kMs));
+    for (size_t i = 0; i < 2; ++i) {
+        const Solved& o = e.solved(0, i);
+        CAPTURE(i);
+        CHECK(std::fabs(o.v) <= kFactory.vmax * (1.0f + handles::kTol));
+        CHECK(std::fabs(o.a) <= kFactory.amax * (1.0f + handles::kTol));
+    }
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::PieceOverCeiling) >= 1);   // the hold is reported
+    for (const State& x : sweep(e, 81 * kMs, 700 * kMs)) s.push_back(x);
+    const Peaks pk = peaksOf(s);
+    MESSAGE("peak p " << pk.hi << ", peak v " << pk.v);
+    CHECK(pk.hi <= 0.9f + 2e-3f);
+    CHECK(pk.lo >= 0.2f - 1e-3f);
+    // Speed past the ceiling is the 1 ms hold alone, never a windup after it.
+    CHECK(pk.v <= kFactory.vmax);
+}
+
+TEST_CASE("a starvation brake and a HARD move start from an acceleration inside amax (kin-554)") {
+    // The state at a knot past amax (a piece no trim makes legal) is never
+    // what a stop unwinds: a jerk-limited ramp from a gains a^2/2J of speed.
+    const State over{0.5f, 0.0f, 3892.0f};
+    const Profile br = Profile::brake(over, 0, kFactory);
+    float vpk = 0.0f;
+    for (float t = 0.0f; t <= br.duration(); t += 1e-4f) vpk = std::fmax(vpk, std::fabs(br.atSeconds(t).v));
+    MESSAGE("brake from a = 3892: peak v " << vpk << ", runs " << br.end().p - over.p);
+    CHECK(vpk <= kFactory.amax * kFactory.amax / (2.0f * kFactory.jmax) * 1.01f);
+    const Profile pt = Profile::point(over, 0.6f, 0, kFactory);
+    REQUIRE(pt.n > 0);
+    CHECK(std::fabs(pt.atSeconds(pt.duration()).p - 0.6f) <= 1e-4f);
+    CHECK(pt.worstRatio(kFactory, -1e30f, 1e30f) <= 1.001f);
+}
+
+TEST_CASE("property: segment streams whose starts miss the newest knot by microseconds stay inside the authored envelope (kin-554)") {
+    // The stream as Nucleus feeds it: each span 125 ms before its start, a
+    // flush from its start, and a gap before it held at the newest knot. The
+    // skews are the jitter between two bundles' clock reads (microseconds) and
+    // a sender's clock correction (a millisecond or more).
+    const int64_t skews[] = {-1500, -900, -30, -3, 0, 0, 0, 3, 30, 1500, 3000};
+    int runs = 0, junction = 0, outside = 0;
+    float worst = 0.0f;
+    for (uint32_t seed = 1; seed <= 200; ++seed) {
+        Rng r(seed);
+        Config cfg; cfg.limits = kFactory;
+        Engine<> e(cfg, 0.5f);
+        std::vector<Knot> ks;
+        uint64_t t = 100 * kMs;
+        float prev = 0.5f;
+        for (int i = 0; i < 24; ++i) {
+            Knot k;
+            k.t_us = t += uint64_t(r.uni(60.0f, 600.0f)) * kMs;
+            const float p = r.pick(4) == 0 ? prev : r.uni(0.05f, 0.95f);
+            k.p = p;
+            k.has_v = true;
+            k.family = r.pick(2) ? Family::C1 : Family::Unspecified;
+            ks.push_back(k);
+            prev = p;
+        }
+        // End velocities as the player gives them: 0 at a reversal, a hold and
+        // the ends, else the mean chord capped at 1.5 times the lesser.
+        for (size_t i = 0; i + 1 < ks.size(); ++i) {
+            const float tp = i ? float(ks[i - 1].t_us) : 100e3f, pp = i ? ks[i - 1].p : 0.5f;
+            const float a = (ks[i].p - pp) / (float(ks[i].t_us) - tp) * 1e6f;
+            const float b = (ks[i + 1].p - ks[i].p) / float(ks[i + 1].t_us - ks[i].t_us) * 1e6f;
+            ks[i].v = a * b > 0.0f ? std::copysign(std::fmin(std::fabs(0.5f * (a + b)), 1.5f * std::fmin(std::fabs(a), std::fabs(b))), a) : 0.0f;
+        }
+        uint64_t newest = 0, start = 100 * kMs, base = 100 * kMs;
+        size_t next = 0;
+        float lo = 0.5f, hi = 0.5f, plo = 1e9f, phi = -1e9f;
+        bool bad = false;
+        for (uint64_t now = 0; now <= ks.back().t_us + 400 * kMs; now += kMs) {
+            while (next < ks.size() && base <= now + 125 * kMs) {
+                const uint64_t dur = ks[next].t_us - base;
+                start = next ? uint64_t(int64_t(newest) + skews[r.pick(11)]) : base;
+                if (next) (void)e.truncateAfter(start, now);
+                if (next && start > newest) REQUIRE(e.submit(knotAt(start, ks[next - 1].p, true, 0.0f, Family::C2), now));
+                Knot k = ks[next];
+                k.t_us = start + dur;
+                REQUIRE(e.submit(k, now));
+                for (size_t i = 0; i < e.pending(0); ++i) {
+                    const Solved& o = e.solved(0, i);
+                    if (std::fabs(o.v) > kFactory.vmax * (1.0f + handles::kTol) || std::fabs(o.a) > kFactory.amax * (1.0f + handles::kTol)) bad = true;
+                }
+                lo = std::fmin(lo, k.p); hi = std::fmax(hi, k.p);
+                newest = k.t_us;
+                base = ks[next].t_us;
+                ++next;
+            }
+            const float p = e.stateAt(0, now).p;
+            plo = std::fmin(plo, p); phi = std::fmax(phi, p);
+        }
+        ++runs;
+        if (bad) ++junction;
+        const float out = std::fmax(lo - plo, phi - hi);
+        worst = std::fmax(worst, out);
+        if (out > 0.01f) { ++outside; if (outside <= 4) MESSAGE("seed " << seed << ": " << out << " of the window outside [" << lo << ", " << hi << "]"); }
+    }
+    MESSAGE(runs << " runs: " << junction << " with a solved knot past vmax or amax, " << outside << " outside the envelope by more than 1 percent, worst " << worst);
+    CHECK(junction == 0);
+    CHECK(outside == 0);
 }

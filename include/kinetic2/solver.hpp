@@ -24,6 +24,9 @@
 // - Config::solve_budget, late_budget_us, policy, amplitude_floor and corner
 //   are not read here; the renderer's knobs are the constants below
 //   (kin-tnv exposes them and bounds the render per tick).
+// - A knot's solved state (where the next piece, a starvation brake and a
+//   re-plan start) is inside vmax and amax, whatever the piece into it did
+//   (emitRun, kin-554).
 // - A knot whose two pieces differ in acceleration by more than jmax * kStepS
 //   carries a corner ramp at jmax: centered on the knot, ending on it into a
 //   flat span, starting on it out of one. Its Solved state is then the ramp's
@@ -341,6 +344,12 @@ inline handles::Over profOver(const Profile& pr, const handles::Cfg& c) {
     return o;
 }
 
+// x held to the ceiling when it is past the legality tolerance; a legal value
+// is kept bit for bit.
+inline float withinCeiling(float x, float ceiling) {
+    return std::fabs(x) > ceiling * (1.0f + handles::kTol) ? std::copysign(ceiling, x) : x;
+}
+
 // ---- one run of the renderer -------------------------------------------------
 // Fills out[r - 1] from the render of knots k[0..m) (te: their times), piece by
 // piece from state s as the engine will build them, with the corner ramp
@@ -393,6 +402,14 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, const Kn
                 o.missed = true;
             }
         }
+        // Where the next piece, a starvation brake and a re-plan start: inside
+        // the ceilings. A piece no trim makes legal ends past one (a hold a
+        // tick after a moving knot ends at several times amax), and the next
+        // piece's lead unwound that at jmax, gaining a^2/2J of speed
+        // (kin-554). The piece into the knot keeps its own end; it is reported.
+        // A corner's exit stays: it is the next piece's own start, reached by
+        // the ramp at jmax and judged with it.
+        if (!o.corner) { o.v = withinCeiling(o.v, c.lim.vmax); o.a = withinCeiling(o.a, c.lim.amax); }
         st = State{o.p, o.v, o.a};
         st_us = o.t_us;
     }
