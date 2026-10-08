@@ -66,6 +66,7 @@ inline constexpr float          kHoldEps   = 0.005f;                 // a chord 
 inline constexpr uint64_t       kMinSpanUs = 1000;                   // one tick, the floor of every span
 inline constexpr float          kIllegal   = 1e30f;                  // a ratio for an illegal profile
 inline constexpr float          kKnotTol   = 1e-3f;                  // a corner ramp passes its knot this near, window units
+inline constexpr int            kWalkBack  = 6;                      // rounds a corner ramp's walk-back may take to settle
 
 // ---- the solved knot ---------------------------------------------------------
 // Where and when the curve passes the knot, with what velocity and acceleration.
@@ -83,7 +84,7 @@ struct Solved {
     float    i0 = handles::kThird, i1 = handles::kThird;   // the incoming piece's handle lengths
     float    a_in = 0.0f;        // the end acceleration the incoming piece is matched to
     float    knot_p = 0.0f;      // where the curve passes the knot at its time: authored, or trimmed
-    bool     missed = false;     // the corner ramp passes the knot off its render (knot_p is where; reported)
+    bool     missed = false;     // the corner ramp passes the knot off its render (knot_p is where)
     // HARD junction: `ramp` is the whole move, Profile::point from the state
     // before the knot, landing at rest on it at t_us. CORNER: the piece ends at
     // head (head_us) and `ramp` carries the jerk-limited step; t_us / p / v / a
@@ -182,20 +183,28 @@ inline bool rampOnCurve(const handles::Piece& qL, const handles::Piece& qR, floa
 // into it ends in, to aR, the next piece's start. The piece then ends at the
 // ramp's start, before the knot, which moves its end acceleration: rounds of
 // the walk-back settle it, and the ramp starts from the head's own end
-// acceleration. With the rendered pieces (qL, qR) the ramp is rampOnCurve's;
+// state. With the rendered pieces (qL, qR) the ramp is rampOnCurve's;
 // without them, or when that finds no split, it is centered on the knot (a
 // ramp longer than planned ends past its plan while it fits). The ramp keeps
 // to half of what remains of each span (from st_us, and tr_us after the
 // knot); one that does not fit leaves the step.
+// Settled: the ramp from the head's own end passes the knot within kKnotTol,
+// or no further off than its plan (a flat knot's turn lands on its height).
+// Once two heads end on either side of their plans the walk-back steps by
+// false position inside that bracket. An unsettled on-curve ramp gives way to
+// the centered one; an unsettled centered walk-back keeps the round whose head
+// ends nearest its plan, with that planned ramp: it passes the knot, and the
+// acceleration step left at the head is judged by renderRun (kin-1ir).
 // from_flat: the ramp starts on the knot; into_flat: it ends on it (a hold
 // stays a hold).
 inline void cornerAt(Solved& o, float aL, float aR, bool from_flat, bool into_flat, const State& st,
                      uint64_t st_us, uint64_t tr_us, const Limits& L,
                      const handles::Piece* qL = nullptr, const handles::Piece* qR = nullptr) {
     if (std::fabs(aR - aL) <= L.jmax * kStepS) return;
-    uint64_t r_us = 0, h_us = 0;
+    uint64_t r_us = 0, h_us = 0, use_us = 0;
     State w;
-    const float a_in0 = o.a_in;
+    float jr = 0.0f;
+    const float a_in0 = o.a_in, aL0 = aL, aR0 = aR;
     float h1 = 0.0f, h2 = 0.0f;
     handles::Eval eL, eR;
     // Only a piece built near the rendered curve (its end acceleration within
@@ -212,58 +221,87 @@ inline void cornerAt(Solved& o, float aL, float aR, bool from_flat, bool into_fl
         const float at_knot = o.p - qL->D + eL.p + eL.v * h1 + 0.5f * eL.a * h1 * h1 + jr * h1 * h1 * h1 / 6.0f;
         if (std::fabs(at_knot - o.p) > kKnotTol) on_curve = false;
     }
-    for (int it = 0; it < (on_curve ? 1 : 4); ++it) {
-        if (on_curve) {
-            h_us = uint64_t(h1 * 1e6f + 0.5f);
-            r_us = h_us + uint64_t(h2 * 1e6f + 0.5f);
-            aL = eL.a;
-            aR = eR.a;
-        } else {
-            r_us = uint64_t(std::fabs(aR - aL) / L.jmax * 1e6f + 0.5f);
-            h_us = into_flat ? r_us : from_flat ? 0 : r_us / 2;
+    for (;;) {
+        aL = aL0;
+        aR = aR0;
+        float aP = aL, jP = 0.0f, aH = aL, best = INFINITY;
+        float ap = 0.0f, fp = 0.0f, an = 0.0f, fn = 0.0f;   // the bracket: heads ending above / below their plan
+        State bw;
+        uint64_t br_us = 0, bh_us = 0;
+        for (int it = 0; it < (on_curve ? 1 : kWalkBack); ++it) {
+            if (on_curve) {
+                h_us = uint64_t(h1 * 1e6f + 0.5f);
+                r_us = h_us + uint64_t(h2 * 1e6f + 0.5f);
+                aL = eL.a;
+                aR = eR.a;
+            } else {
+                r_us = uint64_t(std::fabs(aR - aL) / L.jmax * 1e6f + 0.5f);
+                h_us = into_flat ? r_us : from_flat ? 0 : r_us / 2;
+            }
+            if (r_us == 0 || 2 * (h_us + kMinSpanUs) > o.t_us - st_us || 2 * (r_us - h_us + kMinSpanUs) > tr_us) { o.a_in = a_in0; return; }
+            const float Tr = float(r_us) * 1e-6f, h = float(h_us) * 1e-6f;
+            const float j = (aR - aL) / Tr;
+            w.a = aL;
+            if (on_curve) {
+                w.v = eL.v;
+                w.p = o.p - qL->D + eL.p;
+            } else {
+                // Through the knot at its velocity (into_flat: ends at rest on it,
+                // so a hold stays a hold).
+                w.v = o.v - aL * h - 0.5f * j * h * h;
+                w.p = o.p - w.v * h - 0.5f * aL * h * h - j * h * h * h / 6.0f;
+            }
+            // A flat knot is an extremum: the ramp's own turn lands on its height,
+            // never past it (a crest on the rail stays in the window).
+            const float disc = aL * aL - 2.0f * j * w.v;
+            if (!into_flat && o.v == 0.0f && disc >= 0.0f) {
+                const float r = std::sqrt(disc);
+                for (const float t : {(-aL - r) / j, (-aL + r) / j})
+                    if (t > 0.0f && t < Tr) { w.p += o.p - Profile::step(w, j, t).p; break; }
+            }
+            aP = aL;
+            jP = j;
+            aH = aL;
+            if (h_us != 0) {
+                o.a_in = w.a;
+                const Piece head = Piece::bezier(st_us, st, o.t_us - h_us, w, o.i0, o.i1, L);
+                if (head.T > 0.0f) aH = handles::aEndOf(head.q);
+            }
+            const float res = aH - w.a;   // the head's end past the acceleration it was built to
+            if (std::fabs(res) < best) { best = std::fabs(res); bw = w; br_us = r_us; bh_us = h_us; }
+            if (std::fabs(res) <= L.jmax * kStepS) break;
+            // The next round plans from where this head ends, or by false
+            // position once a bracket exists: the plain step can oscillate.
+            if (res > 0.0f) { ap = w.a; fp = res; } else { an = w.a; fn = res; }
+            aL = fp > 0.0f && fn < 0.0f ? ap - fp * (an - ap) / (fn - fp) : aH;
         }
-        if (r_us == 0 || 2 * (h_us + kMinSpanUs) > o.t_us - st_us || 2 * (r_us - h_us + kMinSpanUs) > tr_us) { o.a_in = a_in0; return; }
-        const float Tr = float(r_us) * 1e-6f, h = float(h_us) * 1e-6f;
-        const float j = (aR - aL) / Tr;
+        aL = aH;
         w.a = aL;
-        if (on_curve) {
-            w.v = eL.v;
-            w.p = o.p - qL->D + eL.p;
-        } else {
-            // Through the knot at its velocity (into_flat: ends at rest on it,
-            // so a hold stays a hold).
-            w.v = o.v - aL * h - 0.5f * j * h * h;
-            w.p = o.p - w.v * h - 0.5f * aL * h * h - j * h * h * h / 6.0f;
+        const uint64_t f_us = uint64_t(std::fabs(aR - aL) / L.jmax * 1e6f + 0.5f);
+        use_us = f_us > (on_curve ? r_us : h_us) && 2 * (f_us - h_us + kMinSpanUs) <= tr_us ? f_us : r_us;
+        jr = on_curve ? std::fmax(-L.jmax, std::fmin(L.jmax, (aR - aL) / (float(use_us) * 1e-6f)))
+                      : (aR - aL) / (float(use_us) * 1e-6f);
+        if (into_flat && aR == 0.0f && aL * w.v < 0.0f) {
+            // Lands at rest from the head's own end: its velocity and acceleration
+            // reach zero together (the planned w can differ from where the head
+            // ends when its end acceleration did not match).
+            const uint64_t l_us = uint64_t(-2.0f * w.v / aL * 1e6f + 0.5f);
+            if (l_us >= h_us && l_us > 0 && std::fabs(aL) <= L.jmax * float(l_us) * 1e-6f * (1.0f + handles::kTol)
+                && 2 * (l_us > h_us ? l_us - h_us + kMinSpanUs : 0) <= tr_us) {
+                use_us = l_us;
+                jr = -aL / (float(l_us) * 1e-6f);
+            }
         }
-        // A flat knot is an extremum: the ramp's own turn lands on its height,
-        // never past it (a crest on the rail stays in the window).
-        const float disc = aL * aL - 2.0f * j * w.v;
-        if (!into_flat && o.v == 0.0f && disc >= 0.0f) {
-            const float r = std::sqrt(disc);
-            for (const float t : {(-aL - r) / j, (-aL + r) / j})
-                if (t > 0.0f && t < Tr) { w.p += o.p - Profile::step(w, j, t).p; break; }
-        }
-        if (h_us == 0) break;
+        const float hk = float(h_us) * 1e-6f;
+        State wp = w;
+        wp.a = aP;
+        const float off = std::fabs(Profile::step(w, jr, hk).p - o.p);
+        if (off <= std::fmax(kKnotTol, std::fabs(Profile::step(wp, jP, hk).p - o.p))) break;
+        if (on_curve) { on_curve = false; continue; }
+        w = bw; r_us = br_us; h_us = bh_us; use_us = r_us;
+        jr = (aR - w.a) / (float(r_us) * 1e-6f);
         o.a_in = w.a;
-        const Piece head = Piece::bezier(st_us, st, o.t_us - h_us, w, o.i0, o.i1, L);
-        if (head.T <= 0.0f) break;
-        aL = handles::aEndOf(head.q);
-    }
-    w.a = aL;
-    const uint64_t f_us = uint64_t(std::fabs(aR - aL) / L.jmax * 1e6f + 0.5f);
-    uint64_t use_us = f_us > (on_curve ? r_us : h_us) && 2 * (f_us - h_us + kMinSpanUs) <= tr_us ? f_us : r_us;
-    float jr = on_curve ? std::fmax(-L.jmax, std::fmin(L.jmax, (aR - aL) / (float(use_us) * 1e-6f)))
-                        : (aR - aL) / (float(use_us) * 1e-6f);
-    if (into_flat && aR == 0.0f && aL * w.v < 0.0f) {
-        // Lands at rest from the head's own end: its velocity and acceleration
-        // reach zero together (the planned w can differ from where the head
-        // ends when its end acceleration did not match).
-        const uint64_t l_us = uint64_t(-2.0f * w.v / aL * 1e6f + 0.5f);
-        if (l_us >= h_us && l_us > 0 && std::fabs(aL) <= L.jmax * float(l_us) * 1e-6f * (1.0f + handles::kTol)
-            && 2 * (l_us > h_us ? l_us - h_us + kMinSpanUs : 0) <= tr_us) {
-            use_us = l_us;
-            jr = -aL / (float(l_us) * 1e-6f);
-        }
+        break;
     }
     const float Tu = float(use_us) * 1e-6f;
     Profile ramp;
@@ -335,14 +373,13 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, const Kn
         } else if (o.v == 0.0f) {
             cornerAt(o, o.a, 0.0f, from_flat, true, st, st_us, ~uint64_t(0) / 4, c.lim);
         }
-        // A ramp that starts from the head's own end acceleration can pass
-        // the knot off its rendered position: where it passes is the knot's
-        // position, reported as a trim (kin-1ir), never silent.
+        // A corner ramp can pass the knot off its rendered position (a flat
+        // knot's turn lands on its height, not at its time): where it passes
+        // is knot_p, flagged missed. share stays the render's trim alone.
         if (o.corner && te[r] >= o.head_us && te[r] <= o.t_us) {
             const float pk = Profile::step(o.ramp.s0, o.ramp.jerk[0], float(te[r] - o.head_us) * 1e-6f).p;
             if (std::fabs(pk - o.knot_p) > kKnotTol) {
                 o.knot_p = pk;
-                if (std::fabs(K.p - pL) > c.holdEps) o.share = (pk - pL) / (K.p - pL);
                 o.missed = true;
             }
         }
