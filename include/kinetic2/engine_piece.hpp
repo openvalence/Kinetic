@@ -79,18 +79,10 @@ struct Piece {
         if (t1 <= t0) { pc.p0 = s1.p; return pc; }
         handles::Piece q{float(t1 - t0) * 1e-6f, s1.p - s0.p, s0.v, s1.v, i0, i1};
         if (!match(q, s0.a, s1.a, L)) {
-            // The start length nearest the start acceleration, when legal: the
-            // lead ramp or the correction then carries only what is left.
-            handles::Cfg c; c.lim = L; c.lo = -1e30f; c.hi = 1e30f;
-            const float bound = std::fmax(1.0f + handles::kTol, handles::overOf(q, 0.0f, c));
-            for (const float l : {handles::kLMax, handles::kLMin}) {
-                handles::Piece qn = q;
-                qn.i0 = l;
-                if (std::fabs(handles::aStartOf(qn) - s0.a) < std::fabs(handles::aStartOf(q) - s0.a)
-                    && handles::overOf(qn, 0.0f, c) <= bound)
-                    q = qn;
-            }
-            i0 = q.i0;
+            // The render's lengths stay: the renderer sized the start ramp's
+            // room for them (handles::startRoom). A length moved toward the
+            // start acceleration here rendered a lone 200 ms segment as a 150
+            // ms crawl and a spike (kin-b1d).
             // The piece rebuilt after the ramp starts where the ramp ends: the
             // ramp aims at the rebuilt piece's start until the two agree. One
             // that still misses by more than 0.1 ms of jmax is no lead.

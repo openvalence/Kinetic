@@ -65,7 +65,7 @@ public:
         if (a.tl.full()) return refuse(k, now_us, kDetailTimelineFull);
         // An axis at rest has been holding since its origin: the first piece
         // starts now, not when the hold began. A brake in flight keeps its end.
-        if (a.tl.empty() && a.origin_us < now_us) a.origin_us = now_us;
+        if (a.tl.empty() && a.origin_us < now_us) boundary(a, a.origin, now_us);
         commitHorizon(axis, now_us, true);
         if (!a.tl.push(k)) { a.replan_open = false; return refuse(k, now_us, kDetailPast); }
         a.solved_valid = false;
@@ -156,11 +156,10 @@ public:
             a.solved_valid = true;
             a.has_committed = false;
             const Profile pr = Profile::brake(s, now_us, _cfg.limits);
-            if (pr.n == 0) { a.origin = State{s.p, 0.0f, 0.0f}; a.origin_us = now_us; a.piece = Piece::hold(s.p, now_us); a.piece_valid = true; continue; }
+            if (pr.n == 0) { boundary(a, State{s.p, 0.0f, 0.0f}, now_us); a.piece = Piece::hold(s.p, now_us); a.piece_valid = true; continue; }
             a.piece = Piece::profile(pr);
             a.piece_valid = true;
-            a.origin = pr.end();
-            a.origin_us = pr.end_us();
+            boundary(a, pr.end(), pr.end_us());
             a.explicit_brake = true;
             record(AnomalyKind::SettleEngaged, now_us, a.origin.p, s.v);
         }
@@ -184,8 +183,7 @@ public:
                 a.piece = Piece::profile(pr);
                 a.piece_valid = true;
                 record(AnomalyKind::SettleEngaged, a.origin_us, pr.end().p, a.origin.v);
-                a.origin = pr.end();
-                a.origin_us = pr.end_us();
+                boundary(a, pr.end(), pr.end_us());
                 return a.piece.at(now_us);
             }
         }
@@ -197,8 +195,7 @@ public:
         while (!a.tl.empty()) {
             if (a.sol[0].t_us > now_us) break;
             const Solved& k = a.sol[0];
-            a.origin = State{k.p, k.v, k.a};
-            a.origin_us = k.t_us;
+            boundary(a, State{k.p, k.v, k.a}, k.t_us);
             const size_t cnt = a.tl.size();
             a.tl.popFront();
             for (size_t i = 0; i + 1 < cnt; ++i) a.sol[i] = a.sol[i + 1];
@@ -212,8 +209,7 @@ public:
                 a.piece = Piece::profile(pr);
                 a.piece_valid = true;
                 record(AnomalyKind::SettleEngaged, a.origin_us, pr.end().p, a.origin.v);
-                a.origin = pr.end();
-                a.origin_us = pr.end_us();
+                boundary(a, pr.end(), pr.end_us());
                 a.n_sol = 0; a.solved_valid = true;
                 return a.piece.at(now_us);
             }
@@ -239,6 +235,13 @@ public:
     }
 
     size_t pending(size_t axis = 0) const { return _ax[axis].tl.size(); }
+    // The authored start of the segment in flight (the piece toward the first
+    // pending knot): the state and time of the knot retired before it, or of
+    // the accept on an axis at rest. plan.start / plan.elapsed / plan.duration.
+    State segStart(size_t axis, uint64_t* t_us) const {
+        if (t_us) *t_us = _ax[axis].seg_us;
+        return _ax[axis].seg;
+    }
     // The solver's decision for pending knot i (tooling: the tuner shows the
     // share per knot). Solves first.
     const Solved& solved(size_t axis, size_t i) { ensureSolved(_ax[axis]); return _ax[axis].sol[i]; }
@@ -259,6 +262,12 @@ private:
         Timeline<Capacity> tl;
         State    origin{};         // the state the next piece starts from
         uint64_t origin_us = 0;
+        // Where the piece toward the first pending knot was authored to start
+        // (the knot retired before it, a brake's end, the accept on an axis
+        // at rest): the segment in flight, for a census. A re-plan from the
+        // reaction horizon moves the origin along the curve, never this.
+        State    seg{};
+        uint64_t seg_us = 0;
         Solved   sol[Capacity]{};  // the solved window, aligned with tl
         Workspace ws{};      // the renderer's scratch, this axis's own
         size_t   n_sol = 0;        // solved knots; equals tl.size() once solved
@@ -283,11 +292,16 @@ private:
         Solved   replan_k0{};
     };
 
+    // The origin moves to a segment boundary: the segment in flight starts there.
+    static void boundary(Axis& a, const State& s, uint64_t t_us) {
+        a.origin = s; a.origin_us = t_us;
+        a.seg = s; a.seg_us = t_us;
+    }
+
     void resetAxis(size_t ax, float p, uint64_t now_us) {
         Axis& a = _ax[ax];
         a.tl.clear();
-        a.origin = State{p, 0.0f, 0.0f};
-        a.origin_us = now_us;
+        boundary(a, State{p, 0.0f, 0.0f}, now_us);
         a.n_sol = 0;
         a.solved_valid = true;
         a.piece = Piece::hold(p, now_us);
@@ -343,8 +357,7 @@ private:
             const Solved& k0 = a.replan_k0;
             a.committed = a.replan_piece;
             a.has_committed = true;
-            a.origin = State{k0.p, k0.v, k0.a};
-            a.origin_us = k0.t_us;
+            boundary(a, State{k0.p, k0.v, k0.a}, k0.t_us);
             a.tl.popFront();
             a.solved_valid = false;
             ensureSolved(a);
@@ -438,8 +451,7 @@ private:
             if (k0.t_us <= tr + 1000 || k0.base_us <= tr + 1000 || fixed) {
                 // Commit through the knot: its piece is kept whole.
                 a.committed = a.piece;
-                a.origin = State{k0.p, k0.v, k0.a};
-                a.origin_us = k0.t_us;
+                boundary(a, State{k0.p, k0.v, k0.a}, k0.t_us);
                 const size_t cnt = a.tl.size();
                 a.tl.popFront();
                 for (size_t i = 0; i + 1 < cnt; ++i) a.sol[i] = a.sol[i + 1];
