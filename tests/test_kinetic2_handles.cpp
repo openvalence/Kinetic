@@ -3,11 +3,19 @@
 // The expected samples and trims are tests/handles_fixture.hpp, generated from
 // the model: `node tests/gen_handles_fixture.mjs` from the Kinetic root.
 // Constraints:
-// - Every assertion is sampled reality on the 1 ms grid, never the planner's word.
-// - Parity bars as asserted: position within 0.5% of the window at every
-//   sample past the jerk-lag allowance at flat knots, each knot's trim within
-//   1% past the same allowance (kin-y6e asks both with no allowance: operator
-//   ruling owed). Ceilings within 0.1%.
+// - Every engine assertion is sampled reality on the 1 ms grid, never the
+//   planner's word; the renderer's trims are read from handles::render alone.
+// - Parity bars as asserted: the renderer's trims within 1e-4 of the window at
+//   every knot with no allowance (the model renders with railStop as the
+//   kernel does, kin-88m); position within 0.5% of the window at every sample
+//   and the engine's trims within 1e-4, both past the corner-ramp allowance
+//   only. Ceilings within 0.1%.
+// - The corner ramps and the origin's lead ramp are the engine's
+//   (engine_piece.hpp, solver.hpp renderRun), and so are the slack passes that
+//   tighten a piece's ceilings by what those ramps cost it: the model has none
+//   of them, so they are the one allowance. The rail-rule cases
+//   (kRenderCases) are held to the renderer alone: the slack passes move them
+//   past that allowance.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest/doctest.h"
 
@@ -47,7 +55,40 @@ Run render(const handles_fixture::Case& c) {
     return r;
 }
 
+// The renderer alone, with the knobs solveWindow gives it (kept in step with
+// solver.hpp by hand), from the first knot at rest.
+std::vector<handles::HKnot> renderBare(const handles_fixture::Case& c) {
+    std::vector<handles::HKnot> k(size_t(c.n));
+    k[0].p = c.p[0]; k[0].has_v = true;
+    for (int i = 1; i < c.n; ++i) { k[size_t(i)].t = float(c.t_ms[i]) * 1e-3f; k[size_t(i)].p = c.p[i]; }
+    handles::Cfg hc;
+    hc.lim = {c.vmax, c.amax, c.jmax};
+    hc.holdEps = kHoldEps; hc.lfloor = kFeelFloor; hc.trim = hc.hi - hc.lo; hc.style = kStyle;
+    hc.trimLast = true; hc.railStop = true;
+    handles::render(k.data(), c.n, hc);
+    return k;
+}
+
 }  // namespace
+
+TEST_CASE("handles parity: the renderer trims the model's script as the model does") {
+    auto parity = [](const handles_fixture::Case& c) {
+        const std::string name = c.name;
+        CAPTURE(name);
+        const std::vector<handles::HKnot> k = renderBare(c);
+        float worst = 0.0f; int at = 0;
+        for (int i = 0; i < c.n; ++i) {
+            CAPTURE(i);
+            const float d = std::fabs(k[size_t(i)].dp - c.dp[i]);
+            if (d > worst) { worst = d; at = i; }
+            CHECK(d <= 1e-4f);
+            CHECK(k[size_t(i)].infeasible == (c.infeasible[i] != 0));
+        }
+        MESSAGE(name << ": worst renderer trim difference " << worst << " of the window at knot " << at);
+    };
+    for (const handles_fixture::Case& c : handles_fixture::kCases) parity(c);
+    for (const handles_fixture::Case& c : handles_fixture::kRenderCases) parity(c);
+}
 
 TEST_CASE("handles parity: the kernel renders the model's script on the author's clock") {
     for (const handles_fixture::Case& c : handles_fixture::kCases) {
@@ -93,12 +134,13 @@ TEST_CASE("handles parity: the kernel renders the model's script on the author's
             const float d = e - allow[size_t(t)];
             if (d > worst_p) { worst_p = d; at = t; }
         }
-        MESSAGE(name << ": worst position error past the jerk-lag allowance " << worst_p << " of the window at " << at
+        MESSAGE(name << ": worst position error past the corner-ramp allowance " << worst_p << " of the window at " << at
                      << " ms; with no allowance " << raw << " at " << raw_at << " ms, " << raw_over << " samples over 0.5%");
         CHECK(worst_p <= 0.005f);
 
         // Trims: which knots moved and by how much; nothing placed early or late.
         // A corner's solved t_us / p are its ramp's end; the knot is on the ramp.
+        float worst_t = 0.0f, raw_t = 0.0f; int at_t = 0;
         for (int i = 1; i < c.n; ++i) {
             CAPTURE(i);
             const Solved& o = r.sol[size_t(i - 1)];
@@ -107,15 +149,21 @@ TEST_CASE("handles parity: the kernel renders the model's script on the author's
             if (o.corner) { CHECK(o.head_us <= t_k); CHECK(o.t_us >= t_k); }
             else CHECK(o.t_us == t_k);
             const float p_k = o.knot_p;   // the renderer's placement, never read back from the curve
-            // Constraint: a piece that lags by the jerk-lag allowance at a speed
-            // ceiling gives that much more amplitude; it is the trim's allowance.
-            CHECK(std::fabs((p_k - c.p[i]) - c.dp[i]) <= 0.01f + knot_lag[size_t(i)]);
+            // Constraint: a ramp's time costs its pieces speed, which the slack
+            // passes give back as amplitude; the position allowance at the knot
+            // is the trim's.
+            const float e = std::fabs((p_k - c.p[i]) - c.dp[i]), d = e - allow[c.t_ms[i]];
+            raw_t = std::fmax(raw_t, e);
+            if (d > worst_t) { worst_t = d; at_t = i; }
+            CHECK(d <= 1e-4f);
             CHECK(o.infeasible == (c.infeasible[i] != 0));
             // Reached at its own time, at its trimmed position, within the
             // corner ramp's tolerance (kKnotTol: a ramp that keeps the curve's
             // velocity may pass its knot that far off).
             CHECK(std::fabs(r.s[c.t_ms[i]].p - p_k) <= kKnotTol);
         }
+        MESSAGE(name << ": worst engine trim difference past the corner-ramp allowance " << worst_t << " of the window at knot "
+                     << at_t << "; with no allowance " << raw_t);
     }
 }
 
