@@ -20,7 +20,7 @@ const SPEND = 'rgba(77,166,255,0.55)';   // the reality blue, dimmed so spend ma
 
 const DEF = { vmax: 3, amax: 30, jmax: 2000, policy: 'blend', floor: 0.25, corner: 'cubic', react: 4, look: 250 };
 const SPANS = [1, 2, 5, 10];
-const KIND = { 1: 'PlanFailed', 2: 'SettleEngaged', 3: 'EndVelClamped', 4: 'DeadlineStretched', 6: 'WaveformScaled', 10: 'DwellZeroed', 11: 'KnotRefused' };
+const KIND = { 1: 'PlanFailed', 2: 'SettleEngaged', 3: 'EndVelClamped', 4: 'DeadlineStretched', 6: 'WaveformScaled', 10: 'DwellZeroed', 11: 'KnotRefused', 12: 'PieceOverCeiling' };
 const SENTINEL = { '-99': 'kDetailNonFinite: a non-finite value', '-95': 'kDetailPast: at or before now or the newest knot', '-96': 'kDetailTimelineFull: all 64 knot slots are pending' };
 
 // ---- state -----------------------------------------------------------------
@@ -74,9 +74,9 @@ function cstr(ptr) {
 }
 
 // ---- replay ------------------------------------------------------------------
-// The engine erases a dropped knot from the timeline mid-window, so
-// kinetic2_solved never reports dropped = 1: drops are read from PlanFailed
-// (its target is the knot's authored p), retirements from the front.
+// A drop is read from PlanFailed only (its target is the knot's authored p),
+// retirements from the front. Kinetic² never drops a knot; PieceOverCeiling
+// is a knot that renders and is never read as a drop.
 function replay() {
   const o = S.o;
   const cfgOk = K.kinetic2_configure(h, o.vmax, o.amax, o.jmax, o.policy === 'blend' ? 5 : 0, o.floor,
@@ -696,13 +696,15 @@ function meaning(a) {
   const d = a.detail;
   const sentinel = SENTINEL[String(Math.round(d))];
   switch (a.kind) {
-    case 1: return 'knot dropped: ' + (sentinel || (d >= 1e29 ? 'no legal piece under any spend (kIllegal)' : `worst ceiling ratio ${d.toFixed(2)} after every spend`));
+    case 1: return 'knot dropped' + (sentinel ? ': ' + sentinel : '');
     case 2: return `braked at ${Math.abs(d).toFixed(2)} u/s: the timeline ran dry`;
     case 3: return `end velocity cut to ${d.toFixed(2)} u/s`;
     case 4: return `deadline moved ${(d * 1000).toFixed(0)} ms later`;
     case 6: return `Blend kept ${(d * 100).toFixed(0)}% of the stroke`;
     case 10: return 'same target re-commanded: a hold, its end velocity dropped';
     case 11: return 'knot refused: ' + (sentinel || 'detail ' + d);
+    case 12: return 'no trim keeps this span inside a limit: it renders at its least-over trim, worst ceiling ratio '
+      + (d >= 1e29 ? 'kIllegal' : d.toFixed(2));
     default: return 'detail ' + d;
   }
 }
