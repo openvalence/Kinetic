@@ -1,13 +1,4 @@
-# The native suite: the engine cases plus a smoke test of the wasm C ABI,
-# compiled natively. Green before every tag (CONTRIBUTING.md).
-add_executable(test_kinetic test_kinetic.cpp test_wasm_abi.cpp ../wasm/kinetic_wasm.cpp)
-target_link_libraries(test_kinetic PRIVATE kinetic::kinetic)
-target_include_directories(test_kinetic PRIVATE third_party ../wasm)
-target_compile_options(test_kinetic PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall>)
-add_test(NAME test_kinetic COMMAND test_kinetic)
-
-# Kinetic²: its own binary, no Ruckig in the link.
+# The native suites. Green before every tag (CONTRIBUTING.md).
 add_executable(test_kinetic2 test_kinetic2.cpp)
 target_link_libraries(test_kinetic2 PRIVATE kinetic::kinetic2)
 target_include_directories(test_kinetic2 PRIVATE third_party)
@@ -23,14 +14,6 @@ target_include_directories(test_kinetic2_handles PRIVATE third_party)
 target_compile_options(test_kinetic2_handles PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>)
 add_test(NAME test_kinetic2_handles COMMAND test_kinetic2_handles)
-
-# Kinetic 1 as the oracle for Kinetic²: the one binary that links both.
-add_executable(test_kinetic2_oracle test_kinetic2_oracle.cpp)
-target_link_libraries(test_kinetic2_oracle PRIVATE kinetic::kinetic kinetic::kinetic2)
-target_include_directories(test_kinetic2_oracle PRIVATE third_party)
-target_compile_options(test_kinetic2_oracle PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall>)
-add_test(NAME test_kinetic2_oracle COMMAND test_kinetic2_oracle)
 
 # The solver's cost per submit (kin-ys0): counts under KINETIC2_STATS, never a
 # test (it prints a table and always exits 0).

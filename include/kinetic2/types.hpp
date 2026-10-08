@@ -4,10 +4,10 @@
 // - Float-first: every quantity a caller sees or the sampler computes is float.
 //   Time is uint64_t microseconds on the caller's clock; deltas become float
 //   seconds only inside a piece (never an absolute time as float).
-// - Wire-visible ordinals are pinned: Policy keeps Kinetic 1's values (Stretch
-//   0, Blend 5: stored in NVS and carried by the catalog select) and Anomaly
-//   kinds 0..10 keep Kinetic 1's meaning and numbering (the per-kind counter
-//   tables in Nucleus and valencesim index by them). New kinds append.
+// - Wire-visible ordinals are pinned: Policy values (Stretch 0, Blend 5) are
+//   stored in NVS and carried by the catalog select, and Anomaly kinds keep
+//   their meaning and numbering (the per-kind counter tables in Nucleus and
+//   valencesim index by them). New kinds append.
 // - Normalized units: position 0..1 across the caller's travel window;
 //   velocity, acceleration and jerk in window units per s, s^2, s^3.
 // See: Valence RFC-105 (the promises), Nucleus val-7p2 (the rulings)
@@ -128,18 +128,17 @@ struct Config {
 };
 
 // ---- Anomaly ----------------------------------------------------------------
-// One event per axis spent, so the counts read as a diagnosis. Kinds 0..10 are
-// Kinetic 1's and keep their numbers (several will never be emitted by Kinetic²
-// and stay reserved); 11 and 12 are Kinetic²'s, new kinds append at 13+.
+// One event per axis spent, so the counts read as a diagnosis. Every number is
+// pinned; a kind marked never emitted stays reserved, new kinds append at 13+.
 enum class AnomalyKind : uint8_t {
     None              = 0,
     PlanFailed        = 1,   // the knot was dropped. Never emitted by Kinetic² (no knot is dropped); consumers read it as a drop
     SettleEngaged     = 2,   // the timeline ran dry mid-motion: braked to rest. detail = v at engagement
     EndVelClamped     = 3,   // an authored end velocity exceeded vmax or the wall bound. detail = the clamped v
     DeadlineStretched = 4,   // a knot placed late. Never emitted by Kinetic² (time never gives)
-    WaveformFallback  = 5,   // reserved (Kinetic 1's Ruckig guard); never emitted
+    WaveformFallback  = 5,   // reserved; never emitted
     WaveformScaled    = 6,   // a knot trimmed toward its predecessor. detail = the share of its chord kept
-    WaveformCentered  = 7,   // retired in Kinetic 1; never emitted
+    WaveformCentered  = 7,   // reserved; never emitted
     HandoffBounded    = 8,   // reserved; the solver owns junction velocities, so nothing to bound
     WaveformSmoothed  = 9,   // reserved; never emitted
     DwellZeroed       = 10,  // the same target re-commanded (a hold): its end velocity dropped

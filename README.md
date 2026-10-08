@@ -1,83 +1,62 @@
 # Kinetic
 
-Kinetic is a header-only C++ library that plans jerk-limited trajectories for
-one linear axis. It has no hardware dependencies and its output is
-deterministic. It is the motion planner of the OpenValence Nucleus firmware
-(OSSM Flagship) and can be used outside Nucleus.
+Kinetic is a header-only C++ library that plans jerk-limited trajectories. It
+has no hardware dependencies and its output is deterministic. It is the
+motion planner of the OpenValence Nucleus firmware (OSSM Flagship) and can be
+used outside Nucleus.
 
-The repository holds two planners.
+The planner is Kinetic² (`include/kinetic2/`): one knot timeline per axis, a
+lookahead solver over the pending knots, three junction kinds. Its API is
+documented in its headers; `wasm/kinetic2_wasm.h` is its C ABI and
+`playground/` runs it in a browser. The design is RFC-105 in the Valence RFC
+queue.
 
-- **Kinetic²** (`include/kinetic2/`) is the planner Nucleus ships: one knot
-  timeline per axis, a lookahead solver over the pending knots, three
-  junction kinds, no Ruckig. `wasm/kinetic2_wasm.h` is its C ABI and
-  `playground/` runs it in a browser. The design is RFC-105 in the Valence
-  RFC queue.
-- **Kinetic 1** (`include/kinetic/`, with the vendored Ruckig in
-  `third_party/ruckig/`) is the previous planner. It stays in this repository
-  as the test oracle that grades Kinetic² (`tests/test_kinetic2_oracle.cpp`)
-  and is not built into Nucleus.
-
-The sections below describe Kinetic 1. Kinetic²'s API is documented in its
-headers; `playground/README.md` and `wasm/kinetic2_wasm.h` show it in use.
+Kinetic 1 and the K2-vs-K1 oracle comparison live on branch `kinetic1` (tag `kinetic1-final`), off main since 2026-10-08 (operator ruling, kin-xfq).
 
 ## The model
 
-- **One trajectory per command**, planned from the engine's actual
-  position, velocity and acceleration at that instant. The caller samples it
-  on its own clock.
-- **Event-driven planning.** A plan is computed when a command arrives
-  (or once, when a moving plan ends with nothing after it). Sampling is
-  polynomial or profile evaluation.
-- **Waveform segments** (a command with a duration) are Hermite curves in the
-  sender's declared family (C1 cubic or C2 quintic) over exactly the commanded
-  duration, scanned against the velocity, acceleration and jerk ceilings and
-  the window before adoption.
-- **Infeasible segments follow a declared policy.** `Blend` (the default)
-  keeps the deadline and reduces shape and amplitude together, only as far as
-  the ceilings require. `Stretch` keeps the whole stroke and overruns the
-  deadline.
-- **Amplitude floor.** `infeasible_amplitude_budget` bounds how much of a
-  commanded stroke Blend may give up; the search never crosses it.
-- **The Ruckig guard.** A shape still illegal at the floor is handed to Ruckig
-  and planned time-optimally under the ceilings; it arrives after the deadline
-  and records an anomaly. Bare
-  points (no duration) are chased by Ruckig, replanned per point; a moving
-  plan that starves is braked to rest by Ruckig's velocity interface.
-- **Limits.** Limits are upper bounds; the planner does not plan to reach
-  them. Every infeasible path records a motion anomaly that describes what
-  the planner gave up.
+- **Knots in, a sampled trajectory out.** Every source (a segment, a sample,
+  a stroke generator) becomes knots: the curve passes `p` at `t_us`, with an
+  optional authored end velocity. The engine never sees a wire format.
+- **Event-driven, never clocked.** The pending window is solved when it
+  changes, lazily at the next sample; a piece is built when the sampler first
+  needs it, from the state the previous piece ends in, so the curve is
+  continuous in position and velocity by construction.
+- **Time never gives, amplitude does.** A knot the ceilings cannot reach in
+  time is trimmed toward its predecessor and records an anomaly; it is never
+  dropped or placed late.
+- **Limits are ceilings.** The planner never exceeds them and does not plan
+  to reach them. Every trim, clamp and refusal records an anomaly.
 
 ## Example
 
 ```cpp
-#include <kinetic/kinetic.hpp>
+#include <kinetic2/engine.hpp>
 
-kinetic::Config cfg;
-cfg.limits = {10.0f, 400.0f, 50000.0f};   // vmax, amax, jmax in window units
-cfg.infeasible_policy = kinetic::InfeasiblePolicy::Blend;
-kinetic::Engine engine(cfg, 0.0f);        // at rest at the window's low end
+kinetic2::Config cfg;
+cfg.limits = {10.0f, 400.0f, 50000.0f};      // vmax, amax, jmax in window units
+kinetic2::Engine<> engine(cfg, 0.0f);        // at rest at the window's low end
+engine.resetAt(0.0f, now_us);
 
-kinetic::Command seg;
-seg.target       = 0.75f;                 // window units, 0..1
-seg.duration_us  = 250000;                // reach it in 250 ms
-seg.has_duration = true;                  // a waveform segment
-seg.end_vel      = 0.0f;
-seg.has_end_vel  = true;                  // arrive at rest
-engine.commit(seg, now_us);               // plans once, from the actual p, v, a
+kinetic2::Knot k;
+k.t_us   = now_us + 250000;                  // pass 0.75 in 250 ms
+k.p      = 0.75f;
+k.family = kinetic2::Family::C2;
+engine.submit(k, now_us);
 
 for (uint64_t t = now_us; t <= now_us + 300000; t += 1000)
-    drive(engine.positionAt(t));          // sample on your own clock
+    drive(engine.positionAt(t));             // sample on your own clock, non-decreasing
 
-kinetic::Anomaly an;
-while (engine.popAnomaly(an))             // anomalies the planner recorded
+kinetic2::Anomaly an;
+while (engine.popAnomaly(an))                // anomalies the planner recorded
     report(an.kind, an.detail);
 ```
 
-The rest of the API: `Command::anchor_us` schedules a segment on the
-engine's clock (a future anchor is planned now and parked), `brake()` stops
-from the current state, `snapshot()` and `planView()` expose the plan for
-telemetry or for a renderer on another core, `setConfig()` / `setLimits()`
-apply at the next plan. The header documents each.
+The rest of the API: `truncateAfter()` replaces what is queued, `brake()`
+stops from the current state, `reseedAt()` restates the state when the
+caller's frame moves, `solved()` and `peek()` expose the plan for telemetry or
+a renderer, `setConfig()` / `setLimits()` apply at the next submit or reset.
+`engine.hpp` documents each.
 
 ## Units and frames
 
@@ -89,22 +68,20 @@ apply at the next plan. The header documents each.
 | time | microseconds, `uint64_t`, supplied by the caller (never read from a clock) |
 
 Mapping the window to millimeters, steps or encoder counts is the caller's.
-`wasm/kinetic_wasm.cpp` is a complete example of that mapping.
 
 ## Determinism
 
-Planning math is `double`; the public API is `float`. The same sequence of calls
-gives bit-identical results on every IEEE-754 target, provided every translation unit that
-compiles the planner is built with `-ffp-contract=off` and without
-`-ffast-math`. The CMake target carries the flag as an INTERFACE option; any
-other build must set it.
+Every quantity is `float`; time is `uint64_t` microseconds. The same sequence
+of calls gives bit-identical results on every IEEE-754 target, provided every
+translation unit that compiles the planner is built with `-ffp-contract=off`
+and without `-ffast-math`. The CMake target carries the flag as an INTERFACE
+option; any other build must set it. `tests/test_kinetic2.cpp` pins a
+fingerprint of the rendered motion.
 
 GCC's default FP contraction emits fused multiply-add on targets such as the
 ESP32-P4, and results then differ from native and wasm builds by a few ULPs.
 
-The engine is single-threaded: every call on one `Engine` comes from one
-task. `commit()` nests KB-scale Ruckig temporaries, so the task that calls it
-needs a deep stack; measure its high-water mark before shrinking it.
+The engine is single-threaded: every call on one `Engine` comes from one task.
 
 ## Integration
 
@@ -112,25 +89,23 @@ needs a deep stack; measure its high-water mark before shrinking it.
 point the build at it with one of the forms below, and record the Kinetic
 commit sha in a pin file (Nucleus: `kinetic.pin`; its lint fails when the
 checkout's HEAD is not the pin). Changes are made in Kinetic first; the pin is then updated.
-Kinetic² needs only `include/`; the Ruckig library below is Kinetic 1's.
 
-**Vendor it**: copy `include/`, `third_party/ruckig/`, `LICENSE` and
-`NOTICE.md` into your tree. Never edit the copy.
+**Vendor it**: copy `include/`, `LICENSE` and `NOTICE.md` into your tree.
+Never edit the copy.
 
-**PlatformIO**: both directories are libraries.
+**PlatformIO**:
 
 ```ini
 build_flags = -std=gnu++2b -ffp-contract=off
 lib_deps =
     symlink://../Kinetic
-    symlink://../Kinetic/third_party/ruckig
 ```
 
 **CMake**:
 
 ```cmake
 add_subdirectory(Kinetic)
-target_link_libraries(app PRIVATE kinetic::kinetic)
+target_link_libraries(app PRIVATE kinetic::kinetic2)
 ```
 
 Requires C++20 (`library.json` builds as gnu++2b).
@@ -144,64 +119,48 @@ ctest --test-dir build --output-on-failure
 ```
 
 Every kinematic assertion samples the produced trajectory on a 1 ms grid
-and checks those samples against the ceilings.
+and checks those samples against the ceilings. `bench_kinetic2` prints the
+solver's cost per submit and is not a test.
 
 ## WebAssembly
 
-`wasm/` builds the engine alone behind a small C ABI (`wasm/kinetic_wasm.h`):
-create with mm limits over a rail, set the window, submit a segment in mm,
-step the handle's clock, read a 64-byte sample.
+`wasm/` builds Kinetic² behind a small C ABI (`wasm/kinetic2_wasm.h`).
 
 ```
 emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-wasm
 ```
 
-Output `build-wasm/wasm/kinetic.wasm`: standalone, zero imports, no JS glue.
-
-```js
-const { instance } = await WebAssembly.instantiate(bytes, {});
-const k = instance.exports;
-k._initialize();
-const h = k.kinetic_create(1000, 40000, 5e6, 100);   // mm/s, mm/s², mm/s³, rail mm
-k.kinetic_set_window(h, 20, 80);
-k.kinetic_submit_segment(h, 50, 500, NaN, 0, 2);     // 50 mm in 500 ms, quintic
-const out = k.malloc(64);
-k.kinetic_step(h, 0.001, out);                        // layout: kinetic_wasm.h
-```
+Output `build-wasm/wasm/kinetic2.wasm`: standalone, zero imports, no JS glue.
+Create a handle, configure the ceilings and planner options, reset at a
+position, submit knots in window units on your own clock, sample the state at
+a time, read the solved knots and the anomalies. Sampling retires knots the
+clock has passed, so sample with non-decreasing times between resets.
+`playground/` is a browser page over this module.
 
 Nucleus builds a separate module for its offline renderer: this engine wrapped
 in the firmware's motion arbiter (Nucleus `tools/kinetic-wasm/`). That module
 stays in Nucleus.
 
-The same build also produces `build-wasm/wasm/kinetic2.wasm`: Kinetic² behind
-`wasm/kinetic2_wasm.h`. Create a handle, configure the ceilings and planner
-options, reset at a position, submit knots in window units on your own clock,
-sample the state at a time, read the solved knots and the anomalies. Sampling
-retires knots the clock has passed, so sample with non-decreasing times
-between resets. `playground/` is a browser page over this module.
-
 ## Scope
 
-Kinetic plans one axis inside a window it is given. These belong to the
+Kinetic plans motion inside a window it is given. These belong to the
 machine around it, and in OpenValence they live in Nucleus:
 
 - window ownership: homing, the stroke window's physical limits, the clamp
   that is the hard backstop downstream of the planner;
 - arbitration: which source owns motion, ESTOP, pause, power gates;
-- the wire protocol: decoding Valence segments into `Command`s, pacing,
+- the wire protocol: decoding Valence segments into knots, pacing,
   schedule horizons;
 - step generation and the emitter.
 
 ## Versioning
 
-`kinetic::kVersion` (in `kinetic.hpp`) is the version string, matching
-`library.json` and the `vX.Y.Z` tag. The wasm module reports it from
-`kinetic_version()` as `"kinetic X.Y.Z"`.
+`kinetic2::kVersion` (in `include/kinetic2/types.hpp`) is the planner's
+version string; the wasm module reports it from `kinetic2_version()` as
+`"kinetic2 X.Y.Z"`. `library.json` carries the repository release, tagged
+`vX.Y.Z`.
 
 ## License
 
 Apache-2.0, see `LICENSE` and `NOTICE.md`.
-
-Built on [Ruckig](https://github.com/pantor/ruckig) Community Version by Lars
-Berscheid (MIT), vendored unmodified.
