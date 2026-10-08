@@ -1479,6 +1479,11 @@ static const float kRailBandP[] = { 0.85, 0.77, 0.7, 0.72, 0.96, 0.04, 0.32, 0.3
 static const float kRailBandDp[] = { 0, 0, 0, 0, -0.23055542, 0.454951787, 0.170429565, 0.150100493 };
 static const unsigned char kRailBandInfeasible[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
+static const unsigned kPchipMonoT[] = { 0, 140, 456, 557, 678, 710, 769, 838 };
+static const float kPchipMonoP[] = { 0.74, 0.85, 0.85, 0.78, 0.02, 0.44, 0.99, 0.88 };
+static const float kPchipMonoDp[] = { 0, 0, 0, 0, 0.202176514, -0.156600515, -0.529950387, -0.209975193 };
+static const unsigned char kPchipMonoInfeasible[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
 static const Case kCases[] = {
     { "sample", 10, 500, 50000, 23, kSampleT, kSampleP, kSampleDp, kSampleInfeasible, 6201, kSampleMs },
     { "figure", 6.66666667, 333.333333, 33333.3333, 5, kFigureT, kFigureP, kFigureDp, kFigureInfeasible, 801, kFigureMs },
@@ -1490,6 +1495,7 @@ static const Case kCases[] = {
 static const Case kRenderCases[] = {
     { "rail_caps", 11.8, 475, 25300, 10, kRailCapsT, kRailCapsP, kRailCapsDp, kRailCapsInfeasible, 0, nullptr },
     { "rail_band", 9.6, 50, 45700, 8, kRailBandT, kRailBandP, kRailBandDp, kRailBandInfeasible, 0, nullptr },
+    { "pchip_mono", 7.486, 143, 68760, 8, kPchipMonoT, kPchipMonoP, kPchipMonoDp, kPchipMonoInfeasible, 0, nullptr },
 };
 
 }  // namespace handles_fixture

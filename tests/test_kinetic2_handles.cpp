@@ -13,9 +13,9 @@
 // - The corner ramps and the origin's lead ramp are the engine's
 //   (engine_piece.hpp, solver.hpp renderRun), and so are the slack passes that
 //   tighten a piece's ceilings by what those ramps cost it: the model has none
-//   of them, so they are the one allowance. The rail-rule cases
-//   (kRenderCases) are held to the renderer alone: the slack passes move them
-//   past that allowance.
+//   of them, so they are the one allowance. The renderer-only cases
+//   (kRenderCases: the rail rules, the monotone judge) are held to the
+//   renderer alone: the slack passes move them past that allowance.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest/doctest.h"
 
