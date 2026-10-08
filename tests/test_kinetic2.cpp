@@ -855,40 +855,38 @@ TEST_CASE("a spent 60 Hz stream stays continuous, refuses nothing, drops nothing
         CHECK(r.worst_jump <= 0.0f);
         CHECK(r.refused == 0);
         CHECK(r.dropped == 0);
-        // The stream's corners are infeasible on purpose (instant starts and
-        // stops): amplitude gives, time never (kin-y6e). No sample is late.
-        CHECK(r.worst_lag_ms == 0.0f);
+        // Samples carry position only (operator ruling 2026-10-08, kin-j6g):
+        // a run of samples renders as the fastest legal move to rest on the
+        // newest, re-planned as each lands, never a Bezier, never trimmed.
+        // A stream faster than its ceilings lands late by what the physics
+        // needs, never short: nothing is over a ceiling and nothing reports.
+        CHECK(r.worst_lag_ms <= 250.0f);
         CHECK(r.pk.v <= 2.5f * 1.001f);
         CHECK(r.pk.a <= 125.0f * 1.001f);
+        CHECK(r.pk.j <= 5000.0f * 1.001f);
         CHECK(r.pk.lo >= -1e-3f);
         CHECK(r.pk.hi <= 1.0f + 1e-3f);
-        // A corner ramp with no room in a 16.7 ms span leaves a jerk step;
-        // it is reported, never silent.
-        CHECK((r.pk.j <= 5000.0f * 1.001f || r.over > 0));
-        CHECK(r.over <= 2);
-        // Constraint: a spent stream's newest sample is due as its successor
-        // arrives, so it is committed through as the rest end it was rendered
-        // as: the carriage stops at every sample, trimmed toward the one
-        // before, and creeps (it ends inside the swing, short of the last
-        // sample: 246 of 309 mm as of 2026-10-07). Measured: a longer
-        // latency does not track either (40 ms ends at 248 mm, 50 ms at 300
-        // mm with 70 jerk-step reports); the newest sample keeping its
-        // secant (RFC-105 (a), the old sampler) tracks to 331 mm but breaks
-        // every ceiling. Whether a sample trims like a segment, keeps a late
-        // placement or keeps the secant is an owed ruling (kin-y6e).
-        CHECK(r.end_p >= 0.6f - 1e-3f);
-        CHECK(r.end_p <= 0.9f + 1e-3f);
+        CHECK(r.over == 0);
+        // The chase lands on the last sample once the stream stops.
+        CHECK(r.end_p == doctest::Approx(last).epsilon(1e-2));
     }
 }
 
-TEST_CASE("a lone far sample from rest is trimmed on time and held, never dropped or late") {
+TEST_CASE("a lone far sample from rest is the fastest legal move to it: late, never trimmed, never dropped") {
     for (Policy policy : {Policy::Stretch, Policy::Blend}) {
         CAPTURE(int(policy));
         Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f}; cfg.policy = policy;
         Engine<> e(cfg, 0.5f);
         REQUIRE(e.submit(knotFromSample(0.75f, 0, 16667), 0));
         const Solved o = e.solved(0, 0);
-        CHECK(onTime(o));
+        // Samples carry position only (operator ruling 2026-10-08, kin-j6g):
+        // the sample renders as Profile::point from rest to rest on it, which
+        // 0.25 of the window in 16.7 ms cannot be, so it lands when the fastest
+        // legal move lands (stretched, like a HARD knot) and is never trimmed.
+        CHECK(o.hard);
+        CHECK(!onTime(o));
+        CHECK(o.stretched_s > 0.0f);
+        CHECK(knotP(o) == doctest::Approx(0.75f).epsilon(1e-5));
         const auto s = sweep(e, 0, 2000 * kMs);
         float worst_jump = 0.0f, peak = 0.0f;
         for (size_t i = 1; i < s.size(); ++i) {
@@ -896,22 +894,21 @@ TEST_CASE("a lone far sample from rest is trimmed on time and held, never droppe
             worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
             peak = std::max(peak, s[i].p);
         }
-        int dropped = 0; Anomaly a;
-        while (e.popAnomaly(a)) if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++dropped;
-        MESSAGE("policy ", int(policy), " reached ", peak * 400.0f, " mm, end ", s.back().p * 400.0f, " mm, jump ", worst_jump * 400.0f);
+        int dropped = 0, trimmed = 0; Anomaly a;
+        while (e.popAnomaly(a)) {
+            if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++dropped;
+            if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++trimmed;
+        }
+        MESSAGE("policy ", int(policy), " lands ", o.stretched_s * 1000.0f, " ms late, peak ", peak * 400.0f, " mm, jump ", worst_jump * 400.0f);
         CHECK(dropped == 0);
+        CHECK(trimmed == 0);
         CHECK(worst_jump <= 0.0f);
-        // A sample renders and trims like any knot (kin-y6e): 0.25 of the
-        // window in 16.7 ms gives amplitude toward the start, on time, and
-        // the curve rests at the trimmed height under every ceiling.
         const Peaks pk = peaksOf(s);
         CHECK(pk.v <= cfg.limits.vmax * 1.001f);
         CHECK(pk.a <= cfg.limits.amax * 1.001f);
         CHECK(pk.j <= cfg.limits.jmax * 1.001f);
         CHECK(peak <= 0.75f + 1e-4f);
-        CHECK(peak > 0.5f);
-        CHECK(s[17].p == doctest::Approx(knotP(o)).epsilon(1e-4));
-        CHECK(s.back().p == doctest::Approx(knotP(o)).epsilon(1e-4));
+        CHECK(s.back().p == doctest::Approx(0.75f).epsilon(1e-4));
         CHECK(s.back().v == 0.0f);
     }
 }

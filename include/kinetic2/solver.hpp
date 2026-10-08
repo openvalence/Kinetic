@@ -486,6 +486,45 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
     }
 }
 
+// ---- CHASE: samples ------------------------------------------------------------
+// A sample carries position only (operator ruling 2026-10-08, kin-j6g): a run
+// of samples renders as ONE fastest legal move from s to rest on the newest
+// of them (Profile::point, no hold), never a Bezier, never trimmed. The
+// earlier samples of the run are passed wherever the profile is at their
+// times; the newest lands at its time, or at the profile's end when that is
+// later (stretched, like a HARD knot). Each new sample re-plans the run from
+// the live origin, so a stream in motion never reaches the rest. False when
+// the profile is full or leaves the window: the run then renders as knots.
+inline bool chaseRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, const handles::Cfg& c, Solved* out) {
+    const Knot& last = kn[cnt - 1];
+    float fastest = 0.0f;
+    const Profile pr = Profile::point(s, last.p, s_us, c.lim, 0.0f, &fastest);
+    const float ratio = pr.n < 0 ? kIllegal : pr.worstRatio(c.lim, c.lo, c.hi);
+    if (!(ratio <= 1.0001f)) return false;
+    const uint64_t end_us = pr.n > 0 ? pr.end_us() : s_us;
+    uint64_t prev_us = s_us;
+    for (size_t r = 0; r < cnt; ++r) {
+        const Knot& K = kn[r];
+        Solved& o = out[r];
+        o = Solved{};
+        o.base_us = K.t_us;
+        o.knot_p = K.p;
+        o.hard = true;
+        o.ramp = pr;
+        o.worst = ratio;
+        const bool newest = r + 1 == cnt;
+        uint64_t t_us = K.t_us > prev_us + kMinSpanUs ? K.t_us : prev_us + kMinSpanUs;
+        if (newest && end_us > t_us) t_us = end_us;
+        o.t_us = t_us;
+        o.stretched_s = newest && end_us > K.t_us ? float(end_us - K.t_us) * 1e-6f : 0.0f;
+        const State st = pr.n > 0 ? pr.atSeconds(float(t_us - s_us) * 1e-6f) : State{s.p, 0.0f, 0.0f};
+        o.p = st.p; o.v = st.v; o.a = st.a;
+        if (newest || t_us >= end_us) { o.p = last.p; o.v = 0.0f; o.a = 0.0f; }
+        prev_us = t_us;
+    }
+    return true;
+}
+
 // ---- the solver --------------------------------------------------------------
 // knots[0..n) pending, in time order; origin is the state the first piece
 // starts from. Writes out[0..n) and reports every trim, every infeasible piece
@@ -510,6 +549,17 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
     uint64_t s_us = origin_us;
     size_t i = 0;
     while (i < n) {
+        if (knots[i].sample && !knots[i].has_v) {
+            // A run of position-only samples: the chase.
+            size_t j = i + 1;
+            while (j < n && j - i < kWindowKnots && knots[j].sample && !knots[j].has_v) ++j;
+            if (chaseRun(s, s_us, knots + i, j - i, c, out + i)) {
+                s = State{out[j - 1].p, 0.0f, 0.0f};
+                s_us = out[j - 1].t_us;
+                i = j;
+                continue;
+            }
+        }
         if (junctionOf(knots[i]) == Junction::Hard && hardKnot(s, s_us, knots[i], c, out[i])) {
             s = State{out[i].p, 0.0f, 0.0f};
             s_us = out[i].t_us;

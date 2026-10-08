@@ -431,7 +431,10 @@ private:
             // newest free knot: committed through, it stays the rest end it
             // was rendered as, and a stream would stop at every knot.
             const uint64_t span = k0.base_us > a.origin_us ? k0.base_us - a.origin_us : 0;
-            const bool fixed = (a.tl.at(0).has_v || a.tl.size() > 1) && k0.base_us <= tr + span / 2;
+            // Never a chased sample: committed through, the stream would come
+            // to its rest at every sample instead of re-planning toward the newest.
+            const bool chased = a.tl.at(0).sample && !a.tl.at(0).has_v;
+            const bool fixed = !chased && (a.tl.at(0).has_v || a.tl.size() > 1) && k0.base_us <= tr + span / 2;
             if (k0.t_us <= tr + 1000 || k0.base_us <= tr + 1000 || fixed) {
                 // Commit through the knot: its piece is kept whole.
                 a.committed = a.piece;
