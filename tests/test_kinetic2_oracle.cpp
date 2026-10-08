@@ -47,7 +47,30 @@ TEST_CASE("brake: Kinetic² stops in the same time Ruckig does, from the same st
     CHECK(t_ours >= t_ruckig * 0.95f);
 }
 
-TEST_CASE("park: a rest-to-rest quintic at the analytic minimum time against Ruckig's optimum") {
+// Kinetic²'s park renders a rest-to-rest piece (kin-y6e): it is whole when
+// the knot is reached untrimmed at its time with no anomaly, every 1 ms sample
+// inside the ceilings. The oracle compares sampled reality, not the renderer's
+// internals: the least whole time is found by rendering.
+static bool parkWhole(float V, float A, float J, float d, uint64_t t_us) {
+    kinetic2::Config cfg; cfg.limits = {V, A, J};
+    kinetic2::Engine<> k2(cfg, 0.05f);
+    kinetic2::Knot k; k.t_us = t_us; k.p = 0.05f + d; k.has_v = true; k.v = 0.0f; k.family = kinetic2::Family::C2;
+    if (!k2.submit(k, 0)) return false;
+    float vpk = 0, apk = 0, jpk = 0, a_prev = 0, p_end = 0;
+    // From rest (a = 0 before the first sample) through the hold after the knot.
+    for (uint64_t t = 0; t <= k.t_us + 50 * kMs; t += kMs) {
+        const auto s = k2.stateAt(0, t);
+        vpk = std::fmax(vpk, std::fabs(s.v)); apk = std::fmax(apk, std::fabs(s.a));
+        jpk = std::fmax(jpk, std::fabs(s.a - a_prev) / 1e-3f);
+        a_prev = s.a;
+        if (t == k.t_us) p_end = s.p;
+    }
+    kinetic2::Anomaly an; int spent = 0;
+    while (k2.popAnomaly(an)) ++spent;
+    return spent == 0 && vpk <= V * 1.001f && apk <= A * 1.001f && jpk <= J * 1.001f && std::fabs(p_end - k.p) <= 1e-4f;
+}
+
+TEST_CASE("park: the least time a rest-to-rest stroke renders whole against Ruckig's optimum") {
     const float V = 3.0f, A = 30.0f, J = 500.0f;
     const float strokes[] = {0.05f, 0.2f, 0.5f, 0.9f};
     for (const float d : strokes) {
@@ -56,26 +79,17 @@ TEST_CASE("park: a rest-to-rest quintic at the analytic minimum time against Ruc
         REQUIRE(k1.commit(pt, 0));
         const float t_ruckig = k1.snapshot(0).duration_s;
         REQUIRE(t_ruckig > 0.0f);
-        // Kinetic²'s park: the least time a rest-to-rest quintic is legal under each ceiling.
-        const float t_quintic = std::fmax(std::fmax(1.875f * d / V, std::sqrt(5.7735f * d / A)), std::cbrt(60.0f * d / J));
-        // And prove it legal by rendering it.
-        kinetic2::Config cfg; cfg.limits = {V, A, J};
-        kinetic2::Engine<> k2(cfg, 0.05f);
-        kinetic2::Knot k; k.t_us = uint64_t(t_quintic * 1e6f) + 1000; k.p = 0.05f + d; k.has_v = true; k.v = 0.0f; k.family = kinetic2::Family::C2;
-        REQUIRE(k2.submit(k, 0));
-        float vpk = 0, apk = 0;
-        for (uint64_t t = 0; t <= k.t_us; t += kMs) { const auto s = k2.stateAt(0, t); vpk = std::fmax(vpk, std::fabs(s.v)); apk = std::fmax(apk, std::fabs(s.a)); }
-        CHECK(vpk <= V * 1.01f);
-        CHECK(apk <= A * 1.01f);
-        kinetic2::Anomaly an; int spent = 0;
-        while (k2.popAnomaly(an)) ++spent;
-        CHECK(spent == 0);
-        const float ratio = t_quintic / t_ruckig;
-        MESSAGE("park d=" << d << ": ruckig " << t_ruckig << " s, quintic " << t_quintic << " s, ratio " << ratio);
-        // The pinned gap. A quintic cannot beat the time-optimal profile and
-        // should not cost more than this; if it does, the park-profile option
-        // in RFC-105 earns its place.
+        // Kinetic²'s park: from half the third-length cubic's analytic
+        // minimum, up in 1 percent steps to the first whole time.
+        const float t_cubic = std::fmax(std::fmax(1.5f * d / V, std::sqrt(6.0f * d / A)), std::cbrt(12.0f * d / J));
+        float t_k2 = 0.5f * t_cubic;
+        while (!parkWhole(V, A, J, d, uint64_t(t_k2 * 1e3f) * kMs) && t_k2 < 4.0f * t_cubic) t_k2 *= 1.01f;
+        REQUIRE(t_k2 < 4.0f * t_cubic);
+        const float ratio = t_k2 / t_ruckig;
+        MESSAGE("park d=" << d << ": ruckig " << t_ruckig << " s, cubic " << t_cubic << " s, whole at " << t_k2 << " s, ratio " << ratio);
+        // The pinned gap. Nothing legal beats the time-optimal profile; if the
+        // gap grows past the pin, a park profile earns its place (RFC-105).
         CHECK(ratio >= 0.99f);
-        CHECK(ratio <= 1.9f);
+        CHECK(ratio <= 1.15f);   // measured 1.025 to 1.084 (2026-10-07)
     }
 }

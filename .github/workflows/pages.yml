@@ -31,7 +31,7 @@ jobs:
         run: |
           mkdir site
           cp -r playground/. site/
-          rm site/check.mjs site/README.md
+          rm site/check.mjs site/handles.check.mjs site/README.md
           cp build-wasm/wasm/kinetic2.wasm site/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

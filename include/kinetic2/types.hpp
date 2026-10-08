@@ -29,11 +29,11 @@ struct Limits {
 };
 
 // ---- Policy -----------------------------------------------------------------
-// What to spend when the ceilings cannot honor a knot in its time. Decided over
-// the whole lookahead window (RFC-105 promise 3), never per segment.
+// Not read by Kinetic²: time never gives, amplitude does (kin-y6e). The
+// ordinals are wire-pinned (NVS, the catalog select) and stay.
 enum class Policy : uint8_t {
-    Stretch = 0,   // keep the stroke, move the knot (spends duration)
-    Blend   = 5,   // keep the deadline, trim amplitude down to its floor
+    Stretch = 0,
+    Blend   = 5,
 };
 
 // ---- Curve family (mirrors the Valence registry `curve_families`) -----------
@@ -58,13 +58,15 @@ struct Knot {
     float    v      = 0.0f;     // window units/s, meaningful when has_v
     bool     has_v  = false;
     Family   family = Family::Unspecified;
-    // A sample (sources.hpp): its deadline is soft. It is never trimmed, only
-    // stretched, and a stretch moves this knot alone; later samples keep their
-    // own times and catch up (Kinetic 1 chased samples time-optimally).
+    // A sample (sources.hpp): rendered as any knot at its own time, trimmed
+    // like one; a HARD sample (a live jog, junctionOf) is the one knot that
+    // may land after its time.
     bool     sample = false;
-    // A segment without an end velocity rests when nothing follows it (SPEC
-    // 9.6); a successor frees it. A sample never sets it: a stream's newest
-    // sample has a successor on the way.
+    // Accepted and not read: the handle renderer rests every newest knot
+    // without an authored velocity (SPEC 9.6) until its successor frees it,
+    // whatever this says. sources.hpp still sets it for a segment without an
+    // end velocity; whether a sample keeps a non-rest angle is the owed
+    // samples ruling (kin-y6e, consumers kin-ebc).
     bool     rest_if_last = false;
 };
 
@@ -82,7 +84,8 @@ constexpr Junction junctionOf(const Knot& k) {
 // ---- Corner (RFC-105 planner option `corner`) --------------------------------
 // How an AUTHORED C1 knot renders. Cubic is the default: the machine matches
 // the author's curve (operator ruling 2026-10-07); Continuous stays as the
-// option.
+// option. The handle renderer (solver.hpp) does not read it: every knot
+// renders the Cubic way until kin-tnv maps the option onto the renderer.
 enum class Corner : uint8_t {
     Continuous = 0,  // the junction acceleration is smoothed through
     Cubic      = 1,  // each side keeps the author's cubic acceleration, joined
@@ -96,8 +99,12 @@ enum class Corner : uint8_t {
 // 2026-10-05); the default is the behavior the bench says is optimal.
 struct Config {
     Limits  limits{};
+    // policy, amplitude_floor and corner are not read by the handle renderer:
+    // time never gives, a trim may take the whole chord, and every G1 knot
+    // takes the corner ramp (Corner::Continuous is a no-op). They stay for
+    // the ABI and the catalog until kin-tnv maps or retires them.
     Policy  policy          = Policy::Blend;
-    float   amplitude_floor = 0.25f;   // Blend never trims a stroke below this share of it
+    float   amplitude_floor = 0.25f;
     uint32_t lookahead_us   = 250000;  // how far past now the solver considers knots
     Corner  corner          = Corner::Cubic;
     // A knot arriving while the axis moves re-plans from the state this far
@@ -107,57 +114,44 @@ struct Config {
     // measured: 6 ms pieces spiraled into reversals, a committed knot froze a
     // start-up velocity into every later piece).
     uint32_t react_us       = 4000;
-    // THE LATENESS BUDGET: how far behind the author's clock the plan may
-    // run before a cubic spend keeps the deadline instead (the stroke cut by
-    // the ratio that binds). A stroke the ceilings refuse is rendered whole
-    // and late (saturated at the speed ceiling, or dilated), the lateness
-    // carried by the segments behind it and given back at the next hold; a
-    // passage that asks more than the machine without end would run ever
-    // later, and past this it shortens. Time, not a share of the window: the
-    // window is the operator's preference and never enters. 0: never late.
-    // 100 ms holds a rise of two spans at a fifth over the speed ceiling
-    // (54 ms, measured: the sawtooth's rise whole, its slow fall gives the
-    // time back within three spans), never a passage at twice it, which
-    // shortens on the author's clock from its second stroke: uniform.
+    // Ignored: the handle renderer is never late (time never gives). Kept so
+    // the layout and the catalog stay as they are.
     uint32_t late_budget_us = 100000;
-    // The most work one solve does, the hard bound on its time, in referee
-    // passes (every extremum of one piece; four knots of a junction solve
-    // count as one). Sized for the P4's 1 ms motion tick: unbounded, the
-    // funscript, jog and 60 Hz stream mixes need at most 107, 66 and 23 per
-    // plan and 29, 6 and 4 on average (tests/bench_kinetic2). A knot the
-    // budget does not reach, or cuts, waits for the next tick; only the first
-    // knot of a solve is always finished, with the best legal answer the
-    // budget found, or dropped (PlanFailed, kDetailBudget). A solve may pass
-    // the budget by the judge in flight. 0: unbounded. FIXED BY THE MACHINE,
-    // never a catalog field: the one Config member a client may not tune
-    // (operator ruling 2026-10-06; it is the tick's budget, not a preference).
+    // The most work one solve may do on the motion tick. The handle renderer
+    // renders the whole window and does not read it yet; kin-tnv bounds it
+    // per tick before a Nucleus pin bump. Measured 2026-10-07 on x86 -O2
+    // (bench_kinetic2): a 3-knot funscript plan 0.17 ms mean, 0.47 ms max; a
+    // 60 Hz stream 0.39 ms mean, 1.2 ms max; a 64-knot bundle 5.4 ms; the
+    // P4's float FPU is 10 to 20 times slower. FIXED BY THE MACHINE, never a
+    // catalog field (operator ruling 2026-10-06). 0: unbounded.
     uint32_t solve_budget   = 96;
 };
 
 // ---- Anomaly ----------------------------------------------------------------
 // One event per axis spent, so the counts read as a diagnosis. Kinds 0..10 are
 // Kinetic 1's and keep their numbers (several will never be emitted by Kinetic²
-// and stay reserved); new kinds append at 11+.
+// and stay reserved); 11 and 12 are Kinetic²'s, new kinds append at 13+.
 enum class AnomalyKind : uint8_t {
     None              = 0,
-    PlanFailed        = 1,   // the knot was dropped. detail: a sentinel below, or the last attempt's worst ceiling ratio
+    PlanFailed        = 1,   // the knot was dropped. Never emitted by Kinetic² (no knot is dropped); consumers read it as a drop
     SettleEngaged     = 2,   // the timeline ran dry mid-motion: braked to rest. detail = v at engagement
     EndVelClamped     = 3,   // an authored end velocity exceeded vmax or the wall bound. detail = the clamped v
-    DeadlineStretched = 4,   // Stretch moved a knot later. detail = seconds added
+    DeadlineStretched = 4,   // a knot placed late. Never emitted by Kinetic² (time never gives)
     WaveformFallback  = 5,   // reserved (Kinetic 1's Ruckig guard); never emitted
-    WaveformScaled    = 6,   // Blend trimmed amplitude. detail = achieved share 0..1
+    WaveformScaled    = 6,   // a knot trimmed toward its predecessor. detail = the share of its chord kept
     WaveformCentered  = 7,   // retired in Kinetic 1; never emitted
     HandoffBounded    = 8,   // reserved; the solver owns junction velocities, so nothing to bound
     WaveformSmoothed  = 9,   // reserved; never emitted
     DwellZeroed       = 10,  // the same target re-commanded (a hold): its end velocity dropped
     KnotRefused       = 11,  // a knot not accepted onto the timeline. detail: a sentinel below
+    PieceOverCeiling  = 12,  // a piece no trim makes legal renders at its least-over trim. detail = its worst ceiling ratio
 };
 
-// PlanFailed / KnotRefused detail sentinels.
+// KnotRefused detail sentinels.
 inline constexpr float kDetailNonFinite   = -99.0f;
 inline constexpr float kDetailPast        = -95.0f;   // t_us at or before the newest knot
 inline constexpr float kDetailTimelineFull = -96.0f;
-inline constexpr float kDetailBudget       = -97.0f;   // the solve's judge budget ran out before a legal spend
+inline constexpr float kDetailBudget       = -97.0f;   // reserved; never emitted by Kinetic²
 
 struct Anomaly {
     uint8_t  kind   = 0;      // AnomalyKind

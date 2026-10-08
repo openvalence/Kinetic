@@ -25,7 +25,7 @@ constexpr Knot knotFromSample(float p, uint64_t arrival_us, uint32_t latency_us)
     k.p = p;
     k.has_v = false;            // the solver's monotone slope: no overshoot between samples
     k.family = Family::C2;
-    k.sample = true;            // soft deadline: stretched alone, never trimmed
+    k.sample = true;            // renders and trims like any knot (the samples ruling is owed, kin-y6e)
     return k;
 }
 

@@ -29,15 +29,14 @@ struct Rng {
 
 struct Tally {
     const char* name;
-    int plans = 0, refused = 0, dropped = 0, stretched = 0, trimmed = 0;
-    float stretch_s = 0.0f, share_sum = 0.0f;   // Stretch seconds and Blend shares, summed
-    int refused_full = 0, refused_past = 0, failed_budget = 0;
+    int plans = 0, refused = 0, dropped = 0, over = 0, trimmed = 0;
+    float share_sum = 0.0f;   // trim shares, summed
+    int refused_full = 0, refused_past = 0;
     float lag_max_ms = -1.0f, lag_end_ms = 0.0f;   // streams: the newest knot's solved time behind its authored time
-    uint64_t judges = 0, solves = 0, chain = 0, extrema = 0, knots = 0;
-    uint64_t max_judges = 0, max_solves = 0, max_chain = 0, max_extrema = 0, max_knots = 0;
+    uint64_t judges = 0, knots = 0;   // renders (handles::render calls) and knots rendered
+    uint64_t max_judges = 0, max_knots = 0;
     double wall_us = 0.0, max_wall_us = 0.0;
-    uint64_t idle_max_judges = 0;   // a tick with no submit that still solved
-    uint64_t work = 0, max_work = 0, idle_max_work = 0;   // budget units (Config::solve_budget)
+    uint64_t idle_max_judges = 0;   // a tick with no submit that still rendered
     float worst_v = 0.0f, worst_a = 0.0f, worst_j = 0.0f;
     float dev_max_mm = -1.0f, dev_mean_mm = 0.0f, within1 = 0.0f;   // funscript: rendered vs the PCHIP curve
 };
@@ -52,28 +51,20 @@ State plan(Engine<1, 64>& e, Tally& t, uint64_t now, Fn&& submit) {
     const State s = e.stateAt(0, now);
     const auto w1 = std::chrono::steady_clock::now();
     const stats::Counters& c1 = stats::g;
-    const uint64_t dj = c1.judges - c0.judges, ds = c1.solves - c0.solves, dc = c1.chain_knots - c0.chain_knots,
-                   de = c1.extrema - c0.extrema, dk = c1.knots - c0.knots;
+    const uint64_t dj = c1.judges - c0.judges, dk = c1.knots - c0.knots;
     const double us = std::chrono::duration<double, std::micro>(w1 - w0).count();
     ++t.plans;
-    t.judges += dj; t.solves += ds; t.chain += dc; t.extrema += de; t.knots += dk; t.wall_us += us;
+    t.judges += dj; t.knots += dk; t.wall_us += us;
     if (dj > t.max_judges) t.max_judges = dj;
-    const uint64_t dw = c1.work - c0.work;
-    t.work += dw;
-    if (dw > t.max_work) t.max_work = dw;
-    if (ds > t.max_solves) t.max_solves = ds;
-    if (dc > t.max_chain) t.max_chain = dc;
-    if (de > t.max_extrema) t.max_extrema = de;
     if (dk > t.max_knots) t.max_knots = dk;
     if (us > t.max_wall_us) t.max_wall_us = us;
     return s;
 }
 
 State idle(Engine<1, 64>& e, Tally& t, uint64_t now) {
-    const uint64_t j0 = stats::g.judges, w0 = stats::g.work;
+    const uint64_t j0 = stats::g.judges;
     const State s = e.stateAt(0, now);
     if (stats::g.judges - j0 > t.idle_max_judges) t.idle_max_judges = stats::g.judges - j0;
-    if (stats::g.work - w0 > t.idle_max_work) t.idle_max_work = stats::g.work - w0;
     return s;
 }
 
@@ -82,8 +73,7 @@ void drainInto(Engine<1, 64>& e, Tally& t) {
     while (e.popAnomaly(a)) {
         if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++t.dropped;
         if (a.kind == uint8_t(AnomalyKind::KnotRefused)) { ++t.refused; if (a.detail == kDetailTimelineFull) ++t.refused_full; if (a.detail == kDetailPast) ++t.refused_past; }
-        if (a.kind == uint8_t(AnomalyKind::PlanFailed) && a.detail == kDetailBudget) ++t.failed_budget;
-        if (a.kind == uint8_t(AnomalyKind::DeadlineStretched)) { ++t.stretched; t.stretch_s += a.detail; }
+        if (a.kind == uint8_t(AnomalyKind::PieceOverCeiling)) ++t.over;
         if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) { ++t.trimmed; t.share_sum += a.detail; }
     }
 }
@@ -278,14 +268,11 @@ Tally fullWindow(uint32_t budget) {
 
 void print(const Tally& t) {
     const double n = t.plans ? double(t.plans) : 1.0;
-    std::printf("%-17s work/plan max %5llu mean %7.1f (idle tick max %llu)\n", t.name, (unsigned long long)t.max_work, double(t.work) / n, (unsigned long long)t.idle_max_work);
-    std::printf("%-17s plans %4d | judges/plan max %6llu mean %8.1f | solves max %6llu mean %8.1f | chain-knots max %7llu mean %9.1f"
-                " | extrema max %7llu mean %9.1f | knots max %3llu | host us max %8.1f mean %7.1f"
-                " | idle judges max %llu | refused %d (full %d, past %d) dropped %d (budget %d) stretched %d (%.3f s) trimmed %d (mean share %.3f) | peak v %.3f a %.3f j %.3f\n",
-                t.name, t.plans, (unsigned long long)t.max_judges, double(t.judges) / n, (unsigned long long)t.max_solves,
-                double(t.solves) / n, (unsigned long long)t.max_chain, double(t.chain) / n, (unsigned long long)t.max_extrema,
-                double(t.extrema) / n, (unsigned long long)t.max_knots, t.max_wall_us, t.wall_us / n, (unsigned long long)t.idle_max_judges, t.refused, t.refused_full, t.refused_past, t.dropped, t.failed_budget,
-                t.stretched, t.stretch_s, t.trimmed, t.trimmed ? t.share_sum / float(t.trimmed) : 0.0f, t.worst_v, t.worst_a, t.worst_j);
+    std::printf("%-17s plans %4d | renders/plan max %4llu mean %5.1f | knots max %3llu | host us max %8.1f mean %7.1f"
+                " | idle renders max %llu | refused %d (full %d, past %d) dropped %d over %d trimmed %d (mean share %.3f) | peak v %.3f a %.3f j %.3f\n",
+                t.name, t.plans, (unsigned long long)t.max_judges, double(t.judges) / n, (unsigned long long)t.max_knots,
+                t.max_wall_us, t.wall_us / n, (unsigned long long)t.idle_max_judges, t.refused, t.refused_full, t.refused_past,
+                t.dropped, t.over, t.trimmed, t.trimmed ? t.share_sum / float(t.trimmed) : 0.0f, t.worst_v, t.worst_a, t.worst_j);
     if (t.lag_max_ms >= 0.0f) std::printf("%-17s lag: max %.1f ms, at the end %.1f ms\n", "", t.lag_max_ms, t.lag_end_ms);
     if (t.dev_max_mm >= 0.0f) std::printf("%-17s vs PCHIP: max %.2f mm, mean %.3f mm, %.1f%% of ticks within 1 mm\n", "", t.dev_max_mm, t.dev_mean_mm, 100.0f * t.within1);
 }

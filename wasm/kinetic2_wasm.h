@@ -28,19 +28,19 @@ typedef struct kinetic2_state {
     uint8_t  reserved[3]; // zero
 } kinetic2_state;
 
-// One solved knot, 40 bytes: where the curve will pass and what the spend cost.
+// One solved knot, 40 bytes: where the curve will pass and what the trim cost.
 typedef struct kinetic2_knot {
-    double   t_us;        // solved time (Stretch may have moved it later)
+    double   t_us;        // solved time (a corner's ramp end; a live jog may land later)
     float    p;
     float    v;           // the junction velocity the solver chose or kept
     float    a;           // the junction acceleration
-    float    share;       // Blend: the share of the stroke kept, 1 = whole
-    float    stretched_s; // Stretch: seconds added
-    float    worst;       // the incoming piece's worst ceiling ratio after the spend
-    uint8_t  dropped;     // unreachable under every spend: not rendered
+    float    share;       // the share of the stroke a trim kept, 1 = whole
+    float    stretched_s; // a live jog's seconds past its time; else 0
+    float    worst;       // the incoming piece's worst ceiling ratio after the trim
+    uint8_t  dropped;     // always 0: a knot is never dropped
     uint8_t  clamped;     // an authored velocity was cut
-    uint8_t  pin_v;       // junction velocity fixed by a backward relaxation
-    uint8_t  pin_a;
+    uint8_t  pin_v;       // always 0; ABI field
+    uint8_t  pin_a;       // always 0; ABI field
     uint8_t  reserved[4]; // zero
 } kinetic2_knot;
 
@@ -62,8 +62,9 @@ typedef struct kinetic2_handle kinetic2_handle;
 kinetic2_handle* kinetic2_create(void);
 void kinetic2_destroy(kinetic2_handle* h);
 
-// The planner options (kinetic2::Config). policy: 0 Stretch, 5 Blend.
-// corner: 0 Continuous, 1 Cubic. 1 applied, 0 refused (non-finite or
+// The planner options (kinetic2::Config). policy: 0 Stretch, 5 Blend, and
+// corner: 0 Continuous, 1 Cubic, are validated and kept but not read by the
+// handle renderer (kin-tnv). 1 applied, 0 refused (non-finite or
 // non-positive ceiling, floor outside 0..1, unknown enum). Takes effect at the
 // next submit or reset; the committed curve is never re-planned.
 int kinetic2_configure(kinetic2_handle* h, float vmax, float amax, float jmax,
@@ -76,9 +77,10 @@ void kinetic2_reset(kinetic2_handle* h, float p, double now_us);
 // One knot: the curve passes p at t_us. has_v 0 leaves the junction to the
 // solver; family: 0 unspecified, 1 C1, 2 C2 (C1 with v = 0 is a hard stop).
 // now_us is when the sender submits it: a knot arriving while the axis moves
-// re-plans from the reaction horizon. flags: bit 0 = sample (soft deadline,
-// stretched alone, never trimmed), bit 1 = rest if last (a free knot with
-// nothing after it rests, SPEC 9.6; a successor frees it). 1 accepted, 0
+// re-plans from the reaction horizon. flags: bit 0 = sample (renders and
+// trims like any knot; the samples ruling is owed, kin-y6e), bit 1 = rest if
+// last (accepted and not read: every newest free knot rests until a successor
+// frees it, SPEC 9.6, whatever the bit says; kin-y6e). 1 accepted, 0
 // refused (an anomaly says why: KnotRefused with a detail sentinel from
 // types.hpp).
 int kinetic2_submit(kinetic2_handle* h, double t_us, float p, int has_v, float v,

@@ -15,6 +15,15 @@ target_compile_options(test_kinetic2 PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>)
 add_test(NAME test_kinetic2 COMMAND test_kinetic2)
 
+# Kinetic² against its spec, the handle model. handles_fixture.hpp is
+# generated: `node tests/gen_handles_fixture.mjs` from the Kinetic root.
+add_executable(test_kinetic2_handles test_kinetic2_handles.cpp)
+target_link_libraries(test_kinetic2_handles PRIVATE kinetic::kinetic2)
+target_include_directories(test_kinetic2_handles PRIVATE third_party)
+target_compile_options(test_kinetic2_handles PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>)
+add_test(NAME test_kinetic2_handles COMMAND test_kinetic2_handles)
+
 # Kinetic 1 as the oracle for Kinetic²: the one binary that links both.
 add_executable(test_kinetic2_oracle test_kinetic2_oracle.cpp)
 target_link_libraries(test_kinetic2_oracle PRIVATE kinetic::kinetic kinetic::kinetic2)
