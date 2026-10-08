@@ -11,7 +11,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0x581048b7350bcdeaull   // accepted 2026-10-07 (kin-y6e): the handle renderer (composite Bezier, trims on time, every built piece judged, angles bounded by their spans)
+#define KINETIC2_FINGERPRINT 0x8634649201e3bbefull   // accepted 2026-10-08 (kin-1ir): the corner walk-back stops at its first settled round
 #endif
 
 using namespace kinetic2;
@@ -471,7 +471,7 @@ uint64_t fingerprint(const std::vector<State>& s) {
     return h;
 }
 
-struct Score { int knots = 0, hit = 0, missed = 0, spent = 0, violations = 0, failed = 0, dropped = 0; int why[6] = {}; };
+struct Score { int knots = 0, hit = 0, missed = 0, off = 0, spent = 0, violations = 0, failed = 0, dropped = 0; int why[6] = {}; };
 
 // Random knot sequences: free, authored and hard knots, legal and not, over a
 // random policy and ceilings. Returns the sampled score.
@@ -480,7 +480,8 @@ Score randomRun(uint32_t seed, Policy policy) {
     Config cfg;
     cfg.limits = {r.uni(1.0f, 8.0f), r.uni(10.0f, 200.0f), r.uni(200.0f, 20000.0f)};
     cfg.policy = policy; cfg.amplitude_floor = r.uni(0.05f, 0.4f);
-    Engine<> e(cfg, r.uni(0.0f, 1.0f));
+    const float p0 = r.uni(0.0f, 1.0f);
+    Engine<> e(cfg, p0);
     const int n = 3 + r.pick(20);
     std::vector<Knot> ks;
     uint64_t t = 0;
@@ -523,7 +524,8 @@ Score randomRun(uint32_t seed, Policy policy) {
     sc.dropped = countKind(an, AnomalyKind::PlanFailed);
     sc.spent = countKind(an, AnomalyKind::WaveformScaled);
     // Every knot is passed at its own time, at its solved (trimmed) position.
-    for (const Solved& o : sol) {
+    for (size_t i = 0; i < sol.size(); ++i) {
+        const Solved& o = sol[i];
         if (o.hard) continue;
         // The sample before the knot carried to its exact time.
         const size_t idx = size_t(o.base_us / kMs);
@@ -532,6 +534,11 @@ Score randomRun(uint32_t seed, Policy policy) {
         const float p = s[idx].p + s[idx].v * dt + 0.5f * s[idx].a * dt * dt;
         if (std::fabs(p - knotP(o)) < 2e-3f) ++sc.hit;
         else if (!o.infeasible) ++sc.missed;
+        // A feasible knot the render did not trim (and not a hold, which
+        // moves with a trim before it) is passed at its authored position:
+        // a corner ramp lands on a reachable knot (kin-1ir).
+        const float prev = i ? ks[i - 1].p : p0;
+        if (!o.infeasible && o.share == 1.0f && std::fabs(ks[i].p - prev) > kHoldEps && std::fabs(p - ks[i].p) >= 2e-3f) ++sc.off;
     }
     // The curve ends at rest.
     if (std::fabs(s.back().v) > 1e-3f) { ++sc.violations; ++sc.why[4]; }
@@ -541,17 +548,17 @@ Score randomRun(uint32_t seed, Policy policy) {
 }  // namespace
 
 TEST_CASE("property: random knot sequences never exceed a ceiling or the window and are never late, under either policy") {
-    int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, knots = 0, failed = 0, dropped = 0, why[6] = {}, withFail = 0, withoutFail = 0;
+    int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, dropped = 0, why[6] = {}, withFail = 0, withoutFail = 0;
     for (uint32_t seed = 1; seed <= 400; ++seed) {
         for (const Policy pol : {Policy::Blend, Policy::Stretch}) {
             const Score sc = randomRun(seed, pol);
-            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; knots += sc.knots; failed += sc.failed; dropped += sc.dropped;
+            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; dropped += sc.dropped;
             for (int w = 0; w < 6; ++w) why[w] += sc.why[w];
             if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
             if (sc.violations && (withFail + withoutFail) <= 6) MESSAGE("seed " << seed << " policy " << int(pol) << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed);
         }
     }
-    MESSAGE(runs << " runs, " << knots << " knots, " << hits << " hit at their time, " << missed << " feasible missed, " << spent << " trimmed, " << failed << " PieceOverCeiling, " << dropped << " PlanFailed, " << violations
+    MESSAGE(runs << " runs, " << knots << " knots, " << hits << " hit at their time, " << missed << " feasible missed, " << off << " untrimmed off their position, " << spent << " trimmed, " << failed << " PieceOverCeiling, " << dropped << " PlanFailed, " << violations
             << " violations (v " << why[0] << ", a " << why[1] << ", j " << why[2] << ", window " << why[3] << ", rest " << why[4] << ", late " << why[5] << "); runs with violations: " << withFail << " reported, " << withoutFail << " silent");
     // Speed, acceleration and the window hold on every run: the angles are
     // bounded by what their spans stop and a trimmed knot's angle by its
@@ -561,17 +568,17 @@ TEST_CASE("property: random knot sequences never exceed a ceiling or the window 
     CHECK(why[3] == 0);
     // Constraint: a G1 knot whose corner ramp has no room in its spans keeps
     // an acceleration step (a 1 ms jerk spike) and is reported
-    // PieceOverCeiling: 44 of 800 runs as of 2026-10-07. Acceptance (c) bars
+    // PieceOverCeiling: 34 of 800 runs as of 2026-10-08. Acceptance (c) bars
     // it; rule 5 as written renders it. Operator ruling owed (kin-y6e).
     CHECK(withoutFail == 0);
-    CHECK(violations <= 44);
+    CHECK(violations <= 34);
     CHECK(dropped == 0);
     CHECK(why[5] == 0);
     CHECK(why[4] == 0);
-    // Constraint: a corner ramp that does not end where planned misses its
-    // knot (6 feasible knots under each policy, up to 8% of the window, as of
-    // 2026-10-07; kin-1ir).
-    CHECK(missed <= 12);
+    // A corner ramp passes a reachable knot: its walk-back settles, or keeps
+    // a planned ramp that passes it (kin-1ir).
+    CHECK(missed == 0);
+    CHECK(off == 0);
     CHECK(hits > 0);
 }
 
