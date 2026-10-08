@@ -262,10 +262,11 @@ inline float overOf(const Piece& q, float pStart, const Cfg& c, float stop = INF
     const Coef k = coefOf(q);
     float r[6];
     float pv = 0.0f, pa = 0.0f, pj = 0.0f;
-    // 11 samples of everything first: the early return a legality test wants
-    // and the insurance against a root pair inside one bracket segment.
+    // The ends first, then the middle, then the quarters: a piece over the bar
+    // at an end (where short handles spike the jerk) shows at the first sample.
+    static constexpr float kOrder[11] = {0.0f, 1.0f, 0.5f, 0.2f, 0.8f, 0.4f, 0.6f, 0.1f, 0.9f, 0.3f, 0.7f};
     for (int s = 0; s <= 10; ++s) {
-        const Deriv d = derivAt(k, 0.1f * static_cast<float>(s));
+        const Deriv d = derivAt(k, kOrder[s]);
         pv = std::fmax(pv, std::fabs(vAt(d)));
         pa = std::fmax(pa, std::fabs(aAt(d)));
         pj = std::fmax(pj, std::fabs(jAt(d)));
@@ -626,7 +627,7 @@ inline float roomOver(const Piece& q, const Room& rm, float jmax) {
 }
 
 inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cfg& c, float bound = INFINITY,
-                    const Room* room = nullptr) {
+                    const Room* room = nullptr, int* hint = nullptr) {
     const float floor = std::fmax(kLMin, c.lfloor);
     Cfg cs = c;
     cs.lim.vmax *= R.slack[0];
@@ -657,19 +658,67 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     // model's full walk. The order is the model's (nearest 1 first), so the
     // first legal factor is the same.
     Over parts;
-    Fit f1 = judge(1.0f, INFINITY, &parts);
+    // With a hint the side is known from the last fit: k = 1 is judged with
+    // the early return (its parts are not needed) and the walk stays on that
+    // side.
+    const bool hinted = hint && *hint > 0 && *hint < kKs;
+    Fit f1 = judge(1.0f, hinted ? 1.0f + kTol : INFINITY, hinted ? nullptr : &parts);
     if (f1.legal) return f1;
     if (f1.o < best.o) best = f1;
-    const bool overV = parts.v > 1.0f + kTol || parts.x > 1.0f + kTol;
-    const bool overAJ = parts.a > 1.0f + kTol || parts.j > 1.0f + kTol;
-    const bool roomOver_ = room && f1.o > std::fmax(std::fmax(parts.v, parts.a), std::fmax(parts.j, parts.x)) + kTol;
+    bool overV, overAJ, roomOver_;
+    if (hinted) {
+        overV = ksAt(*hint) < 1.0f; overAJ = !overV; roomOver_ = false;
+    } else {
+        overV = parts.v > 1.0f + kTol || parts.x > 1.0f + kTol;
+        overAJ = parts.a > 1.0f + kTol || parts.j > 1.0f + kTol;
+        roomOver_ = room && f1.o > std::fmax(std::fmax(parts.v, parts.a), std::fmax(parts.j, parts.x)) + kTol;
+    }
     const bool tryDown = !(overAJ && !overV) || roomOver_, tryUp = !(overV && !overAJ) || roomOver_;
-    for (int idx = 1; idx < kKs; ++idx) {
-        const float f = ksAt(idx);
-        if ((f < 1.0f && !tryDown) || (f > 1.0f && !tryUp)) continue;
-        const Fit fs = judge(f, std::fmax(1.0f + kTol, std::fmin(bound, best.o)), nullptr);
-        if (fs.legal) return fs;
+    // A legality test (bound at the tolerance) with no factor able to recover
+    // the excess at k = 1 skips the walk: a factor of at most 2 cuts the jerk
+    // by at most 2^3 on a third-length handle (the floor and the cap bound the
+    // lengths tighter), the acceleration by 2^2; the model walks and finds the
+    // same, every factor over. The least-over search (a wider bound) walks.
+    if (!hinted && bound <= 1.0f + kTol && !roomOver_ && overAJ && !overV && (parts.j > 9.0f || parts.a > 5.0f)) return best;
+    auto onSide = [&](int idx) { const float f = ksAt(idx); return (f < 1.0f && tryDown) || (f > 1.0f && tryUp); };
+    auto step = [&](int idx, int dir) { do { idx += dir; } while (idx > 0 && idx < kKs && !onSide(idx)); return idx; };
+    auto at = [&](int idx) {
+        const Fit fs = judge(ksAt(idx), std::fmax(1.0f + kTol, std::fmin(bound, best.o)), nullptr);
         if (fs.o < best.o) best = fs;
+        return fs;
+    };
+    // A trim's bisection fits the same piece at nearby moves, so the legal
+    // factor moves little between steps: start at the last one (hint), walk
+    // toward 1 while legal, and the last legal factor is the model's first
+    // legal in its order whenever the side's legal factors are one run.
+    if (hint && *hint > 0 && *hint < kKs && onSide(*hint) && tryDown != tryUp) {
+        int h = *hint;
+        Fit fh = at(h);
+        if (!fh.legal) {
+            // The run moved toward 1, or away: look toward 1 first, then away.
+            int j = step(h, -1);
+            while (j > 0 && !(fh = at(j)).legal) j = step(j, -1);
+            if (j <= 0) {
+                j = step(h, +1);
+                while (j < kKs && !(fh = at(j)).legal) j = step(j, +1);
+                if (j >= kKs) return best;
+                *hint = j;
+                return fh;
+            }
+            h = j;
+        }
+        for (int j = step(h, -1); j > 0; j = step(j, -1)) {
+            const Fit fj = at(j);
+            if (!fj.legal) break;
+            fh = fj; h = j;
+        }
+        *hint = h;
+        return fh;
+    }
+    for (int idx = 1; idx < kKs; ++idx) {
+        if (!onSide(idx)) continue;
+        const Fit fs = at(idx);
+        if (fs.legal) { if (hint) *hint = idx; return fs; }
     }
     return best;
 }
@@ -723,12 +772,13 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
         }
         // Under railStop a trimmed knot's angle keeps to its trimmed chord, so
         // the whole trim is a zero stroke at rest.
-        auto fitAt = [&](float pR, float bound) {
+        int hint = 0;   // the trim bisection's last legal factor (fitPiece)
+        auto fitAt = [&](float pR, float bound, bool hinted = false) {
             HKnot Rt = R;
             if (c.railStop && pR != R.p) Rt.vel = bandHold(R.vel, pR - pL, R.t - L.t);
             Room r2 = rm;
             r2.intoFlat = intoFlat && Rt.vel == 0.0f;
-            Fit f = fitPiece(L, Rt, pL, pR, c, bound, c.railStop ? &r2 : nullptr);
+            Fit f = fitPiece(L, Rt, pL, pR, c, bound, c.railStop ? &r2 : nullptr, hinted ? &hint : nullptr);
             f.s1 = Rt.vel;
             return f;
         };
@@ -739,11 +789,11 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
         if (!f.legal && !hold && canTrim) {
             const float dir = (pL > R.p) ? 1.0f : (pL < R.p) ? -1.0f : 0.0f;
             float lo = 0.0f, hi = std::fmin(c.trim, std::fabs(R.p - pL));
-            Fit fh = fitAt(R.p + dir * hi, 1.0f + kTol);
+            Fit fh = fitAt(R.p + dir * hi, 1.0f + kTol, true);
             if (fh.legal) {
                 for (int s = 0; s < 16; ++s) {
                     const float mid = 0.5f * (lo + hi);
-                    const Fit fm = fitAt(R.p + dir * mid, 1.0f + kTol);
+                    const Fit fm = fitAt(R.p + dir * mid, 1.0f + kTol, true);
                     if (fm.legal) { hi = mid; fh = fm; } else { lo = mid; }
                 }
                 f = fh;
