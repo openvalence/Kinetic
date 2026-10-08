@@ -228,7 +228,7 @@ inline float aAt(const Deriv& d) { return d.nA / (d.tp * d.tp * d.tp); }
 inline float jAt(const Deriv& d) { const float t2 = d.tp * d.tp; return d.nJ / (t2 * t2 * d.tp); }
 
 // The roots of f in (0, 1) bracketed on nseg equal segments, each bisected
-// 9 times; a root pair inside one segment is missed, which the caller's
+// four times then two secant steps; a root pair inside one segment is missed, which the caller's
 // sampled maxima cover. Returns the count written to r (at most cap).
 template <typename F>
 inline int rootsOf(F&& f, int nseg, float* r, int cap) {
@@ -237,10 +237,18 @@ inline int rootsOf(F&& f, int nseg, float* r, int cap) {
     for (int s = 1; s <= nseg && n < cap; ++s) {
         const float u1 = static_cast<float>(s) / static_cast<float>(nseg), f1 = f(u1);
         if ((f0 < 0.0f) != (f1 < 0.0f)) {
-            float lo = u0, hi = u1, flo = f0;
-            for (int it = 0; it < 9; ++it) {
+            float lo = u0, hi = u1, flo = f0, fhi = f1;
+            for (int it = 0; it < 4; ++it) {
                 const float mid = 0.5f * (lo + hi), fm = f(mid);
-                if ((fm < 0.0f) == (flo < 0.0f)) { lo = mid; flo = fm; } else hi = mid;
+                if ((fm < 0.0f) == (flo < 0.0f)) { lo = mid; flo = fm; } else { hi = mid; fhi = fm; }
+            }
+            // Two secant steps inside the bracket finish what four halvings started.
+            for (int it = 0; it < 2; ++it) {
+                const float den = fhi - flo;
+                float x = den != 0.0f ? lo - flo * (hi - lo) / den : 0.5f * (lo + hi);
+                if (!(x > lo && x < hi)) x = 0.5f * (lo + hi);
+                const float fx = f(x);
+                if ((fx < 0.0f) == (flo < 0.0f)) { lo = x; flo = fx; } else { hi = x; fhi = fx; }
             }
             r[n++] = 0.5f * (lo + hi);
         }
@@ -265,13 +273,19 @@ inline float overOf(const Piece& q, float pStart, const Cfg& c, float stop = INF
     // The ends first, then the middle, then the quarters: a piece over the bar
     // at an end (where short handles spike the jerk) shows at the first sample.
     static constexpr float kOrder[11] = {0.0f, 1.0f, 0.5f, 0.2f, 0.8f, 0.4f, 0.6f, 0.1f, 0.9f, 0.3f, 0.7f};
+    // Division-free: each ratio is compared as its numerator against the bar
+    // scaled by the matching power of T'(u) (positive on a monotone piece);
+    // the peaks themselves are divided once, after the scan.
+    float mv = 0.0f, ma = 0.0f, mj = 0.0f;   // the sample maxima, as v, a, j
     for (int s = 0; s <= 10; ++s) {
         const Deriv d = derivAt(k, kOrder[s]);
-        pv = std::fmax(pv, std::fabs(vAt(d)));
-        pa = std::fmax(pa, std::fabs(aAt(d)));
-        pj = std::fmax(pj, std::fabs(jAt(d)));
-        if (pv > sv || pa > sa || pj > sj) return 2.0f * stop;
+        const float t2 = d.tp * d.tp, t3 = t2 * d.tp, t5 = t3 * t2;
+        const float av = std::fabs(d.pp), aa = std::fabs(d.nA), aj = std::fabs(d.nJ);
+        if (av > sv * d.tp || aa > sa * t3 || aj > sj * t5) return 2.0f * stop;
+        const float v = av / d.tp, a = aa / t3, j = aj / t5;
+        mv = std::fmax(mv, v); ma = std::fmax(ma, a); mj = std::fmax(mj, j);
     }
+    pv = mv; pa = ma; pj = mj;
     // Then each peak exactly: |v| where a = 0 (nA, a cubic), |a| where j = 0
     // (nJ, a quartic), |j| where dj/du = 0 (a quintic).
     int n = rootsOf([&](float u) { return derivAt(k, u).nA; }, 6, r, 3);
