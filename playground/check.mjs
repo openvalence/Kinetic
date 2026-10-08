@@ -96,7 +96,7 @@ s = await settle(s.replays);
 await page.click('#opts button:text("Stretch")');
 s = await settle(s.replays);
 ceilings('overreach-stretch', s);
-check(s.knots[0].solved && s.knots[0].solved.stretched > 0, `overreach-stretch: knot stretched ${(s.knots[0].solved?.stretched * 1000).toFixed(1)} ms`);
+check(s.knots[0].solved && s.knots[0].solved.stretched === 0, `overreach-stretch: time never gives, knot stretched ${(s.knots[0].solved?.stretched * 1000).toFixed(1)} ms`);
 await page.screenshot({ path: join(shots, 'overreach-stretch.png') });
 await page.click('#opts button:text("Blend")');
 s = await settle(s.replays);
