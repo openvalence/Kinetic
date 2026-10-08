@@ -285,9 +285,12 @@ float overshoot(const std::vector<handles::HKnot>& k) {
 TEST_CASE("smoothness 0 and 1 render the pchip and smooth styles bit for bit") {
     // Captured 2026-10-08 at Kinetic 7f7330d, before smoothness replaced the
     // style: handles::Cfg::style Pchip and Smooth for the bare render, the
-    // solver's style constant Pchip and Smooth for the engine.
+    // solver's style constant Pchip and Smooth for the engine. The bare smooth
+    // hash moved with kin-rfw7: a smooth solve's lengths walk both sides of
+    // 1, and rail_caps now trims as the model does at smoothness 1 (before, a
+    // piece the model fits was left over jmax).
     CHECK(bareHash(0.0f) == 0x90be372cb59f2f2cull);
-    CHECK(bareHash(1.0f) == 0xe4b902466793fd10ull);
+    CHECK(bareHash(1.0f) == 0x4dee79f44fd096efull);
     CHECK(engineHash(0.0f) == 0xeaac327e48cc9b5aull);
     CHECK(engineHash(1.0f) == 0x49020dae2040542eull);
 }

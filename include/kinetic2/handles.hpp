@@ -13,9 +13,10 @@
 //   points (the roots of the next derivative's numerator, bracketed and
 //   bisected), about 150 polynomial evaluations against the model's 161 full
 //   samples; a legality test stops at the first sample over the bar, the
-//   length walk skips the side of 1 that cannot help, and a piece whose inputs
-//   did not change is not judged again (HKnot memo). A bound on the render's
-//   work belongs in the solver, never this file.
+//   length walk skips the side of 1 that cannot help (lengths of a third
+//   only), and a piece whose inputs did not change is not judged again
+//   (HKnot memo). A bound on the render's work belongs in the solver, never
+//   this file.
 // - The model carries Cfg::trimLast and Cfg::railStop (kin-88m): under
 //   railStop both hold a trimmed knot's angle to its trimmed chord, cap an
 //   angle its span cannot stop, fit the corner ramps' room (Room, aTarget),
@@ -748,7 +749,12 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     if (f1.legal) return f1;
     if (f1.o < best.o) best = f1;
     bool overV, overAJ, roomOver_;
-    if (hinted) {
+    // Constraint: the side rule holds for lengths of a third (every pchip
+    // solve). A smooth solve's lengths can sum past 1, where longer handles
+    // raise the jerk: those walk both sides, as the model does (kin-rfw7).
+    if (L.lOut != kThird || R.lIn != kThird) {
+        overV = overAJ = roomOver_ = true;
+    } else if (hinted) {
         overV = ksAt(*hint) < 1.0f; overAJ = !overV; roomOver_ = false;
     } else {
         overV = parts.v > 1.0f + kTol || parts.x > 1.0f + kTol;

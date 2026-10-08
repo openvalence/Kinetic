@@ -19,6 +19,7 @@ namespace {
 
 constexpr uint64_t kMs = 1000;
 constexpr float kRailMm = 268.0f;
+float g_smoothness = 0.0f;   // Config::smoothness of every scenario (argv[2])
 
 struct Rng {
     uint32_t s;
@@ -98,6 +99,7 @@ Tally funscript(uint32_t budget, bool gentle, const char* name) {
     Tally t{name};
     Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f};
     cfg.solve_budget = budget;
+    cfg.smoothness = g_smoothness;
     Engine<1, 64> e(cfg, 0.5f);
     Rng r(7);
     const int n = 60;
@@ -175,6 +177,7 @@ Tally jogScrub(uint32_t budget, bool live = false) {
     Tally t{live ? "B live jog" : "B jog scrub"};
     Config cfg; cfg.limits = {200.0f / kRailMm, 200.0f / kRailMm, 5.0e6f / kRailMm};
     cfg.solve_budget = budget;
+    cfg.smoothness = g_smoothness;
     Engine<1, 64> e(cfg, 0.5f);
     auto parkUs = [&](float dd) {
         const Limits& L = cfg.limits;
@@ -219,6 +222,7 @@ Tally stream60(uint32_t budget, float amp, const char* name) {
     Tally t{name};
     Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f};
     cfg.solve_budget = budget;
+    cfg.smoothness = g_smoothness;
     Engine<1, 64> e(cfg, 0.5f);
     Peaks pk;
     const uint64_t end = 11000 * kMs;
@@ -251,6 +255,7 @@ Tally fullWindow(uint32_t budget) {
     Tally t{"D 64-knot bundle"};
     Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f};
     cfg.solve_budget = budget;
+    cfg.smoothness = g_smoothness;
     Engine<1, 64> e(cfg, 0.5f);
     Rng r(11);
     Peaks pk;
@@ -282,7 +287,8 @@ void print(const Tally& t) {
 
 int main(int argc, char** argv) {
     const uint32_t budget = argc > 1 ? uint32_t(std::atoi(argv[1])) : Config{}.solve_budget;
-    std::printf("solve_budget %u\n", budget);
+    g_smoothness = argc > 2 ? float(std::atof(argv[2])) : 0.0f;
+    std::printf("solve_budget %u smoothness %g\n", budget, double(g_smoothness));
     print(funscript(budget, false, "A funscript"));
     print(funscript(budget, true, "A gentle"));
     print(jogScrub(budget));

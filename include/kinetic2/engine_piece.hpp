@@ -72,9 +72,10 @@ struct Piece {
 
     // From s0 at t0 to s1 at t1 with the render's handle lengths i0 / i1, both
     // end accelerations matched as match() allows; else a lead ramp, else the
-    // start correction.
+    // start correction. exact: what match() leaves of the start step (under
+    // kStepS) is carried by the start correction too.
     static Piece bezier(uint64_t t0, const State& s0, uint64_t t1, const State& s1, float i0, float i1,
-                        const Limits& L) {
+                        const Limits& L, bool exact = false) {
         Piece pc; pc.start_us = t0; pc.end_us = t1; pc.bez_us = t0; pc.p0 = s0.p;
         if (t1 <= t0) { pc.p0 = s1.p; return pc; }
         handles::Piece q{float(t1 - t0) * 1e-6f, s1.p - s0.p, s0.v, s1.v, i0, i1};
@@ -104,6 +105,8 @@ struct Piece {
                 pc.has_lead = false; pc.lead = Profile{}; pc.bez_us = t0; pc.p0 = s0.p;
             }
             q.da = (pc.has_lead ? pc.lead.end().a : s0.a) - handles::aStartOf(q);
+        } else if (exact) {
+            q.da = s0.a - handles::aStartOf(q);
         }
         pc.q = q; pc.T = q.T;
         return pc;

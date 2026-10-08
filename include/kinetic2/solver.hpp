@@ -85,6 +85,10 @@ struct Solved {
     float    a_in = 0.0f;        // the end acceleration the incoming piece is matched to
     float    knot_p = 0.0f;      // where the curve passes the knot at its time: authored, or trimmed
     bool     missed = false;     // the corner ramp passes the knot off its render (knot_p is where)
+    // The piece into this knot starts on the corner ramp's exit with no
+    // acceleration step (Piece::bezier exact): a step under kStepS beside a
+    // ramp at jmax reads over jmax on the 1 ms grid (kin-rfw7).
+    bool     exact_start = false;
     // HARD junction: `ramp` is the whole move, Profile::point from the state
     // before the knot, landing at rest on it at t_us. CORNER: the piece ends at
     // head (head_us) and `ramp` carries the jerk-limited step; t_us / p / v / a
@@ -147,12 +151,12 @@ inline Piece buildPiece(const State& s, uint64_t s_us, const Solved& k, const Li
         q = Piece::profile(k.ramp);
         q.end_us = k.t_us;
     } else if (k.corner) {
-        q = Piece::bezier(s_us, s, k.head_us, State{k.head.p, k.head.v, k.a_in}, k.i0, k.i1, L);
+        q = Piece::bezier(s_us, s, k.head_us, State{k.head.p, k.head.v, k.a_in}, k.i0, k.i1, L, k.exact_start);
         q.has_tail = true;
         q.tail = k.ramp;
         q.end_us = k.t_us;
     } else {
-        q = Piece::bezier(s_us, s, k.t_us, State{k.p, k.v, k.a_in}, k.i0, k.i1, L);
+        q = Piece::bezier(s_us, s, k.t_us, State{k.p, k.v, k.a_in}, k.i0, k.i1, L, k.exact_start);
     }
     return q;
 }
@@ -353,8 +357,8 @@ inline float withinCeiling(float x, float ceiling) {
 // where the two pieces at a knot differ in acceleration.
 inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, const Knot* kn, const State& s,
                     const handles::Cfg& c, Solved* out) {
-    State st = s;
-    uint64_t st_us = te[0];
+    State st = s, sp = s;   // the state the piece into knot r - 1 started from: sp
+    uint64_t st_us = te[0], sp_us = te[0];
     for (int r = 1; r < m; ++r) {
         const Knot& K = kn[r - 1];
         Solved& o = out[r - 1];
@@ -407,6 +411,24 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, const Kn
         // A corner's exit stays: it is the next piece's own start, reached by
         // the ramp at jmax and judged with it.
         if (!o.corner) { o.v = withinCeiling(o.v, c.lim.vmax); o.a = withinCeiling(o.a, c.lim.amax); }
+        // A start step under kStepS where a corner ramp ends reads over jmax
+        // on the 1 ms grid when the tick before it is near jmax already: the
+        // piece the engine builds carries it exactly, unless that takes the
+        // piece further over a ceiling or out of the window. Above smoothness
+        // 0 only: at 0 it moves the accepted render (kin-rfw7).
+        if (c.smoothness > 0.0f && r > 1 && out[r - 2].corner) {
+            const Piece pl = buildPiece(st, st_us, o, c.lim);
+            const uint64_t back = st_us > sp_us + kMinSpanUs ? st_us - kMinSpanUs : sp_us;
+            if (pl.T > 0.0f && !pl.has_lead && pl.q.da == 0.0f
+                && std::fabs(handles::aStartOf(pl.q) - buildPiece(sp, sp_us, out[r - 2], c.lim).at(back).a)
+                       > c.lim.jmax * handles::kTick * (1.0f + handles::kTol)) {
+                o.exact_start = true;
+                const Piece ex = buildPiece(st, st_us, o, c.lim);
+                o.exact_start = handles::overOf(ex.q, ex.p0, c) <= std::fmax(1.0f + handles::kTol, handles::overOf(pl.q, pl.p0, c));
+            }
+        }
+        sp = st;
+        sp_us = st_us;
         st = State{o.p, o.v, o.a};
         st_us = o.t_us;
     }
@@ -419,6 +441,11 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, const Kn
 // against by its excess and the run renders again, at most kSlackPasses
 // times; what is still over after that is reported PieceOverCeiling.
 inline constexpr int kSlackPasses = 3;
+// Above smoothness 0 the G2 sweeps couple every knot: a ceiling tightened at
+// one knot moves its neighbors' lengths, and the pieces beside it settle over
+// more passes. Constraint: the count is not monotone in what it leaves over;
+// a change re-runs the property suite at every smoothness (kin-rfw7).
+inline constexpr int kSlackPassesSmooth = 8;
 template <typename Report>
 inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, const handles::Cfg& c,
                       Solved* out, size_t base, bool last, Report& report, Workspace& ws) {
@@ -440,7 +467,7 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
         K2_STAT(judges, 1);
         handles::render(k, m, c);
         emitRun(k, te, m, kn, s, c, out);
-        const bool final = pass == kSlackPasses;
+        const bool final = pass == (c.smoothness > 0.0f ? kSlackPassesSmooth : kSlackPasses);
         bool again = false;
         // Only the ceiling that is over tightens; a window excursion tightens
         // all three. A built piece within half the tolerance of a ceiling

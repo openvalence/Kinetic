@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "kinetic2/engine.hpp"
@@ -474,10 +475,11 @@ struct Score { int knots = 0, hit = 0, missed = 0, off = 0, spent = 0, violation
 
 // Random knot sequences: free, authored and hard knots, legal and not, over a
 // random ceilings. Returns the sampled score.
-Score randomRun(uint32_t seed) {
+Score randomRun(uint32_t seed, float smoothness) {
     Rng r(seed);
     Config cfg;
     cfg.limits = {r.uni(1.0f, 8.0f), r.uni(10.0f, 200.0f), r.uni(200.0f, 20000.0f)};
+    cfg.smoothness = smoothness;
     (void)r.uni(0.05f, 0.4f);   // the seeds' sequences stay as accepted
     const float p0 = r.uni(0.0f, 1.0f);
     Engine<> e(cfg, p0);
@@ -548,40 +550,47 @@ Score randomRun(uint32_t seed) {
 }  // namespace
 
 TEST_CASE("property: random knot sequences never exceed a ceiling or the window and are never late") {
-    int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, dropped = 0, junction = 0, why[6] = {}, withFail = 0, withoutFail = 0;
-    for (uint32_t seed = 1; seed <= 400; ++seed) {
-        const Score sc = randomRun(seed);
-        ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; dropped += sc.dropped; junction += sc.junction;
-        for (int w = 0; w < 6; ++w) why[w] += sc.why[w];
-        if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
-        if (sc.violations && (withFail + withoutFail) <= 6) MESSAGE("seed " << seed << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed);
+    // Every set at smoothness 0, 0.25, 0.5, 0.75, 1 and a random value per run
+    // (kin-rfw7): the smooth path is held to the bars pchip is.
+    for (const float set : {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, -1.0f}) {
+        int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, dropped = 0, junction = 0, why[6] = {}, withFail = 0, withoutFail = 0;
+        for (uint32_t seed = 1; seed <= 400; ++seed) {
+            // The random set draws from its own sequence: the knots stay the seed's.
+            const float sm = set >= 0.0f ? set : Rng(seed * 2654435761u).uni(0.0f, 1.0f);
+            const Score sc = randomRun(seed, sm);
+            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; dropped += sc.dropped; junction += sc.junction;
+            for (int w = 0; w < 6; ++w) why[w] += sc.why[w];
+            if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
+            if (sc.violations && (sc.why[0] || sc.why[1] || sc.why[3] || !sc.failed)) MESSAGE("smoothness " << sm << " seed " << seed << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed);
+        }
+        CAPTURE(set);
+        MESSAGE("smoothness " << (set >= 0.0f ? std::to_string(set) : std::string("random per run")) << ": " << runs << " runs, " << knots << " knots, " << hits << " hit at their time, " << missed << " feasible missed, " << off << " untrimmed off their position, " << spent << " trimmed, " << failed << " PieceOverCeiling, " << dropped << " PlanFailed, " << violations
+                << " violations (v " << why[0] << ", a " << why[1] << ", j " << why[2] << ", window " << why[3] << ", rest " << why[4] << ", late " << why[5] << "); runs with violations: " << withFail << " reported, " << withoutFail << " silent; " << junction << " solved knots past vmax or amax");
+        // Speed, acceleration and the window hold on every run: the angles are
+        // bounded by what their spans stop and a trimmed knot's angle by its
+        // trimmed chord, so the whole trim is legal (kin-88m).
+        CHECK(why[0] == 0);
+        CHECK(why[1] == 0);
+        CHECK(why[3] == 0);
+        // No knot hands the next piece or a brake a state past vmax or amax, even
+        // after a piece over a ceiling (kin-554).
+        CHECK(junction == 0);
+        // Constraint: a G1 knot whose corner ramp has no room in its spans keeps
+        // an acceleration step (a 1 ms jerk spike) and is reported
+        // PieceOverCeiling: 17 of 400 runs at smoothness 0 as of 2026-10-08, the
+        // most of any set. Acceptance (c) bars it; rule 5 as written renders it.
+        // Operator ruling owed (kin-y6e).
+        CHECK(withoutFail == 0);
+        CHECK(violations <= 17);
+        CHECK(dropped == 0);
+        CHECK(why[5] == 0);
+        CHECK(why[4] == 0);
+        // A corner ramp passes a reachable knot: its walk-back settles, or keeps
+        // a planned ramp that passes it (kin-1ir).
+        CHECK(missed == 0);
+        CHECK(off == 0);
+        CHECK(hits > 0);
     }
-    MESSAGE(runs << " runs, " << knots << " knots, " << hits << " hit at their time, " << missed << " feasible missed, " << off << " untrimmed off their position, " << spent << " trimmed, " << failed << " PieceOverCeiling, " << dropped << " PlanFailed, " << violations
-            << " violations (v " << why[0] << ", a " << why[1] << ", j " << why[2] << ", window " << why[3] << ", rest " << why[4] << ", late " << why[5] << "); runs with violations: " << withFail << " reported, " << withoutFail << " silent");
-    // Speed, acceleration and the window hold on every run: the angles are
-    // bounded by what their spans stop and a trimmed knot's angle by its
-    // trimmed chord, so the whole trim is legal (kin-88m).
-    CHECK(why[0] == 0);
-    CHECK(why[1] == 0);
-    CHECK(why[3] == 0);
-    // No knot hands the next piece or a brake a state past vmax or amax, even
-    // after a piece over a ceiling (kin-554).
-    MESSAGE(junction << " solved knots past vmax or amax");
-    CHECK(junction == 0);
-    // Constraint: a G1 knot whose corner ramp has no room in its spans keeps
-    // an acceleration step (a 1 ms jerk spike) and is reported
-    // PieceOverCeiling: 17 of 400 runs as of 2026-10-08. Acceptance (c) bars
-    // it; rule 5 as written renders it. Operator ruling owed (kin-y6e).
-    CHECK(withoutFail == 0);
-    CHECK(violations <= 17);
-    CHECK(dropped == 0);
-    CHECK(why[5] == 0);
-    CHECK(why[4] == 0);
-    // A corner ramp passes a reachable knot: its walk-back settles, or keeps
-    // a planned ramp that passes it (kin-1ir).
-    CHECK(missed == 0);
-    CHECK(off == 0);
-    CHECK(hits > 0);
 }
 
 TEST_CASE("fingerprint: the canonical run has not changed bits") {
