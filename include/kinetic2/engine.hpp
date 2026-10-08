@@ -42,6 +42,35 @@ public:
     void resetAt(size_t axis, float p, uint64_t now_us) { resetAxis(axis, p, now_us); }
     void resetAt(float p, uint64_t now_us) { resetAt(0, p, now_us); }
 
+    // The caller's frame moved under the plan (its window units now mean
+    // other positions): `s` is the state at now_us in the new frame. Every
+    // pending knot stays and the window re-solves from s; the curve in
+    // flight, committed or not, is replaced. Nothing pending: the brake from
+    // s while it moves (an explicit brake stays explicit), else a hold. Set
+    // the new frame's limits first: the brake and the solve read them.
+    void reseedAt(size_t axis, const State& s, uint64_t now_us) {
+        Axis& a = _ax[axis];
+        (void)stateAt(axis, now_us);   // retires every knot already due
+        const bool braking = a.explicit_brake && now_us < a.origin_us;
+        const bool moving = std::fabs(s.v) > 1e-6f || std::fabs(s.a) > 1e-6f;
+        a.has_committed = false;
+        a.replan_open = false;
+        a.explicit_brake = false;
+        boundary(a, moving ? s : State{s.p, 0.0f, 0.0f}, now_us);
+        a.piece = Piece::hold(s.p, now_us);
+        a.piece_valid = a.tl.empty();
+        a.n_sol = 0;
+        a.solved_valid = a.tl.empty();
+        if (!braking && !(a.tl.empty() && moving)) return;
+        const Profile pr = Profile::brake(s, now_us, _cfg.limits);
+        if (pr.n == 0) return;
+        if (a.tl.empty()) a.piece = Piece::profile(pr);
+        else { a.committed = Piece::profile(pr); a.has_committed = true; }
+        boundary(a, pr.end(), pr.end_us());
+        a.explicit_brake = braking;
+    }
+    void reseedAt(const State& s, uint64_t now_us) { reseedAt(0, s, now_us); }
+
     const Config& config() const { return _cfg; }
     // The next solve (at the next submit or flush) renders the whole window
     // under it; the curve in flight is not re-solved.

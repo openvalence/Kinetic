@@ -1197,6 +1197,84 @@ TEST_CASE("truncateAfter: a flush at now drops the whole window and hands off at
     CHECK(idle.pending() == 5);
 }
 
+// Nucleus val-17u: a travel-window change mid-stream. The frame moved, so the
+// state in flight is restated in it; the knots are window shares and stay.
+TEST_CASE("reseedAt: the pending knots stay and re-solve from the restated state, continuous, inside the ceilings") {
+    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+    // The new frame: the same millimeters, the window shifted by 0.01 of it.
+    // A shift the ceilings cannot close before the next knot trims the whole
+    // window toward the restated state (time never gives).
+    auto restate = [](const State& s) { return State{s.p - 0.01f, s.v, s.a}; };
+
+    SUBCASE("knots pending") {
+        Engine<> e(cfg, 0.2f);
+        queueRamp(e);
+        (void)sweep(e, 0, 110 * kMs);
+        const uint64_t now = 110 * kMs;
+        const State at = restate(e.stateAt(0, now));
+        const size_t kept = e.pending();
+        e.reseedAt(at, now);
+        CHECK(e.pending() == kept);
+        CHECK(e.isBusy(now));
+        std::vector<State> s{at};
+        for (uint64_t t = now + kMs; t <= 600 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+        CHECK(s[1].p == doctest::Approx(at.p + at.v * 1e-3f).epsilon(1e-3));
+        CHECK(worstJump(s) <= 0.0f);
+        const Peaks pk = peaksOf(s);
+        MESSAGE("reseed at v " << at.v << ": peaks v " << pk.v << " a " << pk.a << " j " << pk.j << ", end " << s.back().p);
+        CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+        CHECK(pk.a <= cfg.limits.amax * 1.001f);
+        CHECK(pk.j <= cfg.limits.jmax * 1.10f);
+        // The last knot is passed at its authored share; the rest after it is
+        // the ramp's own (the same without the reseed).
+        CHECK(pk.hi == doctest::Approx(0.30f).epsilon(1e-4));
+        CHECK(std::fabs(s.back().v) < 1e-4f);
+        const auto an = drain(e);
+        CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
+        CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
+    }
+    SUBCASE("nothing pending, moving: the brake from the restated state") {
+        Engine<> e(cfg, 0.2f);
+        queueRamp(e);
+        (void)sweep(e, 0, 110 * kMs);
+        const uint64_t now = 110 * kMs;
+        REQUIRE(e.truncateAfter(now, now) > 0);
+        while (e.pending() > 0) REQUIRE(e.truncateAfter(now, now) > 0);
+        const State at = restate(e.stateAt(0, now));
+        REQUIRE(std::fabs(at.v) > 0.1f);
+        e.reseedAt(at, now);
+        CHECK(e.pending() == 0);
+        std::vector<State> s{at};
+        for (uint64_t t = now + kMs; t <= 400 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+        CHECK(worstJump(s) <= 0.0f);
+        const Peaks pk = peaksOf(s);
+        CHECK(pk.a <= cfg.limits.amax * 1.001f);
+        CHECK(std::fabs(s.back().v) < 1e-4f);
+        CHECK_FALSE(e.isBusy(400 * kMs));
+        CHECK(e.newest().p == doctest::Approx(s.back().p).epsilon(1e-4));
+    }
+    SUBCASE("an explicit brake stays explicit: a knot before its end is refused") {
+        Engine<> e(cfg, 0.2f);
+        queueRamp(e);
+        (void)sweep(e, 0, 110 * kMs);
+        const uint64_t now = 110 * kMs;
+        e.brake(now);
+        const State at = restate(e.stateAt(0, now));
+        e.reseedAt(at, now);
+        const uint64_t end = e.newest().t_us;
+        REQUIRE(end > now + kMs);
+        CHECK_FALSE(e.submit(knotAt(end - kMs / 2, 0.5f), now + kMs));
+        CHECK(e.submit(knotAt(end + 100 * kMs, 0.5f), now + kMs));
+    }
+    SUBCASE("at rest, nothing pending: a hold at the restated position") {
+        Engine<> e(cfg, 0.2f);
+        e.reseedAt(State{0.35f, 0.0f, 0.0f}, 10 * kMs);
+        CHECK_FALSE(e.isBusy(10 * kMs));
+        CHECK(e.stateAt(0, 50 * kMs).p == doctest::Approx(0.35f));
+        CHECK(e.stateAt(0, 50 * kMs).v == 0.0f);
+    }
+}
+
 // ---- the solve budget (kin-ys0) -------------------------------------------------
 
 TEST_CASE("solve budget: a bundle over the ceilings renders whole, trimmed on time, as the unbounded engine") {
