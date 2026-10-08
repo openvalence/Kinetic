@@ -60,7 +60,13 @@ public:
         // brake is the engine's own guess that nothing follows; a knot proves
         // it wrong, so the engine re-plans from where the carriage is.
         if (a.explicit_brake && k.t_us <= a.origin_us) return refuse(k, now_us, kDetailPast);
-        if (!a.explicit_brake && a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) replanFromBrake(a, now_us);
+        // An explicit brake in flight is kept whole: the knot chains from its
+        // end. Dropped with the piece, the plan stepped to the brake's end (a
+        // jog or a return submitted during a pause brake, kin-v9z).
+        if (a.tl.empty() && a.piece_valid && a.piece.has_tail && now_us < a.piece.end_us) {
+            if (a.explicit_brake) { a.committed = a.piece; a.has_committed = true; }
+            else replanFromBrake(a, now_us);
+        }
         if (a.explicit_brake && now_us >= a.origin_us) a.explicit_brake = false;
         if (a.tl.full()) return refuse(k, now_us, kDetailTimelineFull);
         // An axis at rest has been holding since its origin: the first piece

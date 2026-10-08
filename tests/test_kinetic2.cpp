@@ -1381,6 +1381,130 @@ TEST_CASE("a live jog redirected mid-move replaces the move in flight and turns 
     CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
 }
 
+// ---- a time-giving knot handed motion over its ceilings (kin-v9z, Nucleus val-hlj) ----
+
+namespace {
+
+// Nucleus's factory sets on its arbiter suite's 100 mm window: the input set
+// (1200 mm/s, 100000 mm/s^2, 2e7 mm/s^3) and the jog set (50 mm/s,
+// 200 mm/s^2, the same jerk).
+const Limits kInput{12.0f, 1000.0f, 2.0e5f};
+const Limits kSlowJog{0.5f, 2.0f, 2.0e5f};
+
+// As Nucleus sends a jog: flush at now, then a HARD sample due as soon as
+// possible after the newest knot.
+void jogTo(Engine<>& e, float target, uint64_t now) {
+    (void)e.truncateAfter(now, now);
+    const Knot h = e.newest();
+    Knot k = knotFromSample(target, h.t_us > now ? h.t_us : now, 1000);
+    k.has_v = true; k.family = Family::C1;
+    REQUIRE(e.submit(k, now));
+}
+
+// The bound on anything that starts from s under L: the speed s reaches while
+// its acceleration ramps out at jmax, and its acceleration or the ceiling.
+Peaks reachOf(const State& s, const Limits& L) {
+    Peaks b;
+    b.v = std::fabs(s.v) + (s.a * s.v >= 0.0f ? s.a * s.a / (2.0f * L.jmax) : 0.0f) + 1e-3f;
+    b.a = std::max(std::fabs(s.a), L.amax) * 1.001f;
+    return b;
+}
+
+}  // namespace
+
+TEST_CASE("a live jog handed motion its ceilings cannot stop renders as its profile and lands: it never runs away") {
+    // Nucleus val-hlj: two stream samples a tick apart, a planner tick, then
+    // a Manual jog under the jog set. The state at the hand-off is over every
+    // jog ceiling and its stop leaves the window, so no legal move exists.
+    // The one-tick render it fell back to ended 2000 times over amax, and the
+    // starvation brake from there ran 37 m at 4.7 m/s.
+    Config cfg; cfg.limits = kInput;
+    Engine<> e(cfg, 0.0f);
+    uint64_t now = 1000 * kMs;
+    REQUIRE(e.submit(knotFromSample(1.0f, now, 61 * kMs), now));
+    (void)e.stateAt(0, now);
+    now += kMs;
+    REQUIRE(e.submit(knotFromSample(0.5f, now, 61 * kMs), now));
+    (void)e.stateAt(0, now);   // the planner's tick between the sample and the jog
+    (void)drain(e);
+    e.setLimits(kSlowJog);
+    jogTo(e, 0.9f, now);
+    const Solved o = e.solved(0, 0);
+    CHECK(o.hard);
+    const State h = o.ramp.s0;   // the hand-off: the reaction horizon on the chase
+    REQUIRE(std::fabs(h.v) > kSlowJog.vmax);
+    const float stop = Profile::brake(h, 0, kSlowJog).end().p;
+    REQUIRE(stop > 1.0f);
+    const uint64_t end = o.t_us + 100 * kMs;
+    const auto s = sweep(e, now, end);
+    const Peaks pk = peaksOf(s), b = reachOf(h, kSlowJog);
+    MESSAGE("hand-off v ", h.v, " a ", h.a, ", stop at ", stop, "; peaks v ", pk.v, " a ", pk.a, " p ", pk.lo, "..", pk.hi);
+    // The fastest stop the jog's ceilings allow, then the jog: nothing faster
+    // than the hand-off can reach, nothing past that stop.
+    CHECK(pk.v <= b.v);
+    CHECK(pk.a <= b.a);
+    CHECK(pk.hi <= stop + 1e-3f);
+    CHECK(pk.lo >= -1e-3f);
+    CHECK(worstJump(s) <= 0.0f);
+    CHECK(s.back().p == doctest::Approx(0.9f).epsilon(1e-4));
+    CHECK(s.back().v == 0.0f);
+    CHECK_FALSE(e.isBusy(end));
+    // Over a ceiling, never silent: reported once.
+    float worst = 0.0f;
+    CHECK(countKind(drain(e), AnomalyKind::PieceOverCeiling, &worst) == 1);
+    CHECK(worst > 1.0f);
+}
+
+TEST_CASE("a stream sample under ceilings lowered mid-chase keeps the chase in flight to its rest: it never runs away") {
+    // The chase's own way out of the one-tick render: a re-plan the new
+    // ceilings cannot make is undone, and the chase in flight lands first.
+    Config cfg; cfg.limits = kInput;
+    Engine<> e(cfg, 0.0f);
+    uint64_t now = 1000 * kMs;
+    REQUIRE(e.submit(knotFromSample(1.0f, now, 61 * kMs), now));
+    std::vector<State> s;
+    for (uint64_t end = now + 50 * kMs; now < end; now += kMs) s.push_back(e.stateAt(0, now));
+    REQUIRE(s.back().v > 0.5f * kInput.vmax);
+    e.setLimits({0.25f * kInput.vmax, kInput.amax, kInput.jmax});
+    REQUIRE(e.submit(knotFromSample(0.7f, now, 61 * kMs), now));
+    for (uint64_t end = now + 3000 * kMs; now <= end; now += kMs) s.push_back(e.stateAt(0, now));
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= kInput.vmax * 1.001f);
+    CHECK(pk.a <= kInput.amax * 1.001f);
+    CHECK(pk.hi <= 1.0f + 1e-3f);
+    CHECK(worstJump(s) <= 0.0f);
+    CHECK(s.back().p == doctest::Approx(0.7f).epsilon(1e-4));
+    CHECK(s.back().v == 0.0f);
+    CHECK_FALSE(e.isBusy(now));
+}
+
+TEST_CASE("a stream paused mid-chase, then a jog during the brake: both are profiles, under their ceilings, unreported") {
+    // The other ways a HARD knot follows a sample stream: the pause brake
+    // (input set) and the return or a jog under override (jog set), timed
+    // from the newest knot, which is the brake's end.
+    Config cfg; cfg.limits = kInput;
+    Engine<> e(cfg, 0.0f);
+    uint64_t now = 1000 * kMs;
+    REQUIRE(e.submit(knotFromSample(1.0f, now, 61 * kMs), now));
+    std::vector<State> s;
+    for (uint64_t end = now + 50 * kMs; now < end; now += kMs) s.push_back(e.stateAt(0, now));
+    REQUIRE(s.back().v > 0.5f * kInput.vmax);
+    REQUIRE(e.brake(now));
+    e.setLimits(kSlowJog);
+    jogTo(e, 0.2f, now + kMs);
+    for (uint64_t end = now + 5000 * kMs; now <= end; now += kMs) s.push_back(e.stateAt(0, now));
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= kInput.vmax * 1.001f);
+    CHECK(pk.a <= kInput.amax * 1.001f);
+    CHECK(pk.hi <= 1.0f + 1e-3f);
+    CHECK(worstJump(s) <= 0.0f);
+    CHECK(s.back().p == doctest::Approx(0.2f).epsilon(1e-4));
+    CHECK(s.back().v == 0.0f);
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
+    CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
+}
+
 // ---- a C1 script renders as its author's cubics (kin-7jd) --------------------------
 
 namespace {

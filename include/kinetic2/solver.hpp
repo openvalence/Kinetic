@@ -108,22 +108,32 @@ struct Workspace {
 };
 
 // ---- HARD --------------------------------------------------------------------
-// The fastest legal move from s to rest on the knot (Profile::point); the
-// knot's time is its own, or the profile's end when that is later (a live jog,
-// unreported). False when the profile breaks a ceiling or the window: the knot
-// then renders as any other.
+// The fastest move from s to rest on the knot (Profile::point); the knot's
+// time is its own, or the profile's end when that is later (a live jog,
+// unreported). Always that profile, even over a ceiling or past the window:
+// from a state its ceilings cannot stop inside (a jog handed motion planned
+// under a faster set) it is still the fastest stop they allow, flagged
+// infeasible for the report. Never rendered at its authored time instead: one
+// tick out, that render ended thousands of times over amax and the starvation
+// brake from there ran away (kin-v9z, Nucleus val-hlj). False only for a full
+// profile, which point() never builds (it needs at most eleven phases).
 inline bool hardKnot(const State& s, uint64_t s_us, const Knot& K, const handles::Cfg& c, Solved& o) {
     const uint64_t avail = K.t_us > s_us ? K.t_us - s_us : 0;
     float fastest = 0.0f;
     const Profile pr = Profile::point(s, K.p, s_us, c.lim, float(avail) * 1e-6f, &fastest);
-    const float ratio = pr.n < 0 ? kIllegal : pr.worstRatio(c.lim, c.lo, c.hi);
+    if (pr.n < 0) return false;
+    const float within = pr.worstRatio(c.lim, -1e30f, 1e30f);
+    const float ratio = pr.worstRatio(c.lim, c.lo, c.hi) >= 1e29f ? std::fmax(within, 1.0f + 2.0f * handles::kTol) : within;
     const State end = pr.n > 0 ? pr.atSeconds(pr.duration()) : State{s.p, 0.0f, 0.0f};
-    if (!(ratio <= 1.0001f && std::fabs(end.p - K.p) <= 1e-5f)) return false;
     o = Solved{};
     o.base_us = K.t_us;
     o.t_us = pr.end_us() > K.t_us ? pr.end_us() : K.t_us;
     o.stretched_s = uint64_t(fastest * 1e6f) > avail + 1 ? float(o.t_us - K.t_us) * 1e-6f : 0.0f;
-    o.p = K.p; o.knot_p = K.p; o.hard = true; o.ramp = pr; o.worst = ratio;
+    // Where the profile lands: the knot, or its own end when float bisection
+    // misses it, so the boundary never steps.
+    o.p = std::fabs(end.p - K.p) <= 1e-5f ? K.p : end.p;
+    o.knot_p = K.p; o.hard = true; o.ramp = pr; o.worst = ratio;
+    o.infeasible = !(ratio <= 1.0001f);
     return true;
 }
 
@@ -598,6 +608,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             }
         }
         if (junctionOf(knots[i]) == Junction::Hard && hardKnot(s, s_us, knots[i], c, out[i])) {
+            if (out[i].infeasible) report(AnomalyKind::PieceOverCeiling, i, out[i].t_us, knots[i].p, out[i].worst);
             s = State{out[i].p, 0.0f, 0.0f};
             s_us = out[i].t_us;
             ++i;
