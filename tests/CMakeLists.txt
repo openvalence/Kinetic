@@ -28,6 +28,10 @@ add_test(NAME test_kinetic2_handles COMMAND test_kinetic2_handles)
 add_executable(test_kinetic2_oracle test_kinetic2_oracle.cpp)
 target_link_libraries(test_kinetic2_oracle PRIVATE kinetic::kinetic kinetic::kinetic2)
 target_include_directories(test_kinetic2_oracle PRIVATE third_party)
+# KINETIC2_INCLUDE: the Kinetic² the oracle grades. Point it at a newer main
+# checkout's include/ (tests/ORACLE.md); it is searched before this branch's own.
+set(KINETIC2_INCLUDE "${PROJECT_SOURCE_DIR}/include" CACHE PATH "include/ holding the Kinetic² the oracle grades")
+target_include_directories(test_kinetic2_oracle BEFORE PRIVATE "${KINETIC2_INCLUDE}")
 target_compile_options(test_kinetic2_oracle PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall>)
 add_test(NAME test_kinetic2_oracle COMMAND test_kinetic2_oracle)
