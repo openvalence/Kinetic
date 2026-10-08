@@ -57,6 +57,18 @@ caller's frame moves, `solved()` and `peek()` expose the plan for telemetry or
 a renderer, `setConfig()` / `setLimits()` apply at the next submit or reset.
 `engine.hpp` documents each.
 
+A knot with no end velocity and no successor renders at rest: nothing says
+the motion goes on. A stream owner that knows more is coming says so with
+`expect(axis, until_us)`, before its submits: a solve whose window changed
+before `until_us` renders the newest free knot through, toward a provisional
+successor one span on along its last chord (held to the window and fit to the
+ceilings like any piece), so a stream passes same-direction knots at chord
+speed instead of slowing toward each one. The successor that arrives replaces
+it; a reversal re-plans as any knot does. When none arrives, the knot is
+reached moving and the starvation brake stops the axis. A knot with an end
+velocity is unchanged, `expect(axis, 0)` clears it, and without it the engine
+is bit for bit what it was.
+
 ## Planner options
 
 `kinetic2::Config` holds the ceilings and the options the renderer reads

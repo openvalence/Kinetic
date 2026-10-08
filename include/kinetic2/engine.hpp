@@ -61,6 +61,7 @@ public:
         a.piece_valid = a.tl.empty();
         a.n_sol = 0;
         a.solved_valid = a.tl.empty();
+        a.dirty_us = now_us;
         if (!braking && !(a.tl.empty() && moving)) return;
         const Profile pr = Profile::brake(s, now_us, _cfg.limits);
         if (pr.n == 0) return;
@@ -76,6 +77,18 @@ public:
     // under it; the curve in flight is not re-solved.
     void setConfig(const Config& c) { _cfg = c; }
     void setLimits(const Limits& l) { Config c = _cfg; c.limits = l; setConfig(c); }
+
+    // ---- expectation --------------------------------------------------------
+    // The stream owner's word that more knots follow until until_us (its
+    // schedule horizon). A solve whose window last changed before until_us
+    // renders the newest free knot through, toward a provisional successor
+    // (solver.hpp renderRun), instead of at rest; a HARD or authored knot is
+    // unchanged. Read at the next solve (a submit, a flush, a reseed): it
+    // never re-plans the curve in flight by itself. When no successor
+    // arrives, the knot is reached moving and the starvation brake stops the
+    // axis. 0 clears it, and so does a reset.
+    void expect(size_t axis, uint64_t until_us) { _ax[axis].expect_us = until_us; }
+    void expect(uint64_t until_us) { expect(0, until_us); }
 
     // ---- the one entry ------------------------------------------------------
     // A knot strictly in the future and after the axis's newest knot. False
@@ -108,6 +121,7 @@ public:
         if (!a.tl.push(k)) { a.replan_open = false; return refuse(k, now_us, kDetailPast); }
         a.solved_valid = false;
         a.piece_valid = false;
+        a.dirty_us = now_us;
         return true;
     }
     bool submit(const Knot& k, uint64_t now_us) { return submit(0, k, now_us); }
@@ -165,6 +179,7 @@ public:
         }
         a.solved_valid = false;
         a.piece_valid = false;
+        a.dirty_us = now_us;
         return n - keep;
     }
     size_t truncateAfter(uint64_t t_us, uint64_t now_us) { return truncateAfter(0, t_us, now_us); }
@@ -375,6 +390,10 @@ private:
         bool     replan_open = false;
         Piece    replan_piece{};
         Solved   replan_k0{};
+        // expect(): more is expected until expect_us. dirty_us: when the
+        // window last changed (a solve reads the expectation as of then).
+        uint64_t expect_us = 0;
+        uint64_t dirty_us = 0;
     };
 
     // The origin moves to a segment boundary: the segment in flight starts there.
@@ -395,6 +414,8 @@ private:
         a.has_committed = false;
         a.rep_n = 0;
         a.replan_open = false;
+        a.expect_us = 0;
+        a.dirty_us = now_us;
     }
 
     // Render the pending window from the origin, whole. Knots are copied out
@@ -431,7 +452,7 @@ private:
         const bool undoable = a.replan_open && n > 1;
         a.replan_open = false;
         if (undoable) keepReports(a);
-        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws);
+        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.expect_us > a.dirty_us);
         a.n_sol = n;
         a.solved_valid = true;
         a.piece_valid = false;

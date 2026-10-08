@@ -52,7 +52,8 @@ struct Knot {
     bool     sample = false;
     // Accepted and not read: the handle renderer rests every newest knot
     // without an authored velocity (SPEC 9.6) until its successor frees it,
-    // whatever this says. sources.hpp still sets it for a segment without an
+    // or while the stream owner expects one (Engine::expect), whatever this
+    // says. sources.hpp still sets it for a segment without an
     // end velocity; whether a sample keeps a non-rest angle is the owed
     // samples ruling (kin-y6e, consumers kin-ebc).
     bool     rest_if_last = false;

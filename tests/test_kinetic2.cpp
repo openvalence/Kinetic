@@ -2051,3 +2051,96 @@ TEST_CASE("property: segment streams whose starts miss the newest knot by micros
     CHECK(junction == 0);
     CHECK(outside == 0);
 }
+
+// ---- expect: a stream owner's horizon (kin-fdh0) -----------------------------
+
+namespace {
+
+// A staircase of free knots, each submitted lead before its predecessor's
+// time (the player's lead), every 1 ms sampled. Knot i of n climbs step on
+// from 0.2; knot rev (when >= 0) falls three steps instead. With expect, each
+// submit first sets the horizon 500 ms on.
+struct Stair {
+    std::vector<State> s;
+    std::vector<Knot> ks;
+    std::vector<Solved> sol;   // every pending knot's solve after every submit
+    std::vector<Anomaly> an;
+};
+Stair stair(bool expect, uint64_t span, uint64_t lead, int n = 8, int rev = -1, uint64_t until_from = 500 * kMs) {
+    Config cfg;
+    cfg.limits = {3.0f, 100.0f, 10000.0f};
+    Engine<> e(cfg, 0.2f);
+    Stair r;
+    float p = 0.2f;
+    for (int i = 0; i < n; ++i) {
+        p += (i == rev ? -3.0f : 1.0f) * 0.05f;
+        r.ks.push_back(knotAt(500 * kMs + uint64_t(i + 1) * span, p));
+    }
+    size_t next = 0;
+    for (uint64_t t = 0; t < r.ks.back().t_us + 600 * kMs; t += kMs) {
+        while (next < r.ks.size() && (next ? r.ks[next - 1].t_us : 500 * kMs) <= t + lead) {
+            if (expect) e.expect(t + until_from);
+            REQUIRE(e.submit(r.ks[next++], t));
+            for (size_t i = 0; i < e.pending(); ++i) r.sol.push_back(e.solved(0, i));
+        }
+        r.s.push_back(e.stateAt(0, t));
+        for (const Anomaly& a : drain(e)) r.an.push_back(a);
+    }
+    return r;
+}
+
+}  // namespace
+
+TEST_CASE("expect: streamed free knots 125 ms ahead pass every same-direction knot at chord speed") {
+    for (const uint64_t span : {100 * kMs, 200 * kMs, 400 * kMs}) {
+        const float chord = 0.05f / (float(span) * 1e-6f);
+        float slow[2] = {1e9f, 1e9f};
+        for (const bool expect : {false, true}) {
+            const Stair r = stair(expect, span, 125 * kMs);
+            // Interior: past the launch from rest, before the last knot.
+            for (size_t i = 1; i + 1 < r.ks.size(); ++i) slow[expect] = std::min(slow[expect], r.s[r.ks[i].t_us / kMs].v / chord);
+            if (!expect) continue;
+            const Peaks pk = peaksOf(r.s);
+            CHECK(worstJump(r.s) <= 0.0f);
+            CHECK(pk.v <= 3.0f * 1.001f);
+            CHECK(pk.a <= 100.0f * 1.001f);
+            CHECK(pk.j <= 10000.0f * 1.001f);
+            CHECK(pk.lo >= -1e-3f);
+            CHECK(pk.hi <= 1.0f + 1e-3f);
+            for (const Solved& o : r.sol) { CHECK(std::fabs(o.v) <= 3.0f * 1.001f); CHECK(std::fabs(o.a) <= 100.0f * 1.001f); }
+            // The horizon outlives the last knot: it is reached moving and the
+            // starvation brake stops the axis past it.
+            CHECK(countKind(r.an, AnomalyKind::SettleEngaged) == 1);
+            CHECK(std::fabs(r.s.back().v) <= 1e-6f);
+        }
+        MESSAGE("span " << span / kMs << " ms: slowest interior knot " << slow[0] << " of chord speed at rest ends, " << slow[1] << " expected");
+        CHECK(slow[1] >= 0.95f);
+    }
+}
+
+TEST_CASE("expect: a reversal after a provisional continuation turns on its crest inside the ceilings") {
+    for (const uint64_t span : {60 * kMs, 100 * kMs, 200 * kMs, 400 * kMs}) {
+        const Stair r = stair(true, span, 125 * kMs, 8, 6);
+        const Peaks pk = peaksOf(r.s);
+        const float crest = r.ks[5].p;
+        MESSAGE("span " << span / kMs << " ms: highest " << pk.hi << " (crest " << crest << "), peaks v " << pk.v << " a " << pk.a << " j " << pk.j);
+        // The crest is passed at most kKnotTol past (a trim only lowers it).
+        CHECK(pk.hi <= crest + kKnotTol);
+        CHECK(worstJump(r.s) <= 0.0f);
+        CHECK(pk.v <= 3.0f * 1.001f);
+        CHECK(pk.a <= 100.0f * 1.001f);
+        CHECK(pk.j <= 10000.0f * 1.001f);
+        // kin-554: every solved knot hands on a state inside vmax and amax.
+        for (const Solved& o : r.sol) { CHECK(std::fabs(o.v) <= 3.0f * 1.001f); CHECK(std::fabs(o.a) <= 100.0f * 1.001f); }
+    }
+}
+
+TEST_CASE("expect: a lapsed horizon renders as none, bit for bit") {
+    // Set before every submit but already past: each solve renders the newest
+    // knot at rest, as without it.
+    for (const uint64_t span : {100 * kMs, 400 * kMs}) {
+        const Stair none = stair(false, span, 125 * kMs);
+        const Stair lapsed = stair(true, span, 125 * kMs, 8, -1, 0);
+        CHECK(fingerprint(none.s) == fingerprint(lapsed.s));
+    }
+}
