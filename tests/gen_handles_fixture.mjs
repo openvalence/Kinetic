@@ -6,6 +6,9 @@
 // - Positions and ceilings are written in window units (mm / window width),
 //   the kernel's units; times in integer milliseconds on the author's clock.
 // - The 1 ms grid inverts t(u) by bisection: u is the curve parameter, never time.
+// - Every case renders with the knobs solveWindow (include/kinetic2/solver.hpp)
+//   gives the kernel's renderer: railStop, trimLast, kFeelFloor, kHoldEps of the
+//   window, trim the window span, kStyle. A change there changes KERNEL here.
 import { createRequire } from 'node:module';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +25,19 @@ const CASES = [
   { name: 'sample_trim', cfg: { vmax: 800 }, doc: M.SAMPLE },
   { name: 'figure_tight', cfg: { vmax: 600, amax: 20000, jmax: 5e6, lo: 0, hi: 150 }, doc: { actions: [...FIG, { at: 1000, pos: 0 }] } },
 ];
+// The rail rules at work, for the renderer's parity only (no 1 ms samples): the
+// engine's slack passes move these past the corner-ramp allowance.
+// rail_caps: two caps, an end-acceleration ask, a window excursion, a trimmed last knot.
+// rail_band: band-held trims, two caps, a chord too fast to be a hold, a trimmed last knot.
+const act = (pairs) => ({ actions: pairs.map(([at, pos]) => ({ at, pos })) });
+const RENDER_CASES = [
+  { name: 'rail_caps', cfg: { vmax: 1180, amax: 47500, jmax: 2.53e6 },
+    doc: act([[0, 99], [123, 81], [145, 36], [225, 83], [316, 83], [593, 83.3], [653, 12], [689, 67], [716, 98], [751, 48]]) },
+  { name: 'rail_band', cfg: { vmax: 960, amax: 5000, jmax: 4.57e6 },
+    doc: act([[0, 85], [462, 77], [827, 70], [931, 72], [955, 96], [1099, 4], [1119, 32], [1157, 32.4]]) },
+];
+// solveWindow's knobs, in window units W
+const KERNEL = (W) => ({ railStop: true, trimLast: true, lfloor: 0.15, holdEps: 0.005 * W, trim: W, style: 'pchip' });
 
 // position of one rendered piece at absolute time t (s)
 function positionAt(L, R, t) {
@@ -45,15 +61,16 @@ out += '    int n;                           // knots\n    const unsigned* t_ms;
 out += '    const float* p;                  // authored positions\n    const float* dp;                 // the model\'s trims\n';
 out += '    const unsigned char* infeasible; // the incoming piece is over a ceiling after the whole trim\n';
 out += '    int n_ms;                        // samples, t = 0..n_ms-1 ms\n    const float* ms_p;               // the model\'s position every 1 ms\n};\n\n';
-const rows = [];
-for (const cs of CASES) {
-  const c = { ...M.DEF, ...cs.cfg }, W = c.hi - c.lo;
-  const knots = M.fromFunscript(cs.doc, cs.cfg);
-  M.render(knots, cs.cfg);
+const rows = [], renderRows = [];
+for (const cs of [...CASES, ...RENDER_CASES]) {
+  const withMs = CASES.includes(cs);
+  const c0 = { ...M.DEF, ...cs.cfg }, W = c0.hi - c0.lo, c = { ...c0, ...KERNEL(W) };
+  const knots = M.fromFunscript(cs.doc, c);
+  M.render(knots, c);
   const id = cs.name.replace(/(^|_)(\w)/g, (_, __, ch) => ch.toUpperCase());
   const last = Math.round(knots[knots.length - 1].t * 1000);
   const ms = [];
-  for (let t = 0, i = 0; t <= last; t++) {
+  for (let t = 0, i = 0; withMs && t <= last; t++) {
     while (i < knots.length - 2 && knots[i + 1].t * 1000 <= t) i++;
     ms.push((positionAt(knots[i], knots[i + 1], t / 1000) - c.lo) / W);
   }
@@ -61,11 +78,15 @@ for (const cs of CASES) {
   out += `static const float k${id}P[] = { ${list(knots.map((k) => (M.pos(k) - c.lo) / W))} };\n`;
   out += `static const float k${id}Dp[] = { ${list(knots.map((k) => k.dp / W))} };\n`;
   out += `static const unsigned char k${id}Infeasible[] = { ${knots.map((k) => (k.infeasible ? 1 : 0)).join(', ')} };\n`;
-  out += `static const float k${id}Ms[] = {\n`;
-  for (let i = 0; i < ms.length; i += 10) out += `    ${list(ms.slice(i, i + 10))},\n`;
-  out += '};\n\n';
-  rows.push(`    { "${cs.name}", ${f(c.vmax / W)}, ${f(c.amax / W)}, ${f(c.jmax / W)}, ${knots.length}, k${id}T, k${id}P, k${id}Dp, k${id}Infeasible, ${ms.length}, k${id}Ms },`);
+  if (withMs) {
+    out += `static const float k${id}Ms[] = {\n`;
+    for (let i = 0; i < ms.length; i += 10) out += `    ${list(ms.slice(i, i + 10))},\n`;
+    out += '};\n';
+  }
+  out += '\n';
+  (withMs ? rows : renderRows).push(`    { "${cs.name}", ${f(c.vmax / W)}, ${f(c.amax / W)}, ${f(c.jmax / W)}, ${knots.length}, k${id}T, k${id}P, k${id}Dp, k${id}Infeasible, ${ms.length}, ${withMs ? `k${id}Ms` : 'nullptr'} },`);
 }
-out += `static const Case kCases[] = {\n${rows.join('\n')}\n};\n\n}  // namespace handles_fixture\n`;
+out += `static const Case kCases[] = {\n${rows.join('\n')}\n};\n\n`;
+out += `// The renderer's parity only: no 1 ms samples.\nstatic const Case kRenderCases[] = {\n${renderRows.join('\n')}\n};\n\n}  // namespace handles_fixture\n`;
 writeFileSync(join(here, 'handles_fixture.hpp'), out);
-console.log(`wrote tests/handles_fixture.hpp (${CASES.length} cases)`);
+console.log(`wrote tests/handles_fixture.hpp (${CASES.length} cases, ${RENDER_CASES.length} renderer-only)`);

@@ -16,15 +16,18 @@
 //   length walk skips the side of 1 that cannot help, and a piece whose inputs
 //   did not change is not judged again (HKnot memo). The per-tick bound
 //   belongs in the solver (kin-tnv), never this file.
-// - Cfg::trimLast, Cfg::railStop, HKnot::slack, HKnot::rail, HKnot::vcap,
-//   HKnot::aTarget and Piece::da are the kernel's; at their defaults the
-//   render is the model's, except that an illegal hold lies flat and overOf
-//   also judges the position's exact turning points. Under railStop the
-//   kernel also holds a trimmed knot's angle to its trimmed chord, caps an
-//   angle its span cannot stop (kin-88m), fits the corner ramps' room
-//   (Room), ranks a window excursion below every ceiling ratio, and reads a
-//   hold by rate as well as by distance. The model has none of these yet
-//   (kin-88m carries them there).
+// - The model carries Cfg::trimLast and Cfg::railStop (kin-88m): under
+//   railStop both hold a trimmed knot's angle to its trimmed chord, cap an
+//   angle its span cannot stop, fit the corner ramps' room (Room, aTarget),
+//   rank a window excursion below every ceiling ratio, read a hold by rate as
+//   well as by distance, and lay an illegal hold flat. HKnot::slack,
+//   HKnot::rail, the last knot's brake cap on HKnot::vcap, a moving origin's
+//   HKnot::aIn and Piece::da are the engine's (solver.hpp renderRun,
+//   engine_piece.hpp); the model has none of them. At their defaults the
+//   render is the model's, except that an illegal hold lies flat with
+//   railStop off too, and overOf judges each peak at its exact turning points
+//   where the model samples: the two agree within kTol, which can move a
+//   trim that sits on a legality boundary.
 // See: Valence RFC-106, Kinetic kin-y6e
 #pragma once
 
