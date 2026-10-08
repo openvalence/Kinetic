@@ -39,9 +39,8 @@ kinetic2::Engine<> engine(cfg, 0.0f);        // at rest at the window's low end
 engine.resetAt(0.0f, now_us);
 
 kinetic2::Knot k;
-k.t_us   = now_us + 250000;                  // pass 0.75 in 250 ms
-k.p      = 0.75f;
-k.family = kinetic2::Family::C2;
+k.t_us = now_us + 250000;                    // pass 0.75 in 250 ms
+k.p    = 0.75f;                              // no end velocity: the solver picks the angle
 engine.submit(k, now_us);
 
 for (uint64_t t = now_us; t <= now_us + 300000; t += 1000)
@@ -57,6 +56,20 @@ stops from the current state, `reseedAt()` restates the state when the
 caller's frame moves, `solved()` and `peek()` expose the plan for telemetry or
 a renderer, `setConfig()` / `setLimits()` apply at the next submit or reset.
 `engine.hpp` documents each.
+
+## Planner options
+
+`kinetic2::Config` holds the ceilings and the options the renderer reads
+(Valence RFC-108); `types.hpp` documents each.
+
+| Member | Default | What it sets |
+|---|---|---|
+| `limits` | 3, 30, 500 | vmax, amax, jmax: ceilings, never targets |
+| `smoothness` | 0 | free knots: 0 crisp (PCHIP, no overshoot between monotone knots), 1 smooth (Makima, overshoots), the blend between |
+| `handle_floor` | 0.15 | the shortest handle a ceiling fit may leave, share of its span |
+| `trim_max` | 1 | the farthest a knot moves toward its predecessor to fit the ceilings, share of the window |
+| `react_us` | 4000 | how far ahead of now a knot arriving in motion re-plans from |
+| `solve_budget` | 96 | the machine's bound on one planner run; not read yet |
 
 ## Units and frames
 

@@ -54,7 +54,7 @@ const within = (r, c) => r.peakV <= c.vmax * 1.001 && r.peakA <= c.amax * 1.001 
     const tops = fast.filter((k, i) => i % 2 === 1).map((k) => (k.p + k.dp).toFixed(1)), bottoms = fast.filter((k, i) => i % 2 === 0 && i > 0 && i < 6).map((k) => (k.p + k.dp).toFixed(1));
     check(RF.report.infeasible === 0 && new Set(tops).size === 1 && bottoms.every((b) => b === '0.0') && Number(tops[0]) < 60, `fast run at 400 mm/s: tops trimmed to ${tops[0]} mm, bottoms stay at 0, nothing infeasible`);
   }
-  const smooth = M.fromFunscript(M.SAMPLE, {}), RS = M.render(smooth, { style: 'smooth' });
+  const smooth = M.fromFunscript(M.SAMPLE, {}), RS = M.render(smooth, { smoothness: 1 });
   check(smooth.filter((k) => k.eff === 'G2').length === smooth.length - 2 && RS.report.overPieces === 0 && smooth.filter((k) => k.cls === 'rest').every((k) => k.vIn === 0), `built-in, smooth style: every inner knot G2, hold edges flat, nothing over (Makima's overshoot held inside the window; longest ramp ${Math.max(...RS.steps.map((s) => s.rampMs)).toFixed(1)} ms where the window bound it)`);
   const tight = M.render(M.fromFunscript(M.SAMPLE, {}), { vmax: 300, trim: 0 });
   check(tight.report.infeasible > 0 && tight.report.overPieces === tight.report.infeasible, `built-in at 300 mm/s with no trim: ${tight.report.infeasible} infeasible pieces, each marked`);

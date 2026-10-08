@@ -45,18 +45,17 @@ KINETIC_EXPORT kinetic2_handle* kinetic2_create(void) {
 KINETIC_EXPORT void kinetic2_destroy(kinetic2_handle* h) { delete h; }
 
 KINETIC_EXPORT int kinetic2_configure(kinetic2_handle* h, float vmax, float amax, float jmax,
-                                      uint8_t policy, float amplitude_floor, uint32_t lookahead_us,
-                                      uint8_t corner, uint32_t react_us) {
+                                      float smoothness, float handle_floor, float trim_max,
+                                      uint32_t react_us) {
     if (!h || !positive(vmax) || !positive(amax) || !positive(jmax)) return 0;
-    if (!(amplitude_floor >= 0.0f && amplitude_floor <= 1.0f)) return 0;
-    if (policy != uint8_t(kinetic2::Policy::Stretch) && policy != uint8_t(kinetic2::Policy::Blend)) return 0;
-    if (corner > uint8_t(kinetic2::Corner::Cubic)) return 0;
+    if (!(smoothness >= 0.0f && smoothness <= 1.0f)) return 0;
+    if (!(handle_floor >= kinetic2::handles::kLMin && handle_floor < kinetic2::handles::kThird)) return 0;
+    if (!(trim_max >= 0.0f && trim_max <= 1.0f)) return 0;
     kinetic2::Config c = h->engine.config();
     c.limits = kinetic2::Limits{vmax, amax, jmax};
-    c.policy = kinetic2::Policy(policy);
-    c.amplitude_floor = amplitude_floor;
-    c.lookahead_us = lookahead_us;
-    c.corner = kinetic2::Corner(corner);
+    c.smoothness = smoothness;
+    c.handle_floor = handle_floor;
+    c.trim_max = trim_max;
     c.react_us = react_us;
     h->engine.setConfig(c);
     return 1;
@@ -71,7 +70,7 @@ KINETIC_EXPORT void kinetic2_reset(kinetic2_handle* h, float p, double now_us) {
 }
 
 KINETIC_EXPORT int kinetic2_submit(kinetic2_handle* h, double t_us, float p, int has_v, float v,
-                                   uint8_t family, double now_us, uint32_t flags) {
+                                   double now_us, uint32_t flags) {
     if (!h) return 0;
     kinetic2::Knot k;
     k.t_us = toUs(t_us);
@@ -80,7 +79,6 @@ KINETIC_EXPORT int kinetic2_submit(kinetic2_handle* h, double t_us, float p, int
     k.v = k.has_v ? v : 0.0f;
     k.sample = (flags & KINETIC2_KNOT_SAMPLE) != 0;
     k.rest_if_last = (flags & KINETIC2_KNOT_REST_IF_LAST) != 0;
-    k.family = family <= uint8_t(kinetic2::Family::Step) ? kinetic2::Family(family) : kinetic2::Family::Unspecified;
     return h->engine.submit(k, toUs(now_us)) ? 1 : 0;
 }
 

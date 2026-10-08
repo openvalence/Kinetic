@@ -62,29 +62,28 @@ typedef struct kinetic2_handle kinetic2_handle;
 kinetic2_handle* kinetic2_create(void);
 void kinetic2_destroy(kinetic2_handle* h);
 
-// The planner options (kinetic2::Config). policy: 0 Stretch, 5 Blend, and
-// corner: 0 Continuous, 1 Cubic, are validated and kept but not read by the
-// handle renderer (kin-tnv). 1 applied, 0 refused (non-finite or
-// non-positive ceiling, floor outside 0..1, unknown enum). Takes effect at the
-// next submit or reset; the committed curve is never re-planned.
+// The ceilings and the planner options (kinetic2::Config): smoothness 0..1,
+// handle_floor at least 0.05 and under a third, trim_max 0..1. 1 applied, 0
+// refused (a non-finite or non-positive ceiling, an option out of its range).
+// Takes effect at the next submit or reset; the committed curve is never
+// re-planned.
 int kinetic2_configure(kinetic2_handle* h, float vmax, float amax, float jmax,
-                       uint8_t policy, float amplitude_floor, uint32_t lookahead_us,
-                       uint8_t corner, uint32_t react_us);
+                       float smoothness, float handle_floor, float trim_max,
+                       uint32_t react_us);
 
 // Clears the timeline and anomalies; at rest at p from now_us.
 void kinetic2_reset(kinetic2_handle* h, float p, double now_us);
 
-// One knot: the curve passes p at t_us. has_v 0 leaves the junction to the
-// solver; family: 0 unspecified, 1 C1, 2 C2 (C1 with v = 0 is a hard stop).
-// now_us is when the sender submits it: a knot arriving while the axis moves
-// re-plans from the reaction horizon. flags: bit 0 = sample (renders and
-// trims like any knot; the samples ruling is owed, kin-y6e), bit 1 = rest if
-// last (accepted and not read: every newest free knot rests until a successor
-// frees it, SPEC 9.6, whatever the bit says; kin-y6e). 1 accepted, 0
-// refused (an anomaly says why: KnotRefused with a detail sentinel from
-// types.hpp).
+// One knot: the curve passes p at t_us. has_v 0 leaves the angle to the
+// solver. now_us is when the sender submits it: a knot arriving while the
+// axis moves re-plans from the reaction horizon. flags: bit 0 = sample (a run
+// of position-only samples is the chase; a sample with has_v and v = 0 is a
+// live jog, the fastest move to rest on it), bit 1 = rest if last (accepted
+// and not read: every newest free knot rests until a successor frees it,
+// SPEC 9.6, whatever the bit says). 1 accepted, 0 refused (an anomaly says
+// why: KnotRefused with a detail sentinel from types.hpp).
 int kinetic2_submit(kinetic2_handle* h, double t_us, float p, int has_v, float v,
-                    uint8_t family, double now_us, uint32_t flags);
+                    double now_us, uint32_t flags);
 #define KINETIC2_KNOT_SAMPLE       0x1u
 #define KINETIC2_KNOT_REST_IF_LAST 0x2u
 

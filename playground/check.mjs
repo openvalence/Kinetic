@@ -90,16 +90,11 @@ for (const name of presets) {
   await page.screenshot({ path: join(shots, name + '.png') });
 }
 
-// Overreach under Stretch: the other spend.
+// Overreach: time never gives, the stroke is trimmed.
 await page.click('#presets button[data-preset="overreach"]');
 s = await settle(s.replays);
-await page.click('#opts button:text("Stretch")');
-s = await settle(s.replays);
-ceilings('overreach-stretch', s);
-check(s.knots[0].solved && s.knots[0].solved.stretched === 0, `overreach-stretch: time never gives, knot stretched ${(s.knots[0].solved?.stretched * 1000).toFixed(1)} ms`);
-await page.screenshot({ path: join(shots, 'overreach-stretch.png') });
-await page.click('#opts button:text("Blend")');
-s = await settle(s.replays);
+check(s.knots[0].solved && s.knots[0].solved.stretched === 0 && s.knots[0].solved.share < 1,
+  `overreach: on time (stretched ${(s.knots[0].solved?.stretched * 1000).toFixed(1)} ms), trimmed to ${(s.knots[0].solved?.share * 100).toFixed(0)}%`);
 
 // Add a knot, then Shift-drag it: fine mode moves it a tenth of the pointer.
 await page.click('#presets button[data-preset="stroke"]');

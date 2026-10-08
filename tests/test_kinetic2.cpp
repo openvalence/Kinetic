@@ -21,8 +21,8 @@ namespace {
 
 constexpr uint64_t kMs = 1000;
 
-Knot knotAt(uint64_t t_us, float p, bool has_v = false, float v = 0.0f, Family f = Family::C2) {
-    Knot k; k.t_us = t_us; k.p = p; k.has_v = has_v; k.v = v; k.family = f;
+Knot knotAt(uint64_t t_us, float p, bool has_v = false, float v = 0.0f) {
+    Knot k; k.t_us = t_us; k.p = p; k.has_v = has_v; k.v = v;
     return k;
 }
 
@@ -67,7 +67,7 @@ TEST_CASE("knots are hit at their times and the curve is continuous") {
     const uint64_t now = 1000 * kMs;
     REQUIRE(e.submit(knotAt(now + 200 * kMs, 0.8f), now));
     REQUIRE(e.submit(knotAt(now + 400 * kMs, 0.3f), now));
-    REQUIRE(e.submit(knotAt(now + 600 * kMs, 0.6f, true, 0.0f, Family::C1), now));
+    REQUIRE(e.submit(knotAt(now + 600 * kMs, 0.6f, true, 0.0f), now));
     CHECK(e.pending() == 3);
     CHECK(e.isBusy(now));
 
@@ -76,7 +76,7 @@ TEST_CASE("knots are hit at their times and the curve is continuous") {
     CHECK(s[400].p == doctest::Approx(0.3f).epsilon(1e-4));
     CHECK(s[600].p == doctest::Approx(0.6f).epsilon(1e-4));
     CHECK(s[600].v == doctest::Approx(0.0f).epsilon(1e-3));
-    // Past the last knot: a hold at its position (a C1 knot keeps the
+    // Past the last knot: a hold at its position (an authored knot keeps the
     // author's acceleration into it, and the brake from there settles within
     // a hundred-thousandth of the window).
     CHECK(s[700].p == doctest::Approx(0.6f).epsilon(1e-4));
@@ -318,36 +318,32 @@ TEST_CASE("amplitude gives: an impossible stroke is trimmed on time to the ceili
     CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
 }
 
-// Policy is not read by the renderer (kin-tnv): Stretch and Blend both trim.
-TEST_CASE("under either policy the stroke is trimmed on time and the next knot keeps its own time") {
-    for (Policy pol : {Policy::Stretch, Policy::Blend}) {
-        CAPTURE(int(pol));
-        Config cfg; cfg.limits = {2.0f, 50.0f, 5000.0f}; cfg.policy = pol;
-        Engine<> e(cfg, 0.0f);
-        REQUIRE(e.submit(knotAt(120 * kMs, 1.0f, true, 0.0f), 0));
-        REQUIRE(e.submit(knotAt(620 * kMs, 0.5f, true, 0.0f), 0));
-        const Solved top = e.solved(0, 0), end = e.solved(0, 1);
-        CHECK(onTime(top)); CHECK(onTime(end));
-        CHECK(!e.isBusy(700 * kMs));            // nothing moved past its time
-        const auto s = sweep(e, 0, 800 * kMs);
-        const Peaks pk = peaksOf(s);
-        CHECK(pk.v <= cfg.limits.vmax * 1.001f);
-        CHECK(pk.a <= cfg.limits.amax * 1.001f);
-        CHECK(pk.j <= cfg.limits.jmax * 1.001f);
-        CHECK(pk.hi < 1.0f);                    // the top gave amplitude
-        CHECK(s[120].p == doctest::Approx(knotP(top)).epsilon(1e-4));
-        // 0.5 is reachable from the trimmed top in 500 ms: it never moves.
-        CHECK(s[620].p == doctest::Approx(0.5f).epsilon(1e-4));
-        CHECK(std::fabs(s[620].v) <= 1e-3f);
-        const auto an = drain(e);
-        CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
-        CHECK(countKind(an, AnomalyKind::WaveformScaled) == 1);
-        CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
-    }
+TEST_CASE("a stroke past the ceilings is trimmed on time and the next knot keeps its own time") {
+    Config cfg; cfg.limits = {2.0f, 50.0f, 5000.0f};
+    Engine<> e(cfg, 0.0f);
+    REQUIRE(e.submit(knotAt(120 * kMs, 1.0f, true, 0.0f), 0));
+    REQUIRE(e.submit(knotAt(620 * kMs, 0.5f, true, 0.0f), 0));
+    const Solved top = e.solved(0, 0), end = e.solved(0, 1);
+    CHECK(onTime(top)); CHECK(onTime(end));
+    CHECK(!e.isBusy(700 * kMs));            // nothing moved past its time
+    const auto s = sweep(e, 0, 800 * kMs);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.001f);
+    CHECK(pk.hi < 1.0f);                    // the top gave amplitude
+    CHECK(s[120].p == doctest::Approx(knotP(top)).epsilon(1e-4));
+    // 0.5 is reachable from the trimmed top in 500 ms: it never moves.
+    CHECK(s[620].p == doctest::Approx(0.5f).epsilon(1e-4));
+    CHECK(std::fabs(s[620].v) <= 1e-3f);
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::DeadlineStretched) == 0);
+    CHECK(countKind(an, AnomalyKind::WaveformScaled) == 1);
+    CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
 }
 
 TEST_CASE("the rail is a wall: a reversal that would bulge past it is spent on time") {
-    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f}; cfg.policy = Policy::Blend; cfg.amplitude_floor = 0.1f;
+    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
     Engine<> e(cfg, 0.5f);
     // Arrive at the top rail fast and leave fast: the authored velocities would
     // carry the curve past 1.0 between the knots.
@@ -370,14 +366,14 @@ TEST_CASE("the rail is a wall: a reversal that would bulge past it is spent on t
 
 TEST_CASE("a hard stop keeps its speed longer than a smooth stop and lands at rest") {
     Config cfg; cfg.limits = {4.0f, 40.0f, 1000.0f};
-    auto run = [&](Family f) {
+    auto run = [&](bool jog) {
         Engine<> e(cfg, 0.0f);
-        Knot k = knotAt(500 * kMs, 0.8f, true, 0.0f, f);
-        k.sample = f == Family::C1;   // Hard is a live jog: a C1 sample at rest
+        Knot k = knotAt(500 * kMs, 0.8f, true, 0.0f);
+        k.sample = jog;   // Hard is a live jog: a sample at rest
         REQUIRE(e.submit(k, 0));
         return sweep(e, 0, 600 * kMs);
     };
-    const auto hard = run(Family::C1), smooth = run(Family::C2);
+    const auto hard = run(true), smooth = run(false);
     for (const auto* s : {&hard, &smooth}) {
         CHECK((*s)[500].p == doctest::Approx(0.8f).epsilon(1e-3));
         CHECK(std::fabs((*s)[500].v) < 1e-2f);
@@ -438,17 +434,17 @@ TEST_CASE("a sample stream renders one behind and never overshoots a dead stop")
 }
 
 TEST_CASE("segments become knots at anchor plus duration with the authored end velocity") {
-    const Knot k = knotFromSegment(0.7f, 250 * kMs, true, -1.5f, 1000 * kMs, Family::C1);
+    const Knot k = knotFromSegment(0.7f, 250 * kMs, true, -1.5f, 1000 * kMs);
     CHECK(k.t_us == 1250 * kMs);
     CHECK(k.p == 0.7f);
     CHECK(k.has_v); CHECK(k.v == -1.5f);
     CHECK(junctionOf(k) == Junction::Authored);
-    // An authored C1 segment at rest is a reversal or a hold, never Hard;
-    // a C1 sample at rest (a live jog) is.
-    CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, true, 0.0f, 0, Family::C1)) == Junction::Authored);
-    Knot jog = knotFromSample(0.7f, 0, 250 * kMs); jog.has_v = true; jog.family = Family::C1;
+    // An authored segment at rest is a reversal or a hold, never Hard; a
+    // sample at rest (a live jog) is.
+    CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, true, 0.0f, 0)) == Junction::Authored);
+    Knot jog = knotFromSample(0.7f, 0, 250 * kMs); jog.has_v = true;
     CHECK(junctionOf(jog) == Junction::Hard);
-    CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, false, 0.0f, 0, Family::C2)) == Junction::Smooth);
+    CHECK(junctionOf(knotFromSegment(0.7f, 250 * kMs, false, 0.0f, 0)) == Junction::Smooth);
 }
 
 // ---- the property suite (kin-vcr) --------------------------------------------
@@ -477,12 +473,12 @@ uint64_t fingerprint(const std::vector<State>& s) {
 struct Score { int knots = 0, hit = 0, missed = 0, off = 0, spent = 0, violations = 0, failed = 0, dropped = 0, junction = 0; int why[6] = {}; };
 
 // Random knot sequences: free, authored and hard knots, legal and not, over a
-// random policy and ceilings. Returns the sampled score.
-Score randomRun(uint32_t seed, Policy policy) {
+// random ceilings. Returns the sampled score.
+Score randomRun(uint32_t seed) {
     Rng r(seed);
     Config cfg;
     cfg.limits = {r.uni(1.0f, 8.0f), r.uni(10.0f, 200.0f), r.uni(200.0f, 20000.0f)};
-    cfg.policy = policy; cfg.amplitude_floor = r.uni(0.05f, 0.4f);
+    (void)r.uni(0.05f, 0.4f);   // the seeds' sequences stay as accepted
     const float p0 = r.uni(0.0f, 1.0f);
     Engine<> e(cfg, p0);
     const int n = 3 + r.pick(20);
@@ -492,9 +488,8 @@ Score randomRun(uint32_t seed, Policy policy) {
         t += uint64_t(r.uni(20.0f, 600.0f) * 1000.0f);
         Knot k; k.t_us = t; k.p = r.uni(0.0f, 1.0f);
         const int kind = r.pick(3);
-        if (kind == 1) { k.has_v = true; k.v = r.uni(-cfg.limits.vmax, cfg.limits.vmax); k.family = Family::C2; }
-        if (kind == 2) { k.has_v = true; k.v = 0.0f; k.family = Family::C1; }
-        if (kind == 0) k.family = Family::C2;
+        if (kind == 1) { k.has_v = true; k.v = r.uni(-cfg.limits.vmax, cfg.limits.vmax); }
+        if (kind == 2) { k.has_v = true; k.v = 0.0f; }
         ks.push_back(k);
     }
     // Submit everything up front (a scheduled bundle), then sample through.
@@ -552,16 +547,14 @@ Score randomRun(uint32_t seed, Policy policy) {
 
 }  // namespace
 
-TEST_CASE("property: random knot sequences never exceed a ceiling or the window and are never late, under either policy") {
+TEST_CASE("property: random knot sequences never exceed a ceiling or the window and are never late") {
     int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, dropped = 0, junction = 0, why[6] = {}, withFail = 0, withoutFail = 0;
     for (uint32_t seed = 1; seed <= 400; ++seed) {
-        for (const Policy pol : {Policy::Blend, Policy::Stretch}) {
-            const Score sc = randomRun(seed, pol);
-            ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; dropped += sc.dropped; junction += sc.junction;
-            for (int w = 0; w < 6; ++w) why[w] += sc.why[w];
-            if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
-            if (sc.violations && (withFail + withoutFail) <= 6) MESSAGE("seed " << seed << " policy " << int(pol) << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed);
-        }
+        const Score sc = randomRun(seed);
+        ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; dropped += sc.dropped; junction += sc.junction;
+        for (int w = 0; w < 6; ++w) why[w] += sc.why[w];
+        if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
+        if (sc.violations && (withFail + withoutFail) <= 6) MESSAGE("seed " << seed << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed);
     }
     MESSAGE(runs << " runs, " << knots << " knots, " << hits << " hit at their time, " << missed << " feasible missed, " << off << " untrimmed off their position, " << spent << " trimmed, " << failed << " PieceOverCeiling, " << dropped << " PlanFailed, " << violations
             << " violations (v " << why[0] << ", a " << why[1] << ", j " << why[2] << ", window " << why[3] << ", rest " << why[4] << ", late " << why[5] << "); runs with violations: " << withFail << " reported, " << withoutFail << " silent");
@@ -577,10 +570,10 @@ TEST_CASE("property: random knot sequences never exceed a ceiling or the window 
     CHECK(junction == 0);
     // Constraint: a G1 knot whose corner ramp has no room in its spans keeps
     // an acceleration step (a 1 ms jerk spike) and is reported
-    // PieceOverCeiling: 34 of 800 runs as of 2026-10-08. Acceptance (c) bars
+    // PieceOverCeiling: 17 of 400 runs as of 2026-10-08. Acceptance (c) bars
     // it; rule 5 as written renders it. Operator ruling owed (kin-y6e).
     CHECK(withoutFail == 0);
-    CHECK(violations <= 34);
+    CHECK(violations <= 17);
     CHECK(dropped == 0);
     CHECK(why[5] == 0);
     CHECK(why[4] == 0);
@@ -596,11 +589,11 @@ TEST_CASE("fingerprint: the canonical run has not changed bits") {
     // constant below is the hash of the accepted output; a change here is a
     // change in rendered motion and must be deliberate (update the constant
     // in the same commit, say why).
-    Config cfg; cfg.limits = {4.0f, 60.0f, 3000.0f}; cfg.policy = Policy::Blend; cfg.amplitude_floor = 0.2f;
+    Config cfg; cfg.limits = {4.0f, 60.0f, 3000.0f};
     Engine<> e(cfg, 0.3f);
     REQUIRE(e.submit(knotAt(150 * kMs, 0.9f), 0));
     REQUIRE(e.submit(knotAt(260 * kMs, 0.1f, true, -1.0f), 0));
-    REQUIRE(e.submit(knotAt(500 * kMs, 0.7f, true, 0.0f, Family::C1), 0));
+    REQUIRE(e.submit(knotAt(500 * kMs, 0.7f, true, 0.0f), 0));
     REQUIRE(e.submit(knotAt(520 * kMs, 0.95f), 0));
     REQUIRE(e.submit(knotAt(900 * kMs, 0.4f), 0));
     std::vector<State> s;
@@ -628,10 +621,10 @@ TEST_CASE("peek: the plan ahead is what stateAt returns later, bit for bit, and 
         if (ms == 0) {
             REQUIRE(e.submit(knotAt(150 * kMs, 0.9f), t));
             REQUIRE(e.submit(knotAt(260 * kMs, 0.1f, true, -1.0f), t));
-            REQUIRE(e.submit(knotAt(400 * kMs, 0.6f, true, 0.0f, Family::C1), t));
+            REQUIRE(e.submit(knotAt(400 * kMs, 0.6f, true, 0.0f), t));
         } else if (ms == 420) {
             Knot jog = knotFromSample(0.25f, t, 1000);
-            jog.has_v = true; jog.family = Family::C1;
+            jog.has_v = true;
             REQUIRE(e.submit(jog, t));
         } else if (ms >= 700 && ms <= 860 && (ms - 700) % 16 == 0) {
             REQUIRE(e.submit(knotFromSample(0.25f + 0.02f * float((ms - 700) / 16 + 1), t, 40 * kMs), t));
@@ -672,11 +665,11 @@ TEST_CASE("peek: the plan ahead is what stateAt returns later, bit for bit, and 
     CHECK(compared > 20000);
 
     // The canonical run with a peek before every sample keeps its fingerprint.
-    Config fc; fc.limits = {4.0f, 60.0f, 3000.0f}; fc.policy = Policy::Blend; fc.amplitude_floor = 0.2f;
+    Config fc; fc.limits = {4.0f, 60.0f, 3000.0f};
     Engine<> f(fc, 0.3f);
     REQUIRE(f.submit(knotAt(150 * kMs, 0.9f), 0));
     REQUIRE(f.submit(knotAt(260 * kMs, 0.1f, true, -1.0f), 0));
-    REQUIRE(f.submit(knotAt(500 * kMs, 0.7f, true, 0.0f, Family::C1), 0));
+    REQUIRE(f.submit(knotAt(500 * kMs, 0.7f, true, 0.0f), 0));
     REQUIRE(f.submit(knotAt(520 * kMs, 0.95f), 0));
     REQUIRE(f.submit(knotAt(900 * kMs, 0.4f), 0));
     std::vector<State> s;
@@ -687,16 +680,16 @@ TEST_CASE("peek: the plan ahead is what stateAt returns later, bit for bit, and 
     CHECK(fingerprint(s) == KINETIC2_FINGERPRINT);
 }
 
-// ---- the corner option (kin-jub, RFC-105 planner option `corner`) -------------
+// ---- a G1 knot: the corner ramp (kin-jub) --------------------------------------
 
 TEST_CASE("corner: a G1 knot keeps the author's acceleration step as a jerk-limited ramp, on time") {
-    // A rising corner: fast in, slow out, authored C1 with nonzero velocity.
+    // A rising corner: fast in, slow out, authored with nonzero velocity.
     auto run = []() {
         Config cfg; cfg.limits = {6.0f, 80.0f, 2000.0f};
         Engine<> e(cfg, 0.1f);
-        REQUIRE(e.submit(knotAt(300 * kMs, 0.6f, true, 2.5f, Family::C1), 0));
-        REQUIRE(e.submit(knotAt(700 * kMs, 0.9f, true, 0.3f, Family::C1), 0));
-        REQUIRE(e.submit(knotAt(1000 * kMs, 0.9f, true, 0.0f, Family::C1), 0));
+        REQUIRE(e.submit(knotAt(300 * kMs, 0.6f, true, 2.5f), 0));
+        REQUIRE(e.submit(knotAt(700 * kMs, 0.9f, true, 0.3f), 0));
+        REQUIRE(e.submit(knotAt(1000 * kMs, 0.9f, true, 0.0f), 0));
         return sweep(e, 0, 1100 * kMs);
     };
     const auto cubic = run();
@@ -723,8 +716,6 @@ TEST_CASE("corner: a G1 knot keeps the author's acceleration step as a jerk-limi
     float jpk = 0.0f;
     for (size_t i = 281; i <= 320; ++i) jpk = std::max(jpk, std::fabs(cubic[i].a - cubic[i - 1].a) / 1e-3f);
     CHECK(jpk == doctest::Approx(2000.0f).epsilon(0.05));
-    // The default is Cubic (operator ruling 2026-10-07).
-    Config d; CHECK(d.corner == Corner::Cubic);
 }
 
 // ---- the oscillation modulator (kin-b5g, RFC-103) -----------------------------
@@ -823,36 +814,33 @@ TEST_CASE("oscillator over a planned stroke: the sum keeps every ceiling") {
 
 TEST_CASE("a knot submitted mid-flight never moves the curve under the carriage") {
     Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
-    for (const Policy pol : {Policy::Blend, Policy::Stretch}) {
-        cfg.policy = pol;
-        Engine<> e(cfg, 0.2f);
-        std::vector<State> s;
-        uint64_t t = 0;
-        // 250 ms C2 segments arriving every 250 ms, 125 ms ahead of their start, while sampling.
-        auto sampleUntil = [&](uint64_t until) { for (; t < until; t += kMs) s.push_back(e.stateAt(0, t)); };
-        float target = 0.8f;
-        for (int i = 0; i < 12; ++i) {
-            const uint64_t start = (i + 1) * 250 * kMs;
-            sampleUntil(start - 125 * kMs);
-            REQUIRE(e.submit(knotFromSegment(target, 250 * kMs, true, 0.0f, start, Family::C2), t));
-            target = target > 0.5f ? 0.2f : 0.8f;
-        }
-        sampleUntil(t + 600 * kMs);
-        float worst_jump = 0.0f;
-        for (size_t i = 1; i < s.size(); ++i) {
-            const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
-            worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
-        }
-        CHECK(worst_jump <= 0.0f);
-        const Peaks pk = peaksOf(s);
-        CHECK(pk.v <= cfg.limits.vmax * 1.001f);
-        CHECK(pk.a <= cfg.limits.amax * 1.001f);
-        CHECK(pk.j <= cfg.limits.jmax * 1.10f);
+    Engine<> e(cfg, 0.2f);
+    std::vector<State> s;
+    uint64_t t = 0;
+    // 250 ms segments arriving every 250 ms, 125 ms ahead of their start, while sampling.
+    auto sampleUntil = [&](uint64_t until) { for (; t < until; t += kMs) s.push_back(e.stateAt(0, t)); };
+    float target = 0.8f;
+    for (int i = 0; i < 12; ++i) {
+        const uint64_t start = (i + 1) * 250 * kMs;
+        sampleUntil(start - 125 * kMs);
+        REQUIRE(e.submit(knotFromSegment(target, 250 * kMs, true, 0.0f, start), t));
+        target = target > 0.5f ? 0.2f : 0.8f;
     }
+    sampleUntil(t + 600 * kMs);
+    float worst_jump = 0.0f;
+    for (size_t i = 1; i < s.size(); ++i) {
+        const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+        worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
+    }
+    CHECK(worst_jump <= 0.0f);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.10f);
 }
 
 TEST_CASE("a 60 Hz scrub submitted while sampling stays continuous and one behind") {
-    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f}; cfg.policy = Policy::Stretch;
+    Config cfg; cfg.limits = {10.0f, 400.0f, 50000.0f};
     Engine<> e(cfg, 0.1f);
     std::vector<State> s;
     uint64_t t = 0; float p = 0.1f;
@@ -892,8 +880,8 @@ struct StreamRun {
     int   over = 0;            // PieceOverCeiling reports
 };
 
-StreamRun runArbiterScrub(Policy policy, float* out_last = nullptr) {
-    Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f}; cfg.policy = policy;
+StreamRun runArbiterScrub(float* out_last = nullptr) {
+    Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f};
     Engine<> e(cfg, 0.5f);
     StreamRun r;
     std::vector<State> s;
@@ -936,79 +924,73 @@ StreamRun runArbiterScrub(Policy policy, float* out_last = nullptr) {
 }  // namespace
 
 TEST_CASE("a spent 60 Hz stream stays continuous, refuses nothing, drops nothing and tracks") {
-    for (Policy policy : {Policy::Stretch, Policy::Blend}) {
-        CAPTURE(int(policy));
-        float last = 0.0f;
-        const StreamRun r = runArbiterScrub(policy, &last);
-        MESSAGE("policy ", int(policy), " jump ", r.worst_jump * 400.0f, " mm, refused ", r.refused, ", dropped ", r.dropped,
-                ", worst lag ", r.worst_lag_ms, " ms at sample ", r.worst_lag_at, ", end ", r.end_p * 400.0f, " mm vs ", last * 400.0f,
-                ", range ", r.pk.lo * 400.0f, "..", r.pk.hi * 400.0f, " mm, peaks v ", r.pk.v, " a ", r.pk.a, " j ", r.pk.j, ", over ", r.over);
-        CHECK(r.worst_jump <= 0.0f);
-        CHECK(r.refused == 0);
-        CHECK(r.dropped == 0);
-        // Samples carry position only (operator ruling 2026-10-08, kin-j6g):
-        // a run of samples renders as the fastest legal move to rest on the
-        // newest, re-planned as each lands, never a Bezier, never trimmed.
-        // A stream faster than its ceilings lands late by what the physics
-        // needs, never short: nothing is over a ceiling and nothing reports.
-        CHECK(r.worst_lag_ms <= 250.0f);
-        CHECK(r.pk.v <= 2.5f * 1.001f);
-        CHECK(r.pk.a <= 125.0f * 1.001f);
-        CHECK(r.pk.j <= 5000.0f * 1.001f);
-        CHECK(r.pk.lo >= -1e-3f);
-        CHECK(r.pk.hi <= 1.0f + 1e-3f);
-        CHECK(r.over == 0);
-        // The chase lands on the last sample once the stream stops.
-        CHECK(r.end_p == doctest::Approx(last).epsilon(1e-2));
-    }
+    float last = 0.0f;
+    const StreamRun r = runArbiterScrub(&last);
+    MESSAGE("jump ", r.worst_jump * 400.0f, " mm, refused ", r.refused, ", dropped ", r.dropped,
+            ", worst lag ", r.worst_lag_ms, " ms at sample ", r.worst_lag_at, ", end ", r.end_p * 400.0f, " mm vs ", last * 400.0f,
+            ", range ", r.pk.lo * 400.0f, "..", r.pk.hi * 400.0f, " mm, peaks v ", r.pk.v, " a ", r.pk.a, " j ", r.pk.j, ", over ", r.over);
+    CHECK(r.worst_jump <= 0.0f);
+    CHECK(r.refused == 0);
+    CHECK(r.dropped == 0);
+    // Samples carry position only (operator ruling 2026-10-08, kin-j6g):
+    // a run of samples renders as the fastest legal move to rest on the
+    // newest, re-planned as each lands, never a Bezier, never trimmed.
+    // A stream faster than its ceilings lands late by what the physics
+    // needs, never short: nothing is over a ceiling and nothing reports.
+    CHECK(r.worst_lag_ms <= 250.0f);
+    CHECK(r.pk.v <= 2.5f * 1.001f);
+    CHECK(r.pk.a <= 125.0f * 1.001f);
+    CHECK(r.pk.j <= 5000.0f * 1.001f);
+    CHECK(r.pk.lo >= -1e-3f);
+    CHECK(r.pk.hi <= 1.0f + 1e-3f);
+    CHECK(r.over == 0);
+    // The chase lands on the last sample once the stream stops.
+    CHECK(r.end_p == doctest::Approx(last).epsilon(1e-2));
 }
 
 TEST_CASE("a lone far sample from rest is the fastest legal move to it: late, never trimmed, never dropped") {
-    for (Policy policy : {Policy::Stretch, Policy::Blend}) {
-        CAPTURE(int(policy));
-        Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f}; cfg.policy = policy;
-        Engine<> e(cfg, 0.5f);
-        REQUIRE(e.submit(knotFromSample(0.75f, 0, 16667), 0));
-        const Solved o = e.solved(0, 0);
-        // Samples carry position only (operator ruling 2026-10-08, kin-j6g):
-        // the sample renders as Profile::point from rest to rest on it, which
-        // 0.25 of the window in 16.7 ms cannot be, so it lands when the fastest
-        // legal move lands (stretched, like a HARD knot) and is never trimmed.
-        CHECK(o.hard);
-        CHECK(!onTime(o));
-        CHECK(o.stretched_s > 0.0f);
-        CHECK(knotP(o) == doctest::Approx(0.75f).epsilon(1e-5));
-        const auto s = sweep(e, 0, 2000 * kMs);
-        float worst_jump = 0.0f, peak = 0.0f;
-        for (size_t i = 1; i < s.size(); ++i) {
-            const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
-            worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
-            peak = std::max(peak, s[i].p);
-        }
-        int dropped = 0, trimmed = 0; Anomaly a;
-        while (e.popAnomaly(a)) {
-            if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++dropped;
-            if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++trimmed;
-        }
-        MESSAGE("policy ", int(policy), " lands ", o.stretched_s * 1000.0f, " ms late, peak ", peak * 400.0f, " mm, jump ", worst_jump * 400.0f);
-        CHECK(dropped == 0);
-        CHECK(trimmed == 0);
-        CHECK(worst_jump <= 0.0f);
-        const Peaks pk = peaksOf(s);
-        CHECK(pk.v <= cfg.limits.vmax * 1.001f);
-        CHECK(pk.a <= cfg.limits.amax * 1.001f);
-        CHECK(pk.j <= cfg.limits.jmax * 1.001f);
-        CHECK(peak <= 0.75f + 1e-4f);
-        CHECK(s.back().p == doctest::Approx(0.75f).epsilon(1e-4));
-        CHECK(s.back().v == 0.0f);
+    Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f};
+    Engine<> e(cfg, 0.5f);
+    REQUIRE(e.submit(knotFromSample(0.75f, 0, 16667), 0));
+    const Solved o = e.solved(0, 0);
+    // Samples carry position only (operator ruling 2026-10-08, kin-j6g):
+    // the sample renders as Profile::point from rest to rest on it, which
+    // 0.25 of the window in 16.7 ms cannot be, so it lands when the fastest
+    // legal move lands (stretched, like a HARD knot) and is never trimmed.
+    CHECK(o.hard);
+    CHECK(!onTime(o));
+    CHECK(o.stretched_s > 0.0f);
+    CHECK(knotP(o) == doctest::Approx(0.75f).epsilon(1e-5));
+    const auto s = sweep(e, 0, 2000 * kMs);
+    float worst_jump = 0.0f, peak = 0.0f;
+    for (size_t i = 1; i < s.size(); ++i) {
+        const float allowed = std::max(std::fabs(s[i].v), std::fabs(s[i - 1].v)) * 1e-3f + 2e-4f;
+        worst_jump = std::max(worst_jump, std::fabs(s[i].p - s[i - 1].p) - allowed);
+        peak = std::max(peak, s[i].p);
     }
+    int dropped = 0, trimmed = 0; Anomaly a;
+    while (e.popAnomaly(a)) {
+        if (a.kind == uint8_t(AnomalyKind::PlanFailed)) ++dropped;
+        if (a.kind == uint8_t(AnomalyKind::WaveformScaled)) ++trimmed;
+    }
+    MESSAGE("lands ", o.stretched_s * 1000.0f, " ms late, peak ", peak * 400.0f, " mm, jump ", worst_jump * 400.0f);
+    CHECK(dropped == 0);
+    CHECK(trimmed == 0);
+    CHECK(worst_jump <= 0.0f);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.001f);
+    CHECK(peak <= 0.75f + 1e-4f);
+    CHECK(s.back().p == doctest::Approx(0.75f).epsilon(1e-4));
+    CHECK(s.back().v == 0.0f);
 }
 
 TEST_CASE("a staircase of segments without end velocities, authored ahead, stays continuous and rests at the top") {
     Config cfg;   // default ceilings
     Engine<> e(cfg, 0.1f);
     for (int k = 1; k <= 5; ++k)
-        REQUIRE(e.submit(knotFromSegment(0.1f + 0.15f * float(k), 300 * kMs, false, 0.0f, uint64_t(k - 1) * 300 * kMs, Family::C2), 0));
+        REQUIRE(e.submit(knotFromSegment(0.1f + 0.15f * float(k), 300 * kMs, false, 0.0f, uint64_t(k - 1) * 300 * kMs), 0));
     const auto s = sweep(e, 0, 2200 * kMs);
     float worst_jump = 0.0f, lo = 1.0f, hi = 0.0f;
     for (size_t i = 1; i < s.size(); ++i) {
@@ -1026,7 +1008,7 @@ TEST_CASE("a staircase of segments without end velocities, authored ahead, stays
 TEST_CASE("a lone hard stop from rest holds, launches and lands: it never winds up backward") {
     Config cfg;
     Engine<> e(cfg, 0.1f);
-    Knot k = knotAt(1500 * kMs, 0.5f, true, 0.0f, Family::C1);
+    Knot k = knotAt(1500 * kMs, 0.5f, true, 0.0f);
     k.sample = true;   // a live jog
     REQUIRE(e.submit(k, 0));
     const auto s = sweep(e, 0, 1600 * kMs);
@@ -1048,7 +1030,7 @@ TEST_CASE("a segment with no end velocity and no successor rests at its target; 
     Config cfg; cfg.limits = {2.5f, 125.0f, 5000.0f};
     Engine<> e(cfg, 0.0f);
     // 50 mm of 400 in 500 ms, unspecified end velocity, nothing after it.
-    REQUIRE(e.submit(knotFromSegment(0.125f, 500 * kMs, false, 0.0f, 0, Family::C2), 0));
+    REQUIRE(e.submit(knotFromSegment(0.125f, 500 * kMs, false, 0.0f, 0), 0));
     const auto s = sweep(e, 0, 1200 * kMs);
     float peak = 0.0f;
     for (const State& st : s) peak = std::max(peak, st.p);
@@ -1058,8 +1040,8 @@ TEST_CASE("a segment with no end velocity and no successor rests at its target; 
     CHECK_FALSE(e.isBusy(600 * kMs));
     // The same segment with a successor queued behind it passes through moving.
     Engine<> e2(cfg, 0.0f);
-    REQUIRE(e2.submit(knotFromSegment(0.125f, 500 * kMs, false, 0.0f, 0, Family::C2), 0));
-    REQUIRE(e2.submit(knotFromSegment(0.25f, 500 * kMs, false, 0.0f, 500 * kMs, Family::C2), 0));
+    REQUIRE(e2.submit(knotFromSegment(0.125f, 500 * kMs, false, 0.0f, 0), 0));
+    REQUIRE(e2.submit(knotFromSegment(0.25f, 500 * kMs, false, 0.0f, 500 * kMs), 0));
     CHECK(e2.stateAt(0, 500 * kMs).v > 0.05f);
     CHECK(e2.stateAt(0, 1000 * kMs).p == doctest::Approx(0.25f).epsilon(1e-4));
 }
@@ -1068,11 +1050,10 @@ TEST_CASE("a segment with no end velocity and no successor rests at its target; 
 
 namespace {
 
-// 250 ms of 50 ms C2 segments climbing 0.2 -> 0.3 from t = 0, the last resting.
+// 250 ms of 50 ms segments climbing 0.2 -> 0.3 from t = 0, the last resting.
 void queueRamp(Engine<>& e) {
     for (int k = 0; k < 5; ++k)
-        REQUIRE(e.submit(knotFromSegment(0.2f + 0.02f * float(k + 1), 50 * kMs, k < 4, 0.4f, uint64_t(k) * 50 * kMs,
-                                         Family::C2), 0));
+        REQUIRE(e.submit(knotFromSegment(0.2f + 0.02f * float(k + 1), 50 * kMs, k < 4, 0.4f, uint64_t(k) * 50 * kMs), 0));
 }
 
 float worstJump(const std::vector<State>& s) {
@@ -1098,7 +1079,7 @@ TEST_CASE("free segments streamed late in the span before them pass every throug
         for (int i = 0; i < 5; ++i) {
             const uint64_t start = 300 * kMs + uint64_t(i) * 250 * kMs;
             sampleUntil(start - lead);
-            REQUIRE(e.submit(knotFromSegment(0.1f + 0.17f * float(i + 1), 250 * kMs, false, 0.0f, start, Family::C2), t));
+            REQUIRE(e.submit(knotFromSegment(0.1f + 0.17f * float(i + 1), 250 * kMs, false, 0.0f, start), t));
         }
         sampleUntil(2000 * kMs);
         float slowest = 1e9f;
@@ -1119,51 +1100,47 @@ TEST_CASE("free segments streamed late in the span before them pass every throug
 
 TEST_CASE("truncateAfter: a flush 40 ms out drops the queue from there and hands off continuously") {
     Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
-    for (const Policy pol : {Policy::Blend, Policy::Stretch}) {
-        cfg.policy = pol;
-        Engine<> e(cfg, 0.2f), twin(cfg, 0.2f);
-        queueRamp(e); queueRamp(twin);
-        std::vector<State> s = sweep(e, 0, 110 * kMs);
-        (void)sweep(twin, 0, 110 * kMs);
-        // The seek at 110 ms: every segment starting at or after 150 ms is replaced
-        // by one segment back down; the knot AT 150 ms ends the segment that
-        // started at 100 ms and stays (RFC-087): it is the hand-off.
-        const uint64_t now = 110 * kMs, t_base = 150 * kMs;
-        CHECK(e.truncateAfter(t_base, now) == 2);                   // the knots at 200 and 250 ms
-        CHECK(e.newest().t_us == t_base);                           // the author's knot at 150 ms
-        CHECK(e.newest().family == Family::C2);
-        const float v_base = e.solved(0, e.pending() - 1).v;        // its solved junction velocity
-        const size_t kept = e.pending();
-        REQUIRE(e.submit(knotFromSegment(0.15f, 300 * kMs, false, 0.0f, t_base, Family::C2), now));
-        REQUIRE(e.pending() == kept + 1);
-        for (size_t i = 0; i < e.pending(); ++i) {
-            const uint64_t t = e.solved(0, i).t_us;
-            CHECK(t != 200 * kMs); CHECK(t != 250 * kMs);
-        }
-        for (uint64_t t = now + kMs; t <= 900 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
-        // The curve in flight runs to the new first start: there it is where
-        // the queued plan would have been.
-        const State old_at_base = twin.stateAt(0, t_base);
-        MESSAGE("policy " << int(pol) << " hand-off p " << s[150].p << " vs queued " << old_at_base.p << ", v " << s[150].v
-                          << " vs " << old_at_base.v << ", worst jump " << worstJump(s) << ", end " << s.back().p);
-        CHECK(s[150].p == doctest::Approx(old_at_base.p).epsilon(1e-4));
-        // Constraint: the knot is a G1 corner; the ramp that rounds its
-        // acceleration step runs on the rendered curve around the knot, so the
-        // velocity at the knot's instant differs from its angle by the rounding
-        // (order |da| * r / 4, r = |da| / jmax), inside the band to the twin.
-        CHECK(s[150].v == doctest::Approx(v_base).epsilon(2e-2));
-        CHECK(s[150].v == doctest::Approx(old_at_base.v).epsilon(2e-2));
-        CHECK(worstJump(s) <= 0.0f);
-        const Peaks pk = peaksOf(s);
-        CHECK(pk.v <= cfg.limits.vmax * 1.001f);
-        CHECK(pk.a <= cfg.limits.amax * 1.001f);
-        CHECK(pk.j <= cfg.limits.jmax * 1.10f);
-        CHECK(s.back().p == doctest::Approx(0.15f).epsilon(1e-4));
-        CHECK(std::fabs(s.back().v) < 1e-4f);
-        const auto an = drain(e);
-        CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
-        CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
+    Engine<> e(cfg, 0.2f), twin(cfg, 0.2f);
+    queueRamp(e); queueRamp(twin);
+    std::vector<State> s = sweep(e, 0, 110 * kMs);
+    (void)sweep(twin, 0, 110 * kMs);
+    // The seek at 110 ms: every segment starting at or after 150 ms is replaced
+    // by one segment back down; the knot AT 150 ms ends the segment that
+    // started at 100 ms and stays (RFC-087): it is the hand-off.
+    const uint64_t now = 110 * kMs, t_base = 150 * kMs;
+    CHECK(e.truncateAfter(t_base, now) == 2);                   // the knots at 200 and 250 ms
+    CHECK(e.newest().t_us == t_base);                           // the author's knot at 150 ms
+    const float v_base = e.solved(0, e.pending() - 1).v;        // its solved junction velocity
+    const size_t kept = e.pending();
+    REQUIRE(e.submit(knotFromSegment(0.15f, 300 * kMs, false, 0.0f, t_base), now));
+    REQUIRE(e.pending() == kept + 1);
+    for (size_t i = 0; i < e.pending(); ++i) {
+        const uint64_t t = e.solved(0, i).t_us;
+        CHECK(t != 200 * kMs); CHECK(t != 250 * kMs);
     }
+    for (uint64_t t = now + kMs; t <= 900 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
+    // The curve in flight runs to the new first start: there it is where
+    // the queued plan would have been.
+    const State old_at_base = twin.stateAt(0, t_base);
+    MESSAGE("hand-off p " << s[150].p << " vs queued " << old_at_base.p << ", v " << s[150].v
+                      << " vs " << old_at_base.v << ", worst jump " << worstJump(s) << ", end " << s.back().p);
+    CHECK(s[150].p == doctest::Approx(old_at_base.p).epsilon(1e-4));
+    // Constraint: the knot is a G1 corner; the ramp that rounds its
+    // acceleration step runs on the rendered curve around the knot, so the
+    // velocity at the knot's instant differs from its angle by the rounding
+    // (order |da| * r / 4, r = |da| / jmax), inside the band to the twin.
+    CHECK(s[150].v == doctest::Approx(v_base).epsilon(2e-2));
+    CHECK(s[150].v == doctest::Approx(old_at_base.v).epsilon(2e-2));
+    CHECK(worstJump(s) <= 0.0f);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.10f);
+    CHECK(s.back().p == doctest::Approx(0.15f).epsilon(1e-4));
+    CHECK(std::fabs(s.back().v) < 1e-4f);
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
+    CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
 }
 
 TEST_CASE("truncateAfter: a flush at now drops the whole window and hands off at the reaction horizon") {
@@ -1180,7 +1157,7 @@ TEST_CASE("truncateAfter: a flush at now drops the whole window and hands off at
     // than half its span; commitHorizon).
     const uint64_t through_us = twin.solved(0, 0).t_us;
     CHECK((e.newest().t_us == now + cfg.react_us || e.newest().t_us == through_us));
-    REQUIRE(e.submit(knotFromSegment(0.15f, 300 * kMs, false, 0.0f, now, Family::C2), now));
+    REQUIRE(e.submit(knotFromSegment(0.15f, 300 * kMs, false, 0.0f, now), now));
     for (uint64_t t = now + kMs; t <= 900 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
     // Through the horizon the curve is the one that was rendering.
     for (uint64_t t = now; t <= now + cfg.react_us; t += kMs)
@@ -1279,10 +1256,10 @@ TEST_CASE("reseedAt: the pending knots stay and re-solve from the restated state
 
 TEST_CASE("solve budget: a bundle over the ceilings renders whole, trimmed on time, as the unbounded engine") {
     // An RFC-087 bundle: 32 segments in one submit burst, most past the
-    // ceilings, solved at the next sample. solve_budget is not read by the
-    // renderer until kin-tnv bounds the per-tick work: the motion is the
-    // unbounded engine's, bit for bit, and every knot keeps its time.
-    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f}; cfg.policy = Policy::Blend;
+    // ceilings, solved at the next sample. A bounded run renders what an
+    // unbounded one does, bit for bit (RFC-108 item 8; solve_budget is not
+    // read yet), and every knot keeps its time.
+    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f};
     REQUIRE(cfg.solve_budget > 0);
     Config unb = cfg; unb.solve_budget = 0;
     Engine<> e(cfg, 0.5f), ref(unb, 0.5f);
@@ -1290,7 +1267,7 @@ TEST_CASE("solve budget: a bundle over the ceilings renders whole, trimmed on ti
     for (int i = 0; i < 32; ++i) {
         at += (i % 3 == 0 ? 90 : 140) * kMs;
         const float p = 0.5f + (i % 2 ? -1.0f : 1.0f) * (0.1f + 0.012f * float(i));
-        const Knot k = knotFromSegment(p, uint32_t(at), true, 0.0f, 0, Family::C2);
+        const Knot k = knotFromSegment(p, uint32_t(at), true, 0.0f, 0);
         REQUIRE(e.submit(k, 0));
         REQUIRE(ref.submit(k, 0));
     }
@@ -1363,8 +1340,8 @@ TEST_CASE("a HARD knot from a carriage moving away turns at once and lands at re
     // takes the profile's end as its time, unreported, rendered as that
     // profile.
     Knot k = knotFromSample(target, 1000000, 400000);
-    k.has_v = true; k.family = Family::C1;
-    Config cfg; cfg.limits = kJog; cfg.policy = Policy::Stretch;
+    k.has_v = true;
+    Config cfg; cfg.limits = kJog;
     Solved out[1];
     Workspace ws{};
     int reports = 0;
@@ -1429,13 +1406,13 @@ TEST_CASE("a HARD knot with time to spare: from rest it holds then launches, mov
 TEST_CASE("a live jog redirected mid-move replaces the move in flight and turns at once") {
     // As Nucleus sends a jog: flush at now (the hand-off is the reaction
     // horizon), then a HARD sample due as soon as possible.
-    Config cfg; cfg.limits = kJog; cfg.policy = Policy::Stretch;
+    Config cfg; cfg.limits = kJog;
     Engine<> e(cfg, 0.5f);
     auto jog = [&](float target, uint64_t now) {
         (void)e.truncateAfter(now, now);
         const Knot h = e.newest();
         Knot k = knotFromSample(target, h.t_us > now ? h.t_us : now, 1000);
-        k.has_v = true; k.family = Family::C1;
+        k.has_v = true;
         REQUIRE(e.submit(k, now));
     };
     std::vector<State> s;
@@ -1483,7 +1460,7 @@ void jogTo(Engine<>& e, float target, uint64_t now) {
     (void)e.truncateAfter(now, now);
     const Knot h = e.newest();
     Knot k = knotFromSample(target, h.t_us > now ? h.t_us : now, 1000);
-    k.has_v = true; k.family = Family::C1;
+    k.has_v = true;
     REQUIRE(e.submit(k, now));
 }
 
@@ -1599,7 +1576,7 @@ TEST_CASE("a stream paused mid-chase, then a jog during the brake: both are prof
     CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
 }
 
-// ---- a C1 script renders as its author's cubics (kin-7jd) --------------------------
+// ---- a script with velocities renders as its author's cubics (kin-7jd) ------------
 
 namespace {
 
@@ -1615,8 +1592,8 @@ struct ScriptRun {
 // own PCHIP curve; v_err_max is taken after the first span (the carriage
 // starts at rest with no acceleration, the first cubic does not).
 // open: the knots carry no end velocity (the renderer solves the angles).
-ScriptRun runPchipSine(Family fam, Corner corner, bool open = false) {
-    Config cfg; cfg.limits = {1000.0f / 84.0f, 50000.0f / 84.0f, 1.0e7f / 84.0f}; cfg.corner = corner;
+ScriptRun runPchipSine(bool open) {
+    Config cfg; cfg.limits = {1000.0f / 84.0f, 50000.0f / 84.0f, 1.0e7f / 84.0f};
     Engine<> e(cfg, 0.5f);
     const double period = 1300.0, step = 100.0, amp = 0.3;
     const int n = int(5 * period / step);
@@ -1644,7 +1621,7 @@ ScriptRun runPchipSine(Family fam, Corner corner, bool open = false) {
     for (uint64_t now = 0; now <= end; now += kMs) {
         while (next < n && uint64_t(t[next - 1]) * kMs <= now + 250 * kMs) {
             const Knot k = knotFromSegment(float(p[next]), uint32_t(step) * kMs, !open, open ? 0.0f : float(m[next] * 1000.0),
-                                           uint64_t(t[next - 1]) * kMs, fam);
+                                           uint64_t(t[next - 1]) * kMs);
             if (!e.submit(k, now)) ++r.refused;
             ++next;
         }
@@ -1678,21 +1655,17 @@ ScriptRun runPchipSine(Family fam, Corner corner, bool open = false) {
 }  // namespace
 
 TEST_CASE("a PCHIP script renders as its author's curve; with no velocities its through points are G2") {
-    const ScriptRun c1 = runPchipSine(Family::C1, Corner::Cubic);
-    const ScriptRun c2 = runPchipSine(Family::C2, Corner::Continuous);
-    const ScriptRun g2 = runPchipSine(Family::C2, Corner::Cubic, true);
-    MESSAGE("C1: v error " << c1.v_err_max << " (" << 100.0 * c1.v_err_max / c1.v_peak << " % of peak " << c1.v_peak
-            << "), first span " << c1.v_err_first << "; C2: v error " << c2.v_err_max << " ("
-            << 100.0 * c2.v_err_max / c2.v_peak << " %); open: v error " << g2.v_err_max << ", a step " << g2.a_jump);
-    for (const ScriptRun* r : {&c1, &c2}) {
-        // An authored velocity is the knot's angle under either family.
-        CHECK(r->v_err_max <= 0.02 * r->v_peak);
-        CHECK(r->dips == 0);
-        CHECK(r->refused == 0);
-        CHECK(r->stretched == 0);
-        CHECK(r->trimmed == 0);
-        CHECK(r->failed == 0);
-    }
+    const ScriptRun au = runPchipSine(false);
+    const ScriptRun g2 = runPchipSine(true);
+    MESSAGE("authored: v error " << au.v_err_max << " (" << 100.0 * au.v_err_max / au.v_peak << " % of peak " << au.v_peak
+            << "), first span " << au.v_err_first << "; open: v error " << g2.v_err_max << ", a step " << g2.a_jump);
+    // An authored velocity is the knot's angle.
+    CHECK(au.v_err_max <= 0.02 * au.v_peak);
+    CHECK(au.dips == 0);
+    CHECK(au.refused == 0);
+    CHECK(au.stretched == 0);
+    CHECK(au.trimmed == 0);
+    CHECK(au.failed == 0);
     // No velocities: every inner knot of the sine is a through point or a
     // crest; the through points are G2 by their solved angle and the crests
     // take the corner ramp, so the acceleration never steps faster than jmax.
@@ -1724,12 +1697,12 @@ TEST_CASE("pchip judges monotonicity: a lengthened band-legal piece that oversho
     CHECK(back(rev) > 0.05f);
     CHECK(handles::monoOver(over, c) == doctest::Approx(1.0f + back(over)).epsilon(1e-4));
     CHECK(handles::monoOver(rev, c) == doctest::Approx(1.0f + back(rev)).epsilon(1e-4));
-    // At a third the band keeps it monotone; Smooth and a hold are not judged.
+    // At a third the band keeps it monotone; smoothness above 0 and a hold are not judged.
     handles::Piece third = over;
     third.i0 = third.i1 = handles::kThird;
     CHECK(handles::monoOver(third, c) <= 1.0f + handles::kTol);
     handles::Cfg sm;
-    sm.style = handles::Style::Smooth;
+    sm.smoothness = 1.0f;
     CHECK(handles::monoOver(over, sm) == 0.0f);
     handles::Piece hold = over;
     hold.D = 0.004f; hold.s0 = 0.012f;
@@ -1738,31 +1711,29 @@ TEST_CASE("pchip judges monotonicity: a lengthened band-legal piece that oversho
 
 // RFC-087: a bundle that begins exactly where the queue ends replaces nothing;
 // the knot at its first start is the end of a segment that started before it.
-// Dropping it stood a C2 hand-off knot in its place on every bundle, and a C1
-// script lost the author's corner at every knot (bench, 2026-10-06).
+// The knot keeps the author's velocity, so the author's corner at every knot
+// stays.
 TEST_CASE("truncateAfter keeps the knot at its time: a bundle starting where the queue ends changes nothing") {
     Config cfg; cfg.limits = {3.0f, 30.0f, 2000.0f};
     Engine<> e(cfg, 0.2f);
-    REQUIRE(e.submit(knotFromSegment(0.4f, 200000, true, 0.5f, 0, Family::C1), 0));
-    REQUIRE(e.submit(knotFromSegment(0.6f, 200000, true, 0.5f, 200000, Family::C1), 0));
+    REQUIRE(e.submit(knotFromSegment(0.4f, 200000, true, 0.5f, 0), 0));
+    REQUIRE(e.submit(knotFromSegment(0.6f, 200000, true, 0.5f, 200000), 0));
     (void)e.stateAt(0, 1000);
     CHECK(e.pending(0) == 2);
     CHECK(e.truncateAfter(400000, 1000) == 0);   // the queue ends at 400 ms: nothing after it
     CHECK(e.pending(0) == 2);
     CHECK(e.newest().t_us == 400000);
-    CHECK(e.newest().family == Family::C1);
     CHECK(e.truncateAfter(200000, 1000) == 1);   // after 200 ms: the second span goes, the first knot stays
     CHECK(e.pending(0) == 1);
     CHECK(e.newest().t_us == 200000);
-    CHECK(e.newest().family == Family::C1);
-    REQUIRE(e.submit(knotFromSegment(0.7f, 200000, true, 0.0f, 200000, Family::C1), 1000));
+    REQUIRE(e.submit(knotFromSegment(0.7f, 200000, true, 0.0f, 200000), 1000));
     CHECK(e.truncateAfter(300000, 1000) == 1);   // inside the span: the hand-off knot stands at 300 ms
     CHECK(e.newest().t_us == 300000);
     CHECK(e.newest().has_v);
 }
 
-// ---- C1 cubics against the ceilings (kin-y6e) -----------------------------------
-// An authored C1 cubic the ceilings refuse renders on the author's clock: its
+// ---- authored cubics against the ceilings (kin-y6e) -----------------------------
+// An authored cubic the ceilings refuse renders on the author's clock: its
 // handle lengths give first (speed caps them from above, acceleration and jerk
 // from below), then the amplitude (the later knot moves toward the earlier).
 namespace {
@@ -1778,7 +1749,7 @@ SpendRun runSpans(const Config& cfg, float p0, const Span (&spans)[N], uint64_t 
     for (uint64_t now = 0; now <= end_ms * kMs; now += kMs) {
         while (next < N && spans[next].start_ms * kMs <= now + 110 * kMs) {
             const Span& s = spans[next++];
-            REQUIRE(e.submit(knotFromSegment(s.p, uint32_t(s.dur_ms) * kMs, true, 0.0f, s.start_ms * kMs, Family::C1), now));
+            REQUIRE(e.submit(knotFromSegment(s.p, uint32_t(s.dur_ms) * kMs, true, 0.0f, s.start_ms * kMs), now));
         }
         const State st = e.stateAt(0, now);
         r.p.push_back(st.p); r.v.push_back(st.v);
@@ -1797,13 +1768,13 @@ SpendRun runSpans(const Config& cfg, float p0, const Span (&spans)[N], uint64_t 
 }
 }  // namespace
 
-TEST_CASE("a speed-bound C1 fall renders on time inside the ceilings: the handles give first, then the amplitude") {
+TEST_CASE("a speed-bound authored fall renders on time inside the ceilings: the handles give first, then the amplitude") {
     // The operator's fall (kin-g5u): 96 mm in 125 ms on a 150 mm window, rest to
     // rest, whose cubic peaks at 1152 mm/s against 1000. A hold follows, then
     // the same stroke again. Speed caps the handle length from above (0.23 of
     // the span), acceleration from below (0.29): no factor is legal, so the
     // bottom gives amplitude toward the top, on time (kin-y6e).
-    Config cfg; cfg.limits = {1000.0f / 150.0f, 50000.0f / 150.0f, 5.0e6f / 150.0f}; cfg.corner = Corner::Cubic;
+    Config cfg; cfg.limits = {1000.0f / 150.0f, 50000.0f / 150.0f, 5.0e6f / 150.0f};
     const float top = 0.64f;
     const Span spans[] = {{0, 375, top}, {375, 125, 0.0f}, {500, 250, 0.0f}, {750, 375, top}, {1125, 125, 0.0f}, {1250, 250, 0.0f}};
     const SpendRun r = runSpans(cfg, 0.0f, spans, 1600);
@@ -1830,7 +1801,7 @@ TEST_CASE("a speed-bound C1 fall renders on time inside the ceilings: the handle
     CHECK(std::fabs(r.p[1250] - r.p[500]) <= 1e-3f);
 }
 
-TEST_CASE("an acceleration-bound C1 span renders on time inside the ceilings; jmax at its rest ends trims it") {
+TEST_CASE("an acceleration-bound authored span renders on time inside the ceilings; jmax at its rest ends trims it") {
     // 35 mm in 60 ms on a 100 mm window from rest: the cubic's acceleration is
     // 583 window/s^2 against 500 (ratio 1.17), its speed and jerk legal. The
     // model (jerk-blind at a knot) renders it whole with handles near 0.36.
@@ -1881,7 +1852,7 @@ TEST_CASE("a sawtooth rise from rest over the speed ceiling renders on time with
     for (uint64_t now = 0; now <= 900 * kMs; now += kMs) {
         while (next < 8 && ks[next].start_ms * kMs <= now + 110 * kMs) {
             const K& k = ks[next++];
-            REQUIRE(e.submit(knotFromSegment(k.p, uint32_t(k.dur_ms) * kMs, true, k.v, k.start_ms * kMs, Family::C1), now));
+            REQUIRE(e.submit(knotFromSegment(k.p, uint32_t(k.dur_ms) * kMs, true, k.v, k.start_ms * kMs), now));
         }
         const State st = e.stateAt(0, now);
         v.push_back(st.v);
@@ -1933,7 +1904,7 @@ const Limits kFactory{12.0f, 1000.0f, 2.0e5f};
 // velocity 0, each span sent 125 ms before its start, flushing from there as
 // Nucleus does, its start skewed by skew_us from the newest knot. Returns the
 // sampled positions from rest at 0.05.
-std::vector<float> reversals(int64_t skew_us, Family fam) {
+std::vector<float> reversals(int64_t skew_us) {
     Config cfg; cfg.limits = kFactory;
     Engine<> e(cfg, 0.05f);
     const float ps[] = {0.95f, 0.05f, 0.95f, 0.05f, 0.95f, 0.05f, 0.95f, 0.05f};
@@ -1947,7 +1918,7 @@ std::vector<float> reversals(int64_t skew_us, Family fam) {
                 start = uint64_t(int64_t(newest) + skew_us);
                 (void)e.truncateAfter(start, now);
             }
-            const Knot k = knotFromSegment(ps[next], uint32_t(durs[next] * kMs), true, 0.0f, start, fam);
+            const Knot k = knotFromSegment(ps[next], uint32_t(durs[next] * kMs), true, 0.0f, start);
             REQUIRE(e.submit(k, now));
             newest = k.t_us;
             start = newest;
@@ -1964,15 +1935,13 @@ TEST_CASE("a flush microseconds before the newest knot keeps it: a committed rev
     // returned 0; the submit after it read the committed corner ramp as a
     // starvation brake and re-planned from the horizon, dropping the reversal:
     // the curve ran past 0.95 to 1.29 on the hub.
-    for (const Family fam : {Family::Unspecified, Family::C1}) {
-        for (const int64_t skew : {int64_t(-3), int64_t(-30), int64_t(-900), int64_t(0), int64_t(3)}) {
-            const std::vector<float> p = reversals(skew, fam);
-            float lo = 1.0f, hi = 0.0f;
-            for (float x : p) { lo = std::fmin(lo, x); hi = std::fmax(hi, x); }
-            CAPTURE(int(fam)); CAPTURE(skew);
-            CHECK(hi <= 0.95f + 1e-3f);
-            CHECK(lo >= 0.05f - 1e-3f);
-        }
+    for (const int64_t skew : {int64_t(-3), int64_t(-30), int64_t(-900), int64_t(0), int64_t(3)}) {
+        const std::vector<float> p = reversals(skew);
+        float lo = 1.0f, hi = 0.0f;
+        for (float x : p) { lo = std::fmin(lo, x); hi = std::fmax(hi, x); }
+        CAPTURE(skew);
+        CHECK(hi <= 0.95f + 1e-3f);
+        CHECK(lo >= 0.05f - 1e-3f);
     }
 }
 
@@ -1986,10 +1955,10 @@ TEST_CASE("a hold microseconds after a moving knot: its junction stays inside th
     // the later half of the piece into the moving knot, committed through then.
     Config cfg; cfg.limits = kFactory;
     Engine<> e(cfg, 0.2f);
-    REQUIRE(e.submit(knotAt(150 * kMs, 0.55f, true, 1.946f, Family::C1), 0));
+    REQUIRE(e.submit(knotAt(150 * kMs, 0.55f, true, 1.946f), 0));
     std::vector<State> s = sweep(e, 0, 80 * kMs);
-    REQUIRE(e.submit(knotAt(150 * kMs + 3, 0.55f, true, 0.0f, Family::C2), 80 * kMs));
-    REQUIRE(e.submit(knotAt(418 * kMs + 3, 0.9f, true, 0.0f, Family::C1), 80 * kMs));
+    REQUIRE(e.submit(knotAt(150 * kMs + 3, 0.55f, true, 0.0f), 80 * kMs));
+    REQUIRE(e.submit(knotAt(418 * kMs + 3, 0.9f, true, 0.0f), 80 * kMs));
     for (size_t i = 0; i < 2; ++i) {
         const Solved& o = e.solved(0, i);
         CAPTURE(i);
@@ -2043,7 +2012,7 @@ TEST_CASE("property: segment streams whose starts miss the newest knot by micros
             const float p = r.pick(4) == 0 ? prev : r.uni(0.05f, 0.95f);
             k.p = p;
             k.has_v = true;
-            k.family = r.pick(2) ? Family::C1 : Family::Unspecified;
+            (void)r.pick(2);   // the seeds' sequences stay as accepted
             ks.push_back(k);
             prev = p;
         }
@@ -2064,7 +2033,7 @@ TEST_CASE("property: segment streams whose starts miss the newest knot by micros
                 const uint64_t dur = ks[next].t_us - base;
                 start = next ? uint64_t(int64_t(newest) + skews[r.pick(11)]) : base;
                 if (next) (void)e.truncateAfter(start, now);
-                if (next && start > newest) REQUIRE(e.submit(knotAt(start, ks[next - 1].p, true, 0.0f, Family::C2), now));
+                if (next && start > newest) REQUIRE(e.submit(knotAt(start, ks[next - 1].p, true, 0.0f), now));
                 Knot k = ks[next];
                 k.t_us = start + dur;
                 REQUIRE(e.submit(k, now));

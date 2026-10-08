@@ -22,14 +22,15 @@
   'use strict';
   const LMIN = 0.05, LMAX = 0.95, THIRD = 1 / 3, TOL = 1e-3, NS = 160;  // one sampling for the judge and the drawing
   const TICK = 1e-3, HOLD_SPAN = 0.1;  // the kernel's kTick and kHoldSpan, s (railStop only)
-  // style: 'pchip' keeps crests flat and G1 (PCHIP as drawn, the corner ramp takes the
-  // acceleration step) and makes through points G2 by their angle; 'smooth' takes
-  // Makima's angles and makes every knot G2 (lengths at crests and hold edges).
+  // smoothness: 0 is pchip, crests flat and G1 (PCHIP as drawn, the corner ramp takes
+  // the acceleration step), through points G2 by their angle; 1 is smooth, Makima's
+  // angles, crests and hold edges G2 by their lengths; between, the lerp of the two
+  // solves' free angles and lengths (the kernel's Config::smoothness, Valence RFC-108).
   // lfloor: the feel floor on a nudged handle length (a shorter handle is a harder
   // ramp); trim: how far a knot no length can reach may move toward the previous
   // knot's actual position, mm (amplitude gives, time never). trimLast: the last knot
   // trims too; railStop: the kernel's rail rules (see the constraints above).
-  const DEF = { vmax: 1000, amax: 50000, jmax: 5e6, lfloor: 0.15, trim: 100, holdEps: 0.5, lo: 0, hi: 100, style: 'pchip', sweeps: 4, trimLast: false, railStop: false };
+  const DEF = { vmax: 1000, amax: 50000, jmax: 5e6, lfloor: 0.15, trim: 100, holdEps: 0.5, lo: 0, hi: 100, smoothness: 0, sweeps: 4, trimLast: false, railStop: false };
 
   // ---- one piece ----------------------------------------------------------
   // D mm over T s, end velocities s0/s1 (mm/s), handle lengths i0/i1. Sampled
@@ -137,12 +138,21 @@
 
   // ---- the solve: angles and lengths before the ceilings --------------------
   function solve(knots, cfg, withDp) {
-    const c = { ...DEF, ...cfg };
+    const c = { ...DEF, ...cfg }, s = c.smoothness;
+    if (!(s > 0) || s >= 1) { solveStyle(knots, c, withDp, s >= 1); return; }
+    solveStyle(knots, c, withDp, false);
+    const p = knots.map((k) => [k.vIn, k.vOut, k.lIn, k.lOut]);
+    solveStyle(knots, c, withDp, true);
+    knots.forEach((k, i) => {
+      if (k.man.v == null) { k.vIn = (1 - s) * p[i][0] + s * k.vIn; k.vOut = (1 - s) * p[i][1] + s * k.vOut; }
+      k.lIn = (1 - s) * p[i][2] + s * k.lIn; k.lOut = (1 - s) * p[i][3] + s * k.lOut;
+    });
+  }
+  function solveStyle(knots, c, withDp, smooth) {
     classify(knots, c, withDp);
     const pe = (k) => pos(k) + (withDp ? k.dp || 0 : 0);
     for (let i = 0; i < knots.length; i++) {
       const k = knots[i], prev = knots[i - 1], next = knots[i + 1], m = k.man;
-      const smooth = c.style === 'smooth';
       k.eff = k.cls === 'end' ? 'G1' : k.type !== 'auto' ? k.type : (k.cls === 'through' || smooth) ? 'G2' : 'G1';
       const base = (k.cls === 'end' || k.cls === 'rest') ? 0 : smooth && knots.length > 3 ? makimaAngle(knots, i) : k.cls === 'through' ? pchipAngle(k, prev, next) : 0;
       if (k.eff === 'G0') { k.vIn = m.vIn ?? k.dIn; k.vOut = m.vOut ?? k.dOut; }
@@ -264,7 +274,7 @@
       const r = sample(L.t, pL, D, T, L.vOut, s1, i0, i1, NS);
       let o = over(r, c);
       if (room) o = Math.max(o, roomOver(endAccel(D, T, L.vOut, s1, i0, i1), T, room, c.jmax));
-      if (c.railStop && c.style === 'pchip') o = Math.max(o, monoOver(r, D, T, L.vOut, s1, c));
+      if (c.railStop && !(c.smoothness > 0)) o = Math.max(o, monoOver(r, D, T, L.vOut, s1, c));
       if (o <= 1 + TOL) return { k, i0, i1, o, legal: true };
       if (!best || o < best.o) best = { k, i0, i1, o, legal: false };
     }

@@ -1,6 +1,6 @@
 # Contributing
 
-Two rules a change must keep. A pull request that breaks one is not merged.
+Three rules a change must keep. A pull request that breaks one is not merged.
 
 1. **`-ffp-contract=off`, and never `-ffast-math`.** Same calls in, same bits
    out, on every target. The CMake targets carry the flag; every other build
@@ -15,6 +15,8 @@ Two rules a change must keep. A pull request that breaks one is not merged.
    ```
 
    The wasm build (README.md "WebAssembly") compiles too.
+3. **Every `Config` member is read.** A member the planner stops reading
+   leaves `Config`, the wasm ABI and the playground in the same change.
 
 ## Releasing
 

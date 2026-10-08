@@ -21,9 +21,10 @@
 //   first knot, its angle the live velocity (never clamped), so a re-plan
 //   from mid-flight keeps the velocity exactly and the piece build carries
 //   the acceleration (engine_piece.hpp).
-// - Config::solve_budget, late_budget_us, policy, amplitude_floor and corner
-//   are not read here; the renderer's knobs are the constants below
-//   (kin-tnv exposes them and bounds the render per tick).
+// - The renderer's knobs are Config's (smoothness, handle_floor, trim_max);
+//   solve_budget is not read yet: every run renders its whole window, and
+//   the bound owed is a resumable slice, bit-identical (Valence RFC-108
+//   item 8, kin-tnv), never a cut window.
 // - A knot's solved state (where the next piece, a starvation brake and a
 //   re-plan start) is inside vmax and amax, whatever the piece into it did
 //   (emitRun, kin-554).
@@ -61,15 +62,11 @@ inline Counters g{};
 #define K2_STAT(field, n) ((void)0)
 #endif
 
-// The renderer's knobs. Constants until kin-tnv makes them planner options:
-// Config is ABI and does not carry them.
-inline constexpr float          kFeelFloor = 0.15f;                  // shortest nudged handle, share of its span
-inline constexpr handles::Style kStyle     = handles::Style::Pchip;  // the acceptance style
-inline constexpr float          kHoldEps   = 0.005f;                 // a chord this small is a hold, window units
-inline constexpr uint64_t       kMinSpanUs = 1000;                   // one tick, the floor of every span
-inline constexpr float          kIllegal   = 1e30f;                  // a ratio for an illegal profile
-inline constexpr float          kKnotTol   = 1e-3f;                  // a corner ramp passes its knot this near, window units
-inline constexpr int            kWalkBack  = 6;                      // rounds a corner ramp's walk-back may take to settle
+inline constexpr float    kHoldEps   = 0.005f;   // a chord this small is a hold, window units
+inline constexpr uint64_t kMinSpanUs = 1000;     // one tick, the floor of every span
+inline constexpr float    kIllegal   = 1e30f;    // a ratio for an illegal profile
+inline constexpr float    kKnotTol   = 1e-3f;    // a corner ramp passes its knot this near, window units
+inline constexpr int      kWalkBack  = 6;        // rounds a corner ramp's walk-back may take to settle
 
 // ---- the solved knot ---------------------------------------------------------
 // Where and when the curve passes the knot, with what velocity and acceleration.
@@ -604,9 +601,9 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
     c.lo = std::fmin(0.0f, origin.p);
     c.hi = std::fmax(1.0f, origin.p);
     c.holdEps = kHoldEps;
-    c.lfloor = kFeelFloor;
-    c.trim = c.hi - c.lo;
-    c.style = kStyle;
+    c.lfloor = cfg.handle_floor;
+    c.trim = cfg.trim_max * (c.hi - c.lo);
+    c.smoothness = cfg.smoothness;
     c.trimLast = true;
     c.railStop = true;
     State s = origin;

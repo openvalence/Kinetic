@@ -14,8 +14,8 @@
 //   bisected), about 150 polynomial evaluations against the model's 161 full
 //   samples; a legality test stops at the first sample over the bar, the
 //   length walk skips the side of 1 that cannot help, and a piece whose inputs
-//   did not change is not judged again (HKnot memo). The per-tick bound
-//   belongs in the solver (kin-tnv), never this file.
+//   did not change is not judged again (HKnot memo). A bound on the render's
+//   work belongs in the solver, never this file.
 // - The model carries Cfg::trimLast and Cfg::railStop (kin-88m): under
 //   railStop both hold a trimmed knot's angle to its trimmed chord, cap an
 //   angle its span cannot stop, fit the corner ramps' room (Room, aTarget),
@@ -25,16 +25,21 @@
 //   HKnot::aIn and Piece::da are the engine's (solver.hpp renderRun,
 //   engine_piece.hpp); the model has none of them. At their defaults the
 //   render is the model's, except that an illegal hold lies flat with
-//   railStop off too, Pchip judges monotonicity with railStop off too (the
-//   model under railStop only), and overOf judges each peak at its exact
+//   railStop off too, smoothness 0 judges monotonicity with railStop off too
+//   (the model under railStop only), and overOf judges each peak at its exact
 //   turning points where the model samples: the two agree within kTol, which
 //   can move a trim that sits on a legality boundary.
-// - Under Pchip a band-legal piece stays monotone at its scaled lengths
-//   (monoOver, kin-ay9): the band guarantees it only at a third.
+// - At smoothness 0 a band-legal piece stays monotone at its scaled lengths
+//   (monoOver, kin-ay9): the band guarantees it only at a third. Above 0 only
+//   the window judges overshoot.
+// - Smoothness (Valence RFC-108 item 6): 0 renders the pchip solve and 1 the
+//   smooth solve, bit for bit; between, both are solved and every knot takes
+//   (1 - s) pchip + s smooth of its free angle and both lengths, then the
+//   ceilings fit and trim the lerped curve. Cost: a mid value solves twice.
 // - The solve order (RFC-106 item 7): every angle first, with every length a
 //   third (authored kept, else the style's start angle; each held to vmax and
 //   its cap, an authored one under railStop to the rail, the origin's live
-//   angle never), then four G2 sweeps (solve). Then per piece in knot order
+//   angle never), then four G2 sweeps (solveStyle). Then per piece in knot order
 //   one length factor on the k grid (ksAt: 1, 0.95, 1.05, ... 0.2, then 1.85
 //   to 2.0, the lower first on a tie), the first legal taken, else the trim
 //   (nudge). Then two rounds of solve on the trimmed chords and fit again,
@@ -59,22 +64,16 @@ namespace kinetic2::handles {
 
 inline constexpr float kLMin   = 0.05f;   // shortest handle, share of its span
 inline constexpr float kLMax   = 0.95f;   // longest handle
-inline constexpr float kThird  = 1.0f / 3.0f;  // the polynomial cubic (C1 Hermite)
+inline constexpr float kThird  = 1.0f / 3.0f;  // the polynomial cubic (the cubic Hermite)
 inline constexpr float kTol    = 1e-3f;   // a peak within 0.1% of its ceiling is legal
 inline constexpr int   kJudgeN = 160;     // u samples per judged piece; the model's NS
 inline constexpr float kTick   = 1e-3f;   // the engine's tick, s: a corner ramp's clearance from a span's end
 inline constexpr int   kMemoKey = 16;     // nudge's memo inputs per piece; every input of a fit is in it
 
-// The model's style knob. Pchip is the default and the acceptance.
-enum class Style : uint8_t {
-    Pchip  = 0,   // crests and hold edges flat and G1, through points G2 by angle
-    Smooth = 1,   // Makima angles, every inner knot G2 (lengths at crests)
-};
-
 enum class KnotClass : uint8_t { End = 0, Rest = 1, Crest = 2, Through = 3 };
 
-// Constant knobs until the follow-up exposes them as planner options; the
-// kernel's Config layout is ABI and does not carry them.
+// The solver fills lfloor, trim and smoothness from Config (handle_floor,
+// trim_max times the window span, smoothness).
 struct Cfg {
     Limits lim{};
     float  lo      = 0.0f;     // window, caller units
@@ -82,7 +81,12 @@ struct Cfg {
     float  holdEps = 0.005f;   // a chord this small is a hold
     float  lfloor  = 0.15f;    // feel floor on a nudged handle length
     float  trim    = 1.0f;     // farthest a knot moves toward its predecessor
-    Style  style   = Style::Pchip;
+    // Free knots: 0 pchip (crests and hold edges flat and G1, through points
+    // G2 by angle, no overshoot between monotone knots); 1 smooth (crests take
+    // Makima's angle, through points start from it and are G2 by angle, crests
+    // and hold edges G2 by their lengths where both sides accelerate the same
+    // way, else G1); the lerp between.
+    float  smoothness = 0.0f;
     int    sweeps  = 4;        // G2 sweeps per solve
     // The last knot trims too. The model keeps it (a script's end); the kernel's
     // last knot is the newest of a window and must never render over a ceiling.
@@ -128,6 +132,8 @@ struct HKnot {
     float mk[kMemoKey] = {};
     float mi0 = kThird, mi1 = kThird, mdp = 0.0f, mvel = 0.0f, maIn = 0.0f;
     bool  mlegal = false;
+    // The pchip solve's angle and lengths, held while a mid smoothness solves smooth.
+    float pVel = 0.0f, pIn = kThird, pOut = kThird;
 };
 
 inline float rendered(const HKnot& k) { return k.p + k.dp; }
@@ -523,10 +529,9 @@ inline void band(const HKnot& m, float& lo, float& hi) {
 // An authored angle (has_v) is kept; every angle is held to +-vmax before any
 // length is tried. G2 sweeps: a through point solves its angle in closed form
 // (aEnd of the left piece and aStart of the right are both linear in it), a
-// crest or hold edge under Smooth its lengths (ratio matched, product a ninth).
-inline void solve(HKnot* k, int n, const Cfg& c, bool withDp) {
+// crest or hold edge under smooth its lengths (ratio matched, product a ninth).
+inline void solveStyle(HKnot* k, int n, const Cfg& c, bool withDp, bool smooth) {
     classify(k, n, c, withDp);
-    const bool smooth = c.style == Style::Smooth;
     for (int i = 0; i < n; ++i) {
         HKnot& m = k[i];
         m.g2 = m.cls != KnotClass::End && (m.cls == KnotClass::Through || smooth);
@@ -566,6 +571,26 @@ inline void solve(HKnot* k, int n, const Cfg& c, bool withDp) {
                 }
             }
         }
+    }
+}
+
+// The solve at Cfg::smoothness. An authored angle is the same in both solves
+// and is kept bit for bit; g2 is the smooth solve's (read by its sweeps only).
+inline void solve(HKnot* k, int n, const Cfg& c, bool withDp) {
+    const float s = c.smoothness;
+    if (!(s > 0.0f) || s >= 1.0f) {
+        solveStyle(k, n, c, withDp, s >= 1.0f);
+        return;
+    }
+    solveStyle(k, n, c, withDp, false);
+    for (int i = 0; i < n; ++i) { k[i].pVel = k[i].vel; k[i].pIn = k[i].lIn; k[i].pOut = k[i].lOut; }
+    solveStyle(k, n, c, withDp, true);
+    const float r = 1.0f - s;
+    for (int i = 0; i < n; ++i) {
+        HKnot& m = k[i];
+        if (!m.has_v) m.vel = r * m.pVel + s * m.vel;
+        m.lIn = r * m.pIn + s * m.lIn;
+        m.lOut = r * m.pOut + s * m.lOut;
     }
 }
 
@@ -662,14 +687,15 @@ inline float roomOver(const Piece& q, const Room& rm, float jmax) {
     return o;
 }
 
-// Under Pchip a band-legal piece (both angles zero or of its chord's sign and
-// at most 3 (1 + kTol) times it) stays monotone at its scaled lengths: 1 +
+// At smoothness 0 a band-legal piece (both angles zero or of its chord's sign
+// and at most 3 (1 + kTol) times it) stays monotone at its scaled lengths: 1 +
 // the share of its chord it travels backward (an overshoot past its end or a
-// reversal inside); 0 when not judged (Smooth, a hold, an angle outside the
-// band: an authored angle's overshoot is the author's). Exact: P'(u) / 3D is
-// A (1-u)^2 + 2 B u (1-u) + C u^2, which changes sign only when B^2 > A C, B < 0.
+// reversal inside); 0 when not judged (smoothness above 0, a hold, an angle
+// outside the band: an authored angle's overshoot is the author's). Exact:
+// P'(u) / 3D is A (1-u)^2 + 2 B u (1-u) + C u^2, which changes sign only when
+// B^2 > A C, B < 0.
 inline float monoOver(const Piece& q, const Cfg& c) {
-    if (c.style != Style::Pchip || !(std::fabs(q.D) > c.holdEps)) return 0.0f;
+    if (c.smoothness > 0.0f || !(std::fabs(q.D) > c.holdEps)) return 0.0f;
     const float m = q.D / q.T, al = q.s0 / m, be = q.s1 / m, b = 3.0f * (1.0f + kTol);
     if (!(al >= 0.0f && al <= b && be >= 0.0f && be <= b)) return 0.0f;
     const float A = al * q.i0, C = be * q.i1, B = 1.0f - A - C;

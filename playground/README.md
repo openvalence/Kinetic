@@ -75,9 +75,11 @@ is classified from its chords: a hold edge, a crest (the chords change sign)
 or a through point (same sign). Its class can be set by hand: G0 renders a
 corner with two angles, G1 one angle with free lengths, G2 continuous
 acceleration (the angle for a through point, the lengths for a crest). The
-style sets the defaults: PCHIP keeps crests and hold edges G1 as drawn, the
-corner ramp takes their acceleration step, and makes through points G2 by
-their angle; smooth takes Makima's angles and makes every knot G2. The
+smoothness sets the defaults: at 0 (PCHIP) crests and hold edges stay G1 as
+drawn, the corner ramp takes their acceleration step, and through points are
+G2 by their angle; at 1 crests take Makima's angles and crests and hold edges
+are G2 by their lengths; between, the free angles and lengths of the two
+blend (the kernel's Config::smoothness). The
 ceilings, the window included, bound the lengths per piece: speed from above, acceleration and jerk
 from below. A piece no length satisfies may move its later knot inside the
 tolerance box; what remains is marked infeasible. Handles drag as in Blender

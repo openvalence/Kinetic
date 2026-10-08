@@ -7,8 +7,9 @@
 //   the kernel's units; times in integer milliseconds on the author's clock.
 // - The 1 ms grid inverts t(u) by bisection: u is the curve parameter, never time.
 // - Every case renders with the knobs solveWindow (include/kinetic2/solver.hpp)
-//   gives the kernel's renderer: railStop, trimLast, kFeelFloor, kHoldEps of the
-//   window, trim the window span, kStyle. A change there changes KERNEL here.
+//   gives the kernel's renderer at Config's defaults: railStop, trimLast,
+//   handle_floor, kHoldEps of the window, trim_max of the window span,
+//   smoothness. A change there changes KERNEL here.
 import { createRequire } from 'node:module';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -40,7 +41,7 @@ const RENDER_CASES = [
     doc: act([[0, 74], [140, 85], [456, 85], [557, 78], [678, 2], [710, 44], [769, 99], [838, 88]]) },
 ];
 // solveWindow's knobs, in window units W
-const KERNEL = (W) => ({ railStop: true, trimLast: true, lfloor: 0.15, holdEps: 0.005 * W, trim: W, style: 'pchip' });
+const KERNEL = (W) => ({ railStop: true, trimLast: true, lfloor: 0.15, holdEps: 0.005 * W, trim: W, smoothness: 0 });
 
 // position of one rendered piece at absolute time t (s)
 function positionAt(L, R, t) {

@@ -94,10 +94,10 @@ struct Peaks {
 // the ceilings (vmax 2, amax 100, jmax 10000); `gentle` keeps them to 0.03 to
 // 0.2 over 150 to 300 ms, which the ceilings allow. The match is the rendered
 // position against the PCHIP curve itself, in mm on a 268 mm rail.
-Tally funscript(uint32_t budget, Corner corner, Family fam, bool gentle, const char* name) {
+Tally funscript(uint32_t budget, bool gentle, const char* name) {
     Tally t{name};
-    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f}; cfg.policy = Policy::Blend;
-    cfg.solve_budget = budget; cfg.corner = corner;
+    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f};
+    cfg.solve_budget = budget;
     Engine<1, 64> e(cfg, 0.5f);
     Rng r(7);
     const int n = 60;
@@ -144,8 +144,8 @@ Tally funscript(uint32_t budget, Corner corner, Family fam, bool gentle, const c
             s = plan(e, t, now, [&] {
                 while (next <= n && at[next - 1] <= now + 250 * kMs) {
                     // The arbiter's hold: a start past the newest knot is a rest until it.
-                    if (next == 1) { Knot h; h.t_us = at[0]; h.p = p[0]; h.has_v = true; h.family = Family::C2; (void)e.submit(h, now); }
-                    (void)e.submit(knotFromSegment(p[next], uint32_t(at[next] - at[next - 1]), true, v[next], at[next - 1], fam), now);
+                    if (next == 1) { Knot h; h.t_us = at[0]; h.p = p[0]; h.has_v = true; (void)e.submit(h, now); }
+                    (void)e.submit(knotFromSegment(p[next], uint32_t(at[next] - at[next - 1]), true, v[next], at[next - 1]), now);
                     ++next;
                 }
             });
@@ -165,15 +165,15 @@ Tally funscript(uint32_t budget, Corner corner, Family fam, bool gentle, const c
 }
 
 // (B) Jog scrub: a slider swept across an 84 mm window at 20 Hz, each move a
-// sample at the park time from the newest knot (has_v, v = 0), Stretch, the
+// knot at rest at the park time from the newest knot (has_v, v = 0), the
 // jog ceilings 200 mm/s and 200 mm/s^2 on a 268 mm rail. The queue grows
 // faster than it drains, as on the bench. `live` is the jog as Nucleus now
 // sends it: each move supersedes the queue at the reaction horizon
-// (truncateAfter) and is a HARD knot (C1, v = 0) due as soon as possible,
+// (truncateAfter) and is a HARD knot (a sample at rest) due as soon as possible,
 // so the solver's Profile::point sets its time.
 Tally jogScrub(uint32_t budget, bool live = false) {
     Tally t{live ? "B live jog" : "B jog scrub"};
-    Config cfg; cfg.limits = {200.0f / kRailMm, 200.0f / kRailMm, 5.0e6f / kRailMm}; cfg.policy = Policy::Stretch;
+    Config cfg; cfg.limits = {200.0f / kRailMm, 200.0f / kRailMm, 5.0e6f / kRailMm};
     cfg.solve_budget = budget;
     Engine<1, 64> e(cfg, 0.5f);
     auto parkUs = [&](float dd) {
@@ -193,11 +193,12 @@ Tally jogScrub(uint32_t budget, bool live = false) {
                 const uint64_t from = newest_us > now ? newest_us : now;
                 Knot k = knotFromSample(target, from, parkUs(std::fabs(target - newest_p)));
                 k.has_v = true;
+                k.sample = false;   // a parked target: an authored rest, not a live jog
                 if (live) {
                     (void)e.truncateAfter(now, now);
                     const Knot h = e.newest();
                     k = knotFromSample(target, h.t_us > now ? h.t_us : now, 1000);
-                    k.has_v = true; k.family = Family::C1;
+                    k.has_v = true;
                 }
                 if (e.submit(k, now)) { newest_us = k.t_us; newest_p = k.p; }
             });
@@ -216,7 +217,7 @@ Tally jogScrub(uint32_t budget, bool live = false) {
 // 10000).
 Tally stream60(uint32_t budget, float amp, const char* name) {
     Tally t{name};
-    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f}; cfg.policy = Policy::Blend;
+    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f};
     cfg.solve_budget = budget;
     Engine<1, 64> e(cfg, 0.5f);
     Peaks pk;
@@ -248,7 +249,7 @@ Tally stream60(uint32_t budget, float amp, const char* name) {
 // (D) The worst window: 64 infeasible segments in one bundle, solved once.
 Tally fullWindow(uint32_t budget) {
     Tally t{"D 64-knot bundle"};
-    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f}; cfg.policy = Policy::Blend;
+    Config cfg; cfg.limits = {2.0f, 100.0f, 10000.0f};
     cfg.solve_budget = budget;
     Engine<1, 64> e(cfg, 0.5f);
     Rng r(11);
@@ -258,7 +259,7 @@ Tally fullWindow(uint32_t budget) {
         for (int i = 0; i < 64; ++i) {
             at += uint64_t(r.uni(60.0f, 200.0f) * 1000.0f);
             dir = -dir;
-            (void)e.submit(knotFromSegment(0.5f + dir * r.uni(0.1f, 0.45f), uint32_t(at), true, 0.0f, 0, Family::C2), 0);
+            (void)e.submit(knotFromSegment(0.5f + dir * r.uni(0.1f, 0.45f), uint32_t(at), true, 0.0f, 0), 0);
         }
     });
     for (uint64_t now = 1; now < 20000 * kMs; now += kMs) { pk.add(e.stateAt(0, now), cfg.limits, t); drainInto(e, t); }
@@ -282,10 +283,8 @@ void print(const Tally& t) {
 int main(int argc, char** argv) {
     const uint32_t budget = argc > 1 ? uint32_t(std::atoi(argv[1])) : Config{}.solve_budget;
     std::printf("solve_budget %u\n", budget);
-    print(funscript(budget, Corner::Continuous, Family::Unspecified, false, "A funscript"));
-    print(funscript(budget, Corner::Cubic, Family::C1, false, "A funscript C1cub"));
-    print(funscript(budget, Corner::Continuous, Family::Unspecified, true, "A gentle"));
-    print(funscript(budget, Corner::Cubic, Family::C1, true, "A gentle C1cub"));
+    print(funscript(budget, false, "A funscript"));
+    print(funscript(budget, true, "A gentle"));
     print(jogScrub(budget));
     print(jogScrub(budget, true));
     print(stream60(budget, 0.25f, "C 60 Hz stream"));

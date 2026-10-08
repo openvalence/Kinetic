@@ -1,13 +1,12 @@
 // kinetic2/types.hpp -- the vocabulary of Kinetic²: knots, junctions, limits,
-// policies, anomalies, the sampled state
+// the planner options, anomalies, the sampled state
 // Constraints:
 // - Float-first: every quantity a caller sees or the sampler computes is float.
 //   Time is uint64_t microseconds on the caller's clock; deltas become float
 //   seconds only inside a piece (never an absolute time as float).
-// - Wire-visible ordinals are pinned: Policy values (Stretch 0, Blend 5) are
-//   stored in NVS and carried by the catalog select, and Anomaly kinds keep
-//   their meaning and numbering (the per-kind counter tables in Nucleus and
-//   valencesim index by them). New kinds append.
+// - Anomaly kinds are wire-visible: they keep their meaning and numbering
+//   (the per-kind counter tables in Nucleus and valencesim index by them).
+//   New kinds append.
 // - Normalized units: position 0..1 across the caller's travel window;
 //   velocity, acceleration and jerk in window units per s, s^2, s^3.
 // See: Valence RFC-105 (the promises), Nucleus val-7p2 (the rulings)
@@ -28,23 +27,13 @@ struct Limits {
     float jmax = 500.0f;   // window units/s^3
 };
 
-// ---- Policy -----------------------------------------------------------------
-// Not read by Kinetic²: time never gives, amplitude does (kin-y6e). The
-// ordinals are wire-pinned (NVS, the catalog select) and stay.
-enum class Policy : uint8_t {
-    Stretch = 0,
-    Blend   = 5,
-};
-
-// ---- Curve family (mirrors the Valence registry `curve_families`) -----------
-enum class Family : uint8_t { Unspecified = 0, C1 = 1, C2 = 2, Step = 3 };
-
 // ---- Junction kinds (RFC-105 promise 2) -------------------------------------
-// Derived from the family and whether an end velocity was given; never sent.
+// Derived from whether an end velocity was given and whether the knot is a
+// sample; never sent.
 enum class Junction : uint8_t {
-    Smooth   = 0,  // no end velocity, C2: v and a free, the smoothest curve through
-    Authored = 1,  // end velocity pinned; a continuous under C2, free to step under C1
-    Hard     = 2,  // a live jog (a C1 sample at rest): the fastest move to rest on the knot
+    Smooth   = 0,  // no end velocity: the renderer solves the angle (Config::smoothness)
+    Authored = 1,  // end velocity given: the knot's angle
+    Hard     = 2,  // a live jog (a sample at rest): the fastest move to rest on the knot
 };
 
 // ---- Knot -------------------------------------------------------------------
@@ -57,10 +46,9 @@ struct Knot {
     float    p      = 0.5f;     // window units
     float    v      = 0.0f;     // window units/s, meaningful when has_v
     bool     has_v  = false;
-    Family   family = Family::Unspecified;
-    // A sample (sources.hpp): rendered as any knot at its own time, trimmed
-    // like one; a HARD sample (a live jog, junctionOf) is the one knot that
-    // may land after its time.
+    // A sample (sources.hpp): a run of position-only samples is the chase
+    // (solver.hpp chaseRun); a sample at rest (has_v, v = 0) is a live jog,
+    // the HARD junction, the one knot that may land after its time.
     bool     sample = false;
     // Accepted and not read: the handle renderer rests every newest knot
     // without an authored velocity (SPEC 9.6) until its successor frees it,
@@ -70,43 +58,38 @@ struct Knot {
     bool     rest_if_last = false;
 };
 
-// The junction a knot renders, by the rules above. Unspecified behaves as C2.
-// Only a SAMPLE is Hard: an authored segment with v = 0 is a reversal or a
-// hold in the author's curve, rendered with the author's accelerations under
-// C1 (Corner::Cubic) and smoothly under C2. A C1 funscript reversal made
-// Hard braked to rest at every peak (Kinetic kin-ecn, kin-7jd).
+// The junction a knot renders, by the rules above. Only a SAMPLE is Hard: an
+// authored segment with v = 0 is a reversal or a hold in the author's curve,
+// rendered through, never braked to rest.
 constexpr Junction junctionOf(const Knot& k) {
     if (!k.has_v) return Junction::Smooth;
-    if (k.sample && k.family == Family::C1 && k.v == 0.0f) return Junction::Hard;
+    if (k.sample && k.v == 0.0f) return Junction::Hard;
     return Junction::Authored;
 }
 
-// ---- Corner (RFC-105 planner option `corner`) --------------------------------
-// How an AUTHORED C1 knot renders. Cubic is the default: the machine matches
-// the author's curve (operator ruling 2026-10-07); Continuous stays as the
-// option. The handle renderer (solver.hpp) does not read it: every knot
-// renders the Cubic way until kin-tnv maps the option onto the renderer.
-enum class Corner : uint8_t {
-    Continuous = 0,  // the junction acceleration is smoothed through
-    Cubic      = 1,  // each side keeps the author's cubic acceleration, joined
-                     // by a jerk-limited ramp centered on the knot (default)
-};
-
 // ---- Config -----------------------------------------------------------------
-// Every member here is a planner option in the RFC-105 sense: a setup-category
-// catalog field on the hub, tunable from the client. Add one only where one
-// choice is more accurate in one place and less in another (operator ruling
-// 2026-10-05); the default is the behavior the bench says is optimal.
+// Every member but limits and solve_budget is a planner option in the RFC-105
+// sense: a setup-category catalog field on the hub, tunable from the client.
+// Every member is read (solve_budget's reader is owed, below): one the
+// planner stops reading leaves this struct. Add
+// one only where one choice is more accurate in one place and less in another
+// (operator ruling 2026-10-05); the default is the behavior the bench says is
+// optimal. See: Valence RFC-108 (the set).
 struct Config {
-    Limits  limits{};
-    // policy, amplitude_floor and corner are not read by the handle renderer:
-    // time never gives, a trim may take the whole chord, and every G1 knot
-    // takes the corner ramp (Corner::Continuous is a no-op). They stay for
-    // the ABI and the catalog until kin-tnv maps or retires them.
-    Policy  policy          = Policy::Blend;
-    float   amplitude_floor = 0.25f;
-    uint32_t lookahead_us   = 250000;  // how far past now the solver considers knots
-    Corner  corner          = Corner::Cubic;
+    Limits   limits{};
+    // How free knots render: 0 crisp (pchip: no overshoot between monotone
+    // knots, acceleration may step at a crest), 1 smooth (acceleration
+    // continuous where the rules allow, overshoots by construction), the lerp
+    // of the two between (handles.hpp; a mid value solves twice). 0..1.
+    float    smoothness     = 0.0f;
+    // The shortest handle a ceiling fit may leave a piece, share of its span:
+    // the sharpest a fit may bend it. Held to at least handles::kLMin.
+    float    handle_floor   = 0.15f;
+    // The farthest a knot moves toward its predecessor to fit the ceilings,
+    // share of the window span. Below 1 a piece no trim within it makes legal
+    // renders over a ceiling, reported PieceOverCeiling, the newest knot's
+    // included. 0 turns trims off.
+    float    trim_max       = 1.0f;
     // A knot arriving while the axis moves re-plans from the state this far
     // ahead of now; the curve up to there is committed. Long enough that the
     // re-plan never starts inside a piece too short to bend legally, short
@@ -114,16 +97,10 @@ struct Config {
     // measured: 6 ms pieces spiraled into reversals, a committed knot froze a
     // start-up velocity into every later piece).
     uint32_t react_us       = 4000;
-    // Ignored: the handle renderer is never late (time never gives). Kept so
-    // the layout and the catalog stay as they are.
-    uint32_t late_budget_us = 100000;
-    // The most work one solve may do on the motion tick. The handle renderer
-    // renders the whole window and does not read it yet; kin-tnv bounds it
-    // per tick before a Nucleus pin bump. Measured 2026-10-07 on x86 -O2
-    // (bench_kinetic2): a 3-knot funscript plan 0.17 ms mean, 0.47 ms max; a
-    // 60 Hz stream 0.39 ms mean, 1.2 ms max; a 64-knot bundle 5.4 ms; the
-    // P4's float FPU is 10 to 20 times slower. FIXED BY THE MACHINE, never a
-    // catalog field (operator ruling 2026-10-06). 0: unbounded.
+    // The most work one planner run may do. FIXED BY THE MACHINE, never a
+    // catalog field (operator ruling 2026-10-06). Not read yet: every run
+    // renders its whole window; the bound is a resumable slice, bit-identical
+    // to an unbounded render (Valence RFC-108 item 8, kin-tnv). 0: unbounded.
     uint32_t solve_budget   = 96;
 };
 

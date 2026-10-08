@@ -13,7 +13,7 @@
 //   the next sample: the handle render of the whole window. A piece is then
 //   one solved interval. The brake profile (kin-4gd) replaces the trapezoid
 //   estimate in brake(), marked below.
-// - A solve renders the whole window (kin-tnv bounds it per tick).
+// - A solve renders the whole window (Config::solve_budget is not read yet).
 #pragma once
 
 #include <cmath>
@@ -117,10 +117,9 @@ public:
     // RFC-087): drops every pending knot authored AFTER t_us and keeps the
     // ones at or before it: a segment whose start is at or after t_us is
     // replaced, the one ending exactly at t_us is not (SPEC 9.6, RFC-087), so
-    // a bundle that begins where the queue ends changes nothing. Dropping
-    // the knot at t_us and standing a C2 hand-off in its place turned every
-    // knot of a C1 script into a C2 junction, one bundle per span, and the
-    // author's corners were lost. The curve through the reaction horizon is committed
+    // a bundle that begins where the queue ends changes nothing: the knot at
+    // t_us keeps the author's velocity, never a hand-off's. The curve through
+    // the reaction horizon is committed
     // first and never moves (RFC-105 (bb)). When t_us lies past the horizon
     // and inside the dropped plan, a knot at t_us carries that plan's (p, v)
     // there, so the motion in flight hands off at t_us as it would to any
@@ -161,7 +160,7 @@ public:
         }
         if (handoff) {
             Knot h;
-            h.t_us = t_us; h.p = hs.p; h.v = hs.v; h.has_v = true; h.family = Family::C2;
+            h.t_us = t_us; h.p = hs.p; h.v = hs.v; h.has_v = true;
             (void)a.tl.push(h);   // after every kept knot, with room: one was dropped
         }
         a.solved_valid = false;

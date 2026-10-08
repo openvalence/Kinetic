@@ -18,13 +18,13 @@ const TOL = 1e-3;
 const KNOT_SAMPLE = 0x1, KNOT_REST_IF_LAST = 0x2;
 const SPEND = 'rgba(77,166,255,0.55)';   // the reality blue, dimmed so spend marks never hide the trace   // relative slack before a sample counts as over a ceiling
 
-const DEF = { vmax: 3, amax: 30, jmax: 2000, policy: 'blend', floor: 0.25, corner: 'cubic', react: 4, look: 250 };
+const DEF = { vmax: 3, amax: 30, jmax: 2000, smooth: 0, floor: 0.15, trim: 1, react: 4 };
 const SPANS = [1, 2, 5, 10];
 const KIND = { 1: 'PlanFailed', 2: 'SettleEngaged', 3: 'EndVelClamped', 4: 'DeadlineStretched', 6: 'WaveformScaled', 10: 'DwellZeroed', 11: 'KnotRefused', 12: 'PieceOverCeiling' };
 const SENTINEL = { '-99': 'kDetailNonFinite: a non-finite value', '-95': 'kDetailPast: at or before now or the newest knot', '-96': 'kDetailTimelineFull: all 64 knot slots are pending' };
 
 // ---- state -----------------------------------------------------------------
-// knot: { t: s, p: window, fam: 2 C2 | 1 C1, v: null (free) | u/s }
+// knot: { t: s, p: window, v: null (free) | u/s, jog: true for a live jog }
 let S = { T: 2, mode: 'ahead', lat: 100, o: { ...DEF }, p0: 0.5, knots: [] };
 let sel = null;          // a knot object, 'start', or null
 let R = null;            // the last replay
@@ -49,9 +49,9 @@ async function boot() {
   }
   const { instance } = await WebAssembly.instantiate(bytes, {});
   K = instance.exports;
-  if (K.kinetic2_submit.length !== 8) {
+  if (K.kinetic2_submit.length !== 7) {
     $('#version').textContent = 'kinetic2.wasm is out of date';
-    status(`kinetic2.wasm predates this page: kinetic2_submit takes ${K.kinetic2_submit.length} arguments, 8 expected. Rebuild the kinetic2_wasm target.`);
+    status(`kinetic2.wasm does not match this page: kinetic2_submit takes ${K.kinetic2_submit.length} arguments, 7 expected. Rebuild the kinetic2_wasm target.`);
     K = null;
     return;
   }
@@ -79,8 +79,7 @@ function cstr(ptr) {
 // is a knot that renders and is never read as a drop.
 function replay() {
   const o = S.o;
-  const cfgOk = K.kinetic2_configure(h, o.vmax, o.amax, o.jmax, o.policy === 'blend' ? 5 : 0, o.floor,
-    Math.round(o.look * 1000), o.corner === 'cubic' ? 1 : 0, Math.round(o.react * 1000));
+  const cfgOk = K.kinetic2_configure(h, o.vmax, o.amax, o.jmax, o.smooth, o.floor, o.trim, Math.round(o.react * 1000));
   K.kinetic2_reset(h, S.p0, 0);
   const ks = [...S.knots].sort((a, b) => a.t - b.t);
   const lat = S.mode === 'stream' ? S.lat / 1000 : Infinity;
@@ -121,9 +120,9 @@ function replay() {
     while (e < ev.length && Math.round(ev[e].at * 1e6) <= tus) {
       const { k, at } = ev[e++];
       const now = Math.round(at * 1e6);
-      // A knot marked `jog` is a live jog: a C1 sample at rest is the HARD junction.
+      // A knot marked `jog` is a live jog: a sample at rest is the HARD junction.
       const flags = S.mode === 'stream' || k.jog ? KNOT_SAMPLE : k.v == null ? KNOT_REST_IF_LAST : 0;
-      const ok = K.kinetic2_submit(h, Math.round(k.t * 1e6), k.p, k.v == null ? 0 : 1, k.v ?? 0, k.fam, now, flags);
+      const ok = K.kinetic2_submit(h, Math.round(k.t * 1e6), k.p, k.v == null ? 0 : 1, k.v ?? 0, now, flags);
       submits.push({ k, at: now / 1e6, ok });
       drain();
       if (ok) live.push(k); else refused.add(k);
@@ -304,7 +303,7 @@ function knots(g, pn) {
   mark(g, 'square', sx, sy, 4.5, C.violet, sel === 'start' ? C.text : null);
   for (const k of S.knots) {
     if (k.t > S.T + 1e-9) continue;
-    const x = L.tx(k.t), y = pn.y(k.p), shape = k.fam === 1 ? 'diamond' : 'circle';
+    const x = L.tx(k.t), y = pn.y(k.p), shape = k.jog ? 'diamond' : 'circle';
     const s = R.solved.get(k);
     if (R.refused.has(k) || R.dropped.has(k) || (s && s.dropped)) {
       mark(g, shape, x, y, 6, null, C.hi);
@@ -407,7 +406,7 @@ overlay.addEventListener('pointerdown', (ev) => {
   if (!k) {
     let t = clamp(L.xt(x), 0.001, S.T), p = clamp((pn.y1 - y) / (pn.y1 - pn.y0) * (pn.hi - pn.lo) + pn.lo, 0, 1);
     if (ev.ctrlKey) { t = Math.max(0.05, snapTo(t, 0.05)); p = snapTo(p, 0.05); }
-    k = { t: +t.toFixed(6), p: +p.toFixed(5), fam: 2, v: null };
+    k = { t: +t.toFixed(6), p: +p.toFixed(5), v: null };
     S.knots.push(k);
   }
   sel = k;
@@ -484,21 +483,21 @@ reduced.addEventListener('change', motionPref);
 
 // ---- presets ---------------------------------------------------------------
 const PRESETS = {
-  stroke: { label: 'Stroke', title: '0.2 to 0.8 at 0.5 s, back to 0.2 at 1.0 s, a C1 stop at the end', make: () => ({
-    T: 2, mode: 'ahead', p0: 0.2, knots: [{ t: 0.5, p: 0.8, fam: 2, v: null }, { t: 1.0, p: 0.2, fam: 1, v: 0 }] }) },
-  staircase: { label: 'Staircase', title: 'Five steps of 0.15 every 300 ms, each a C1 knot at rest', make: () => ({
-    T: 2, mode: 'ahead', p0: 0.1, knots: [1, 2, 3, 4, 5].map((i) => ({ t: 0.3 * i, p: +(0.1 + 0.15 * i).toFixed(2), fam: 1, v: 0 })) }) },
+  stroke: { label: 'Stroke', title: '0.2 to 0.8 at 0.5 s, back to 0.2 at 1.0 s, at rest at the end', make: () => ({
+    T: 2, mode: 'ahead', p0: 0.2, knots: [{ t: 0.5, p: 0.8, v: null }, { t: 1.0, p: 0.2, v: 0 }] }) },
+  staircase: { label: 'Staircase', title: 'Five steps of 0.15 every 300 ms, each a knot at rest', make: () => ({
+    T: 2, mode: 'ahead', p0: 0.1, knots: [1, 2, 3, 4, 5].map((i) => ({ t: 0.3 * i, p: +(0.1 + 0.15 * i).toFixed(2), v: 0 })) }) },
   scrub: { label: 'Scrub', title: 'A 60 Hz stream of a 1 Hz sine, streamed at 16 ms latency. Capped at 60 knots (1 s): the ABI holds 64 pending knots', make: () => ({
     T: 2, mode: 'stream', lat: 16, p0: 0.15, knots: Array.from({ length: 60 }, (_, i) => {
       const t = (i + 1) / 60;
-      return { t: +t.toFixed(6), p: +(0.5 - 0.35 * Math.cos(2 * Math.PI * t)).toFixed(5), fam: 2, v: null };
+      return { t: +t.toFixed(6), p: +(0.5 - 0.35 * Math.cos(2 * Math.PI * t)).toFixed(5), v: null };
     }) }) },
-  hardstop: { label: 'Hard stop', title: 'A live jog to 0.5 (a C1 sample at rest: the fastest move, braked onto it), then onward', make: () => ({
-    T: 2, mode: 'ahead', p0: 0.1, knots: [{ t: 0.6, p: 0.5, fam: 1, v: 0, jog: true }, { t: 1.2, p: 0.9, fam: 2, v: null }] }) },
-  overreach: { label: 'Overreach', title: '0.05 to 0.95 in 150 ms: Blend trims it, Stretch moves it', make: () => ({
-    T: 1, mode: 'ahead', p0: 0.05, knots: [{ t: 0.15, p: 0.95, fam: 2, v: null }] }) },
+  hardstop: { label: 'Hard stop', title: 'A live jog to 0.5 (a sample at rest: the fastest move, braked onto it), then onward', make: () => ({
+    T: 2, mode: 'ahead', p0: 0.1, knots: [{ t: 0.6, p: 0.5, v: 0, jog: true }, { t: 1.2, p: 0.9, v: null }] }) },
+  overreach: { label: 'Overreach', title: '0.05 to 0.95 in 150 ms: trimmed toward the start, on time', make: () => ({
+    T: 1, mode: 'ahead', p0: 0.05, knots: [{ t: 0.15, p: 0.95, v: null }] }) },
   starved: { label: 'Starved stream', title: 'Streamed, a knot every 100 ms for 0.5 s, then nothing: the brake engages', make: () => ({
-    T: 1, mode: 'stream', lat: 100, p0: 0.2, knots: [1, 2, 3, 4, 5].map((i) => ({ t: 0.1 * i, p: +(0.2 + 0.1 * i).toFixed(2), fam: 2, v: null })) }) },
+    T: 1, mode: 'stream', lat: 100, p0: 0.2, knots: [1, 2, 3, 4, 5].map((i) => ({ t: 0.1 * i, p: +(0.2 + 0.1 * i).toFixed(2), v: null })) }) },
 };
 
 function preset(name, render_ = true) {
@@ -514,9 +513,9 @@ function saveHash() {
   clearTimeout(hashTimer);
   hashTimer = setTimeout(() => {
     const o = S.o;
-    const j = JSON.stringify({ v: 1, T: S.T, m: S.mode, l: S.lat, p0: S.p0,
-      o: [o.vmax, o.amax, o.jmax, o.policy, o.floor, o.corner, o.react, o.look],
-      k: S.knots.map((k) => (k.jog ? [k.t, k.p, k.fam, k.v, 1] : [k.t, k.p, k.fam, k.v])) });
+    const j = JSON.stringify({ v: 2, T: S.T, m: S.mode, l: S.lat, p0: S.p0,
+      o: [o.vmax, o.amax, o.jmax, o.smooth, o.floor, o.trim, o.react],
+      k: S.knots.map((k) => (k.jog ? [k.t, k.p, k.v, 1] : [k.t, k.p, k.v])) });
     const b = btoa(j).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     history.replaceState(null, '', '#' + b);
   }, 250);
@@ -527,6 +526,7 @@ function loadHash() {
   try {
     const j = JSON.parse(atob(location.hash.slice(1).replace(/-/g, '+').replace(/_/g, '/')));
     const num = (v, lo, hi, d) => (Number.isFinite(v) ? clamp(v, lo, hi) : d);
+    if (j.v !== 2) throw new Error('link version');
     const o = Array.isArray(j.o) ? j.o : [];
     S = {
       T: SPANS.includes(j.T) ? j.T : 2,
@@ -534,11 +534,11 @@ function loadHash() {
       lat: num(j.l, 0, 500, 100),
       p0: num(j.p0, 0, 1, 0.5),
       o: { vmax: num(o[0], 0.1, 30, DEF.vmax), amax: num(o[1], 1, 300, DEF.amax), jmax: num(o[2], 10, 10000, DEF.jmax),
-        policy: o[3] === 'stretch' ? 'stretch' : 'blend', floor: num(o[4], 0, 1, DEF.floor), corner: o[5] === 'cubic' ? 'cubic' : 'continuous',
-        react: num(o[6], 0, 50, DEF.react), look: num(o[7], 50, 1000, DEF.look) },
+        smooth: num(o[3], 0, 1, DEF.smooth), floor: num(o[4], 0.05, 0.33, DEF.floor), trim: num(o[5], 0, 1, DEF.trim),
+        react: num(o[6], 0, 50, DEF.react) },
       knots: (Array.isArray(j.k) ? j.k : []).slice(0, 128).filter((k) => Array.isArray(k) && Number.isFinite(k[0]) && Number.isFinite(k[1]))
-        .map((k) => ({ t: clamp(k[0], 0.001, 10), p: clamp(k[1], 0, 1), fam: k[2] === 1 ? 1 : 2, v: Number.isFinite(k[3]) ? clamp(k[3], -100, 100) : null,
-                       ...(k[4] === 1 ? { jog: true } : {}) })),
+        .map((k) => ({ t: clamp(k[0], 0.001, 10), p: clamp(k[1], 0, 1), v: Number.isFinite(k[2]) ? clamp(k[2], -100, 100) : null,
+                       ...(k[3] === 1 ? { jog: true } : {}) })),
     };
     return true;
   } catch {
@@ -552,11 +552,10 @@ const OPTS = [
   { key: 'vmax', label: 'vmax', unit: 'u/s', log: [0.1, 30] },
   { key: 'amax', label: 'amax', unit: 'u/s²', log: [1, 300] },
   { key: 'jmax', label: 'jmax', unit: 'u/s³', log: [10, 10000] },
-  { key: 'policy', label: 'policy', choices: [['blend', 'Blend'], ['stretch', 'Stretch']] },
-  { key: 'floor', label: 'amplitude floor', lin: [0, 1, 0.01] },
-  { key: 'corner', label: 'corner', choices: [['continuous', 'Continuous'], ['cubic', 'Cubic']] },
+  { key: 'smooth', label: 'smoothness', unit: '0 crisp, 1 smooth', lin: [0, 1, 0.05] },
+  { key: 'floor', label: 'handle floor', unit: 'of the span', lin: [0.05, 0.33, 0.01] },
+  { key: 'trim', label: 'max trim', unit: 'of the window', lin: [0, 1, 0.05] },
   { key: 'react', label: 'reaction horizon', unit: 'ms', lin: [0, 50, 1] },
-  { key: 'look', label: 'lookahead', unit: 'ms', lin: [50, 1000, 10] },
 ];
 const syncers = [];
 
@@ -640,18 +639,17 @@ function buildUi() {
   num('#i-t', (v) => { if (sel && sel !== 'start') sel.t = clamp(v, 0.001, 10); });
   num('#i-p', (v) => { if (sel && sel !== 'start') sel.p = clamp(v, 0, 1); });
   num('#i-v', (v) => { if (sel && sel !== 'start' && sel.v != null) sel.v = v; });
-  $('#i-fam').addEventListener('change', (ev) => { sel.fam = +ev.target.value; changed(); });
   $('#i-vmode').addEventListener('change', (ev) => { sel.v = ev.target.value === 'set' ? 0 : null; changed(); });
   $('#i-del').addEventListener('click', () => sel && sel !== 'start' && remove(sel));
 
   $('#legend').innerHTML = [
     ['<rect x="3" y="3" width="8" height="8" fill="#A78BFA"/>', 'start (at rest)'],
-    ['<circle cx="7" cy="7" r="4.5" fill="#A78BFA"/>', 'C2 knot'],
-    ['<path d="M7 1.5 12.5 7 7 12.5 1.5 7Z" fill="#A78BFA"/>', 'C1 knot'],
+    ['<circle cx="7" cy="7" r="4.5" fill="#A78BFA"/>', 'knot'],
+    ['<path d="M7 1.5 12.5 7 7 12.5 1.5 7Z" fill="#A78BFA"/>', 'live jog'],
     ['<circle cx="7" cy="7" r="5" fill="none" stroke="#A78BFA" stroke-width="1.5"/>', 'authored, moved by the spend'],
     ['<circle cx="7" cy="7" r="4" fill="#4DA6FF"/>', 'solved'],
-    ['<line x1="7" y1="1" x2="7" y2="13" stroke="#4DA6FF" stroke-width="1.5"/>', 'Blend trim'],
-    ['<path d="M1 7H10M8 3.5 12.5 7 8 10.5Z" stroke="#4DA6FF" stroke-width="1.5" fill="#4DA6FF"/>', 'Stretch'],
+    ['<line x1="7" y1="1" x2="7" y2="13" stroke="#4DA6FF" stroke-width="1.5"/>', 'trim'],
+    ['<path d="M1 7H10M8 3.5 12.5 7 8 10.5Z" stroke="#4DA6FF" stroke-width="1.5" fill="#4DA6FF"/>', 'landed late (a live jog)'],
     ['<circle cx="7" cy="7" r="5.5" fill="none" stroke="#FF5CB3" stroke-width="1.5"/><path d="M4 4 10 10M10 4 4 10" stroke="#FF5CB3" stroke-width="1.5"/>', 'dropped or refused'],
     ['<rect x="2" y="2" width="10" height="10" fill="#FF5CB3"/><text x="7" y="10.5" font-size="9" text-anchor="middle" font-family="monospace" fill="#040507" font-weight="bold">v</text>', 'end velocity clamped'],
     ['<path d="M1 7H13" stroke="#33373E" stroke-dasharray="3 2" stroke-width="1.5"/>', 'ceiling'],
@@ -674,13 +672,12 @@ function inspector() {
   if (!sel || sel === 'start') return;
   const k = sel;
   keep('#i-t', k.t); keep('#i-p', k.p);
-  $('#i-fam').value = String(k.fam);
   $('#i-vmode').value = k.v == null ? 'free' : 'set';
   $('#i-vrow').hidden = k.v == null;
   if (k.v != null) keep('#i-v', k.v);
-  $('#i-hint').textContent = k.v == null ? 'The solver picks the junction velocity.'
-    : k.fam === 1 && k.v === 0 ? 'C1 with 0: a hard stop, the fastest legal brake lands here.'
-    : k.fam === 1 ? 'C1: acceleration may step here (corner option).' : 'C2: velocity pinned, acceleration continuous.';
+  $('#i-hint').textContent = k.v == null ? 'The solver picks the angle (smoothness).'
+    : k.jog && k.v === 0 ? 'A live jog: the fastest legal move lands here at rest.'
+    : 'Authored velocity: the knot passes at it.';
   const s = R.solved.get(k), dl = $('#i-solved');
   if (R.refused.has(k)) { dl.innerHTML = '<dt>status</dt><dd class="bad">refused (see anomalies)</dd>'; return; }
   if (R.dropped.has(k)) { dl.innerHTML = '<dt>status</dt><dd class="bad">dropped: PlanFailed (see anomalies)</dd>'; return; }
@@ -700,7 +697,7 @@ function meaning(a) {
     case 2: return `braked at ${Math.abs(d).toFixed(2)} u/s: the timeline ran dry`;
     case 3: return `end velocity cut to ${d.toFixed(2)} u/s`;
     case 4: return `deadline moved ${(d * 1000).toFixed(0)} ms later`;
-    case 6: return `Blend kept ${(d * 100).toFixed(0)}% of the stroke`;
+    case 6: return `the trim kept ${(d * 100).toFixed(0)}% of the stroke`;
     case 10: return 'same target re-commanded: a hold, its end velocity dropped';
     case 11: return 'knot refused: ' + (sentinel || 'detail ' + d);
     case 12: return 'no trim keeps this span inside a limit: it renders at its least-over trim, worst ceiling ratio '

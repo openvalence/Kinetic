@@ -349,8 +349,9 @@ $('#c-rail').addEventListener('change', (ev) => {
   const size = Math.min(cfg.hi - cfg.lo, r), lo = Math.min(cfg.lo, r - size); setWindow(lo, lo + size);
 });
 syncWindowInputs();
-$('#c-style').value = cfg.style;
-$('#c-style').addEventListener('change', (ev) => { cfg.style = ev.target.value; update(); });
+const syncSmooth = () => { $('#c-smooth').value = cfg.smoothness; $('#c-smoothout').textContent = cfg.smoothness.toFixed(2); };
+syncSmooth();
+$('#c-smooth').addEventListener('input', (ev) => { cfg.smoothness = Number(ev.target.value); syncSmooth(); update(); });
 document.addEventListener('keydown', (ev) => {
   if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return;
   if (ev.key === 'Escape') { sel = null; update(); }
