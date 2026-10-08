@@ -1409,6 +1409,39 @@ TEST_CASE("a PCHIP script renders as its author's curve; with no velocities its 
     CHECK(g2.failed == 0);
 }
 
+// The band keeps a piece monotone only at a third (RFC-106 item 3); under
+// Pchip the judge reads what a lengthened handle travels backward (kin-ay9).
+TEST_CASE("pchip judges monotonicity: a lengthened band-legal piece that overshoots or reverses is over") {
+    const handles::Cfg c;
+    auto back = [](const handles::Piece& q) {   // backward travel over the chord, sampled
+        float top = -1e30f, b = 0.0f;
+        for (int k = 0; k <= 20000; ++k) {
+            const float x = handles::evalPiece(q, float(k) / 20000.0f).p / q.D;
+            if (x > top) top = x; else b = std::fmax(b, top - x);
+        }
+        return b;
+    };
+    // The review's pieces: alpha, beta = 3, 0 at a length of 0.5 overshoots
+    // its end by 8% of the chord; 3, 3 at 0.4 reverses inside.
+    const handles::Piece over{1.0f, 0.5f, 1.5f, 0.0f, 0.5f, 0.5f};
+    const handles::Piece rev{1.0f, -0.5f, -1.5f, -1.5f, 0.4f, 0.4f};
+    MESSAGE("overshoot " << back(over) << ", reversal " << back(rev) << " of the chord");
+    CHECK(back(over) == doctest::Approx(0.08).epsilon(0.01));
+    CHECK(back(rev) > 0.05f);
+    CHECK(handles::monoOver(over, c) == doctest::Approx(1.0f + back(over)).epsilon(1e-4));
+    CHECK(handles::monoOver(rev, c) == doctest::Approx(1.0f + back(rev)).epsilon(1e-4));
+    // At a third the band keeps it monotone; Smooth and a hold are not judged.
+    handles::Piece third = over;
+    third.i0 = third.i1 = handles::kThird;
+    CHECK(handles::monoOver(third, c) <= 1.0f + handles::kTol);
+    handles::Cfg sm;
+    sm.style = handles::Style::Smooth;
+    CHECK(handles::monoOver(over, sm) == 0.0f);
+    handles::Piece hold = over;
+    hold.D = 0.004f; hold.s0 = 0.012f;
+    CHECK(handles::monoOver(hold, c) == 0.0f);
+}
+
 // RFC-087: a bundle that begins exactly where the queue ends replaces nothing;
 // the knot at its first start is the end of a segment that started before it.
 // Dropping it stood a C2 hand-off knot in its place on every bundle, and a C1

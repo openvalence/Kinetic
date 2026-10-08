@@ -241,6 +241,19 @@
     }
     return best;
   }
+  // railStop, pchip: a band-legal piece (both angles zero or of its chord's sign and at
+  // most 3 (1 + TOL) times it) stays monotone at its scaled lengths: 1 + the share of
+  // its chord it travels backward (an overshoot past its end or a reversal inside),
+  // read from the samples; 0 when not judged (a hold, an angle outside the band)
+  function monoOver(r, D, T, s0, s1, c) {
+    if (!(Math.abs(D) > c.holdEps)) return 0;
+    const m = D / T, al = s0 / m, be = s1 / m, b = 3 * (1 + TOL);
+    if (!(al >= 0 && al <= b && be >= 0 && be <= b)) return 0;
+    const sg = Math.sign(D);
+    let top = -Infinity, back = 0;
+    for (const p of r.p) { const x = sg * p; if (x > top) top = x; else back = Math.max(back, top - x); }
+    return 1 + back / Math.abs(D);
+  }
   // s1: R's angle for this fit (bandHold may lower it); room: railStop's corner room
   function fitPiece(L, R, pL, pR, c, s1 = R.vIn, room = null) {
     const T = R.t - L.t, D = pR - pL, floor = Math.max(LMIN, c.lfloor);
@@ -251,6 +264,7 @@
       const r = sample(L.t, pL, D, T, L.vOut, s1, i0, i1, NS);
       let o = over(r, c);
       if (room) o = Math.max(o, roomOver(endAccel(D, T, L.vOut, s1, i0, i1), T, room, c.jmax));
+      if (c.railStop && c.style === 'pchip') o = Math.max(o, monoOver(r, D, T, L.vOut, s1, c));
       if (o <= 1 + TOL) return { k, i0, i1, o, legal: true };
       if (!best || o < best.o) best = { k, i0, i1, o, legal: false };
     }

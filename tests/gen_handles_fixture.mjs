@@ -29,12 +29,15 @@ const CASES = [
 // engine's slack passes move these past the corner-ramp allowance.
 // rail_caps: two caps, an end-acceleration ask, a window excursion, a trimmed last knot.
 // rail_band: band-held trims, two caps, a chord too fast to be a hold, a trimmed last knot.
+// pchip_mono: the monotone judge at work (kin-ay9); without it knots 5 to 7 trim otherwise.
 const act = (pairs) => ({ actions: pairs.map(([at, pos]) => ({ at, pos })) });
 const RENDER_CASES = [
   { name: 'rail_caps', cfg: { vmax: 1180, amax: 47500, jmax: 2.53e6 },
     doc: act([[0, 99], [123, 81], [145, 36], [225, 83], [316, 83], [593, 83.3], [653, 12], [689, 67], [716, 98], [751, 48]]) },
   { name: 'rail_band', cfg: { vmax: 960, amax: 5000, jmax: 4.57e6 },
     doc: act([[0, 85], [462, 77], [827, 70], [931, 72], [955, 96], [1099, 4], [1119, 32], [1157, 32.4]]) },
+  { name: 'pchip_mono', cfg: { vmax: 748.6, amax: 14300, jmax: 6.876e6 },
+    doc: act([[0, 74], [140, 85], [456, 85], [557, 78], [678, 2], [710, 44], [769, 99], [838, 88]]) },
 ];
 // solveWindow's knobs, in window units W
 const KERNEL = (W) => ({ railStop: true, trimLast: true, lfloor: 0.15, holdEps: 0.005 * W, trim: W, style: 'pchip' });

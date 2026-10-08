@@ -25,9 +25,28 @@
 //   HKnot::aIn and Piece::da are the engine's (solver.hpp renderRun,
 //   engine_piece.hpp); the model has none of them. At their defaults the
 //   render is the model's, except that an illegal hold lies flat with
-//   railStop off too, and overOf judges each peak at its exact turning points
-//   where the model samples: the two agree within kTol, which can move a
-//   trim that sits on a legality boundary.
+//   railStop off too, Pchip judges monotonicity with railStop off too (the
+//   model under railStop only), and overOf judges each peak at its exact
+//   turning points where the model samples: the two agree within kTol, which
+//   can move a trim that sits on a legality boundary.
+// - Under Pchip a band-legal piece stays monotone at its scaled lengths
+//   (monoOver, kin-ay9): the band guarantees it only at a third.
+// - The solve order (RFC-106 item 7): every angle first, with every length a
+//   third (authored kept, else the style's start angle; each held to vmax and
+//   its cap, an authored one under railStop to the rail, the origin's live
+//   angle never), then four G2 sweeps (solve). Then per piece in knot order
+//   one length factor on the k grid (ksAt: 1, 0.95, 1.05, ... 0.2, then 1.85
+//   to 2.0, the lower first on a tie), the first legal taken, else the trim
+//   (nudge). Then two rounds of solve on the trimmed chords and fit again,
+//   plus one round for each last round that capped an angle or asked an end
+//   acceleration, at most four (render). The solver renders again with
+//   tightened ceilings, at most kSlackPasses (3) times (solver.hpp
+//   renderRun). Angles are solved at a third, so a G2 knot whose piece scales
+//   loses the match and is G1: the solver rounds its acceleration step with a
+//   corner ramp at jmax.
+// - Parity with the model (tests/test_kinetic2_handles.cpp): trims within
+//   1e-4 of the window; the engine's positions within 0.5% and its trims
+//   within 1e-4, both past the corner-ramp allowance.
 // See: Valence RFC-106, Kinetic kin-y6e
 #pragma once
 
@@ -643,6 +662,26 @@ inline float roomOver(const Piece& q, const Room& rm, float jmax) {
     return o;
 }
 
+// Under Pchip a band-legal piece (both angles zero or of its chord's sign and
+// at most 3 (1 + kTol) times it) stays monotone at its scaled lengths: 1 +
+// the share of its chord it travels backward (an overshoot past its end or a
+// reversal inside); 0 when not judged (Smooth, a hold, an angle outside the
+// band: an authored angle's overshoot is the author's). Exact: P'(u) / 3D is
+// A (1-u)^2 + 2 B u (1-u) + C u^2, which changes sign only when B^2 > A C, B < 0.
+inline float monoOver(const Piece& q, const Cfg& c) {
+    if (c.style != Style::Pchip || !(std::fabs(q.D) > c.holdEps)) return 0.0f;
+    const float m = q.D / q.T, al = q.s0 / m, be = q.s1 / m, b = 3.0f * (1.0f + kTol);
+    if (!(al >= 0.0f && al <= b && be >= 0.0f && be <= b)) return 0.0f;
+    const float A = al * q.i0, C = be * q.i1, B = 1.0f - A - C;
+    if (B >= 0.0f || B * B <= A * C) return 1.0f;
+    // The turning points (P' / 3D = A - 2 (A - B) u + (A - 2 B + C) u^2), both in [0, 1].
+    const float sq = std::sqrt(B * B - A * C), den = A - 2.0f * B + C;
+    const float r1 = (A - B - sq) / den, r2 = (A - B + sq) / den;
+    // P / D, the control points 0, A, 1 - C, 1.
+    auto P = [&](float u) { const float w = 1.0f - u; return 3.0f * u * w * (w * A + u * (1.0f - C)) + u * u * u; };
+    return 1.0f + std::fmax(0.0f, P(r1) - P(r2));
+}
+
 inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cfg& c, float bound = INFINITY,
                     const Room* room = nullptr, int* hint = nullptr) {
     const float floor = std::fmax(kLMin, c.lfloor);
@@ -664,16 +703,16 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
         q.s1 = R.vel;
         q.i0 = std::fmin(kLMax, std::fmax(floor, L.lOut * f));
         q.i1 = std::fmin(kLMax, std::fmax(floor, R.lIn * f));
-        const float ro = room ? roomOver(q, *room, cs.lim.jmax) : 0.0f;
+        const float ro = std::fmax(room ? roomOver(q, *room, cs.lim.jmax) : 0.0f, monoOver(q, cs));
         const float o = std::fmax(ro, ro > 1.0f + kTol && ro >= bound_ && !parts ? ro
                                       : overOf(q, pL, cs, parts ? INFINITY : bound_, parts));
         return Fit{f, q.i0, q.i1, o, o <= 1.0f + kTol};
     };
     // k = 1 first, with its parts: a speed or window excess wants shorter
     // handles, an acceleration or jerk excess longer ones, so the other side
-    // of the grid is skipped; both at once, or a room that is over, keep the
-    // model's full walk. The order is the model's (nearest 1 first), so the
-    // first legal factor is the same.
+    // of the grid is skipped; both at once, or a room or reversal that is
+    // over, keep the model's full walk. The order is the model's (nearest 1
+    // first), so the first legal factor is the same.
     Over parts;
     // With a hint the side is known from the last fit: k = 1 is judged with
     // the early return (its parts are not needed) and the walk stays on that
@@ -688,7 +727,7 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     } else {
         overV = parts.v > 1.0f + kTol || parts.x > 1.0f + kTol;
         overAJ = parts.a > 1.0f + kTol || parts.j > 1.0f + kTol;
-        roomOver_ = room && f1.o > std::fmax(std::fmax(parts.v, parts.a), std::fmax(parts.j, parts.x)) + kTol;
+        roomOver_ = f1.o > std::fmax(std::fmax(parts.v, parts.a), std::fmax(parts.j, parts.x)) + kTol;
     }
     const bool tryDown = !(overAJ && !overV) || roomOver_, tryUp = !(overV && !overAJ) || roomOver_;
     // A legality test (bound at the tolerance) with no factor able to recover
@@ -816,6 +855,12 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
                 f = fh;
                 dp = dir * hi;
             } else {
+                // Constraint: reachable (kin-ay9). The full move is a zero stroke,
+                // illegal while L's angle heads into the span faster than the span
+                // turns it (its cap lands a round later, at most four), and a
+                // partial move can be legal then: without this the property suite's
+                // PieceOverCeiling rose from 48 to 472 (seed 6: speed,
+                // acceleration and the window over).
                 for (int q = 1; q <= 4; ++q) {
                     const float d = dir * 0.25f * static_cast<float>(q) * hi;
                     const Fit fq = fitAt(R.p + d, f.o);
