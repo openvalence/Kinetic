@@ -201,10 +201,11 @@
   // under the feel floor); if none is, move the later knot toward the previous
   // knot's actual position by the least that is legal (bisection; the stroke
   // keeps its time and loses height). A knot that was reachable never moves.
-  // Under railStop the window is a wall: leaving it past the tolerance ranks below
-  // any ceiling ratio short of a thousand, so the least-over fit stays inside.
+  // Under railStop the window is a wall: leaving it past half the tolerance ranks
+  // below any ceiling ratio short of a thousand, so the least-over fit stays inside
+  // (the other half is the engine's: a built piece reads a little past its render).
   const over = (r, c) => {
-    const out = Math.max(0, c.lo - r.pMin, r.pMax - c.hi), wall = c.railStop && out > TOL * (c.hi - c.lo) ? 1e3 : 1;
+    const out = Math.max(0, c.lo - r.pMin, r.pMax - c.hi), wall = c.railStop && out > 0.5 * TOL * (c.hi - c.lo) ? 1e3 : 1;
     return Math.max(r.peakV / c.vmax, r.peakA / c.amax, r.peakJ / c.jmax, wall + out / (c.hi - c.lo));
   };
   const KS = []; for (let k = 0.2; k <= 2.0001; k += 0.05) KS.push(k);
@@ -236,7 +237,8 @@
   }
   // railStop: the fastest angle at L whose zero-stroke piece to R (R at L's height,
   // at rest) is legal at some length factor (every peak is linear in the angle),
-  // toward the wall dir heads for; intoFlat: the corner ramp to rest fits in half the span
+  // toward the wall dir heads for; intoFlat: the corner ramp to rest fits in half the span;
+  // the end acceleration stays within R's ask (aTarget, aTol) when it has one
   function zeroStrokeMax(L, R, pL, dir, c, intoFlat) {
     const T = R.t - L.t, floor = Math.max(LMIN, c.lfloor), gap = dir > 0 ? c.hi - pL : pL - c.lo;
     let best = 0;
@@ -247,6 +249,10 @@
       let s = Math.min(c.vmax / r.peakV, c.amax / r.peakA, c.jmax / r.peakJ);
       if (px > 0) s = Math.min(s, Math.max(0, gap) / px);
       if (intoFlat) s = Math.min(s, c.jmax * Math.max(0, 0.5 * T - TICK) / Math.abs(endAccel(0, T, dir, 0, i0, i1).aEnd));
+      if (!Number.isNaN(R.aTarget)) {
+        const e1 = endAccel(0, T, dir, 0, i0, i1).aEnd;
+        s = Math.min(s, Math.max(0, (R.aTol + (e1 > 0 ? R.aTarget : -R.aTarget)) / Math.abs(e1)));
+      }
       best = Math.max(best, s);
     }
     return best;
@@ -311,20 +317,32 @@
       // a hold after a trimmed knot moves with it: the hold stays flat at the trimmed height
       const hold = holdChord(knots, i, pos(R) - pos(L), c);
       const canTrim = c.trim > 0 && (i + 1 < n - 1 || c.trimLast);
-      let f = fitAt(pos(R) + (hold ? L.dp : 0)), dp = hold ? L.dp : 0;
-      if (!f.legal && !hold && canTrim) {
-        const dir = Math.sign(pL - pos(R)); let lo = 0, hi = Math.min(c.trim, Math.abs(pos(R) - pL));
-        let fh = fitAt(pos(R) + dir * hi);
-        if (fh.legal) {
-          for (let s = 0; s < 16; s++) { const m = (lo + hi) / 2, fm = fitAt(pos(R) + dir * m); if (fm.legal) { hi = m; fh = fm; } else lo = m; }
-          f = fh; dp = dir * hi;
-        } else { // nothing reachable: take the least-over position on the way
-          for (const q of [0.25, 0.5, 0.75, 1]) { const fq = fitAt(pos(R) + dir * q * hi); if (fq.o < f.o) { f = fq; dp = dir * q * hi; } }
+      let f, dp;
+      const search = () => {
+        f = fitAt(pos(R) + (hold ? L.dp : 0)); dp = hold ? L.dp : 0;
+        if (!f.legal && !hold && canTrim) {
+          const dir = Math.sign(pL - pos(R)); let lo = 0, hi = Math.min(c.trim, Math.abs(pos(R) - pL));
+          let fh = fitAt(pos(R) + dir * hi);
+          if (fh.legal) {
+            for (let s = 0; s < 16; s++) { const m = (lo + hi) / 2, fm = fitAt(pos(R) + dir * m); if (fm.legal) { hi = m; fh = fm; } else lo = m; }
+            f = fh; dp = dir * hi;
+          } else { // nothing reachable: take the least-over position on the way
+            for (const q of [0.25, 0.5, 0.75, 1]) { const fq = fitAt(pos(R) + dir * q * hi); if (fq.o < f.o) { f = fq; dp = dir * q * hi; } }
+          }
         }
+        // railStop: an illegal hold lies flat at its predecessor instead when that is less over
+        if (rs && !f.legal && hold && canTrim) { const ff = fitAt(pL); if (ff.o < f.o) { f = ff; dp = pL - pos(R); } }
+      };
+      search();
+      // railStop: an end-acceleration ask no fit honors legally is dropped (it is the
+      // next piece's jerk, never this piece's speed or acceleration)
+      if (rs && !f.legal && !Number.isNaN(room.aEnd)) {
+        const fa = f, da = dp;
+        room.aEnd = NaN; room.aEndTol = Infinity;
+        search();
+        if (!f.legal) { f = fa; dp = da; }
       }
       if (rs) {
-        // an illegal hold lies flat at its predecessor instead when that is less over
-        if (!f.legal && hold && canTrim) { const ff = fitAt(pL); if (ff.o < f.o) { f = ff; dp = pL - pos(R); } }
         // still over: L's angle is faster than its span can stop; its cap holds it
         // from the next solve on (under a thousandth of vmax it is zero)
         if (!f.legal && i > 0 && L.vOut !== 0) {
@@ -336,10 +354,11 @@
         const T = R.t - L.t, e = endAccel(pos(R) + dp - pL, T, L.vOut, R.vIn, f.i0, f.i1);
         R.aIn = e.aEnd;
         // over because the start ramp at L does not fit: the piece into L is asked
-        // to end near this piece's start (from the next round)
+        // to end near this piece's start, held to amax (from the next round)
         if (!f.legal && startRoom(e, T, room, c.jmax) > 1 + TOL) {
           const span = room.fromFlat ? 0.5 * T - TICK : Math.min(T, room.tIn) - 2 * TICK, tol = 0.95 * c.jmax * span;
-          if (tol > 0 && !(L.aTarget === e.aStart && L.aTol === tol)) { L.aTarget = e.aStart; L.aTol = tol; steps.capped = true; }
+          const target = Math.max(-c.amax, Math.min(c.amax, e.aStart));
+          if (tol > 0 && !(L.aTarget === target && L.aTol === tol)) { L.aTarget = target; L.aTol = tol; steps.capped = true; }
         }
       }
       L.effOut = f.i0; R.effIn = f.i1; R.dp = dp; R.infeasible = !f.legal;

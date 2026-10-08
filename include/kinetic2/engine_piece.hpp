@@ -73,13 +73,14 @@ struct Piece {
     // From s0 at t0 to s1 at t1 with the render's handle lengths i0 / i1, both
     // end accelerations matched as match() allows; else a lead ramp, else the
     // start correction. exact: what match() leaves of the start step (under
-    // kStepS) is carried by the start correction too.
+    // kStepS) is carried by the start correction too. keep: the lengths are
+    // never matched (the lead ramp and the start correction carry the step).
     static Piece bezier(uint64_t t0, const State& s0, uint64_t t1, const State& s1, float i0, float i1,
-                        const Limits& L, bool exact = false) {
+                        const Limits& L, bool exact = false, bool keep = false) {
         Piece pc; pc.start_us = t0; pc.end_us = t1; pc.bez_us = t0; pc.p0 = s0.p;
         if (t1 <= t0) { pc.p0 = s1.p; return pc; }
         handles::Piece q{float(t1 - t0) * 1e-6f, s1.p - s0.p, s0.v, s1.v, i0, i1};
-        if (!match(q, s0.a, s1.a, L)) {
+        if (keep || !match(q, s0.a, s1.a, L)) {
             // The render's lengths stay: the renderer sized the start ramp's
             // room for them (handles::startRoom). A length moved toward the
             // start acceleration here rendered a lone 200 ms segment as a 150
@@ -98,7 +99,7 @@ struct Piece {
                 const State e = Profile::step(s0, lead.jerk[0], tr);
                 pc.has_lead = true; pc.lead = lead; pc.bez_us = t0 + tr_us; pc.p0 = e.p;
                 q = handles::Piece{float(t1 - pc.bez_us) * 1e-6f, s1.p - e.p, e.v, s1.v, i0, i1};
-                if (match(q, e.a, s1.a, L) || std::fabs(handles::aStartOf(q) - e.a) <= L.jmax * kStepS) break;
+                if ((!keep && match(q, e.a, s1.a, L)) || std::fabs(handles::aStartOf(q) - e.a) <= L.jmax * kStepS) break;
             }
             if (pc.has_lead && std::fabs(handles::aStartOf(q) - pc.lead.end().a) > L.jmax * 1e-4f) {
                 q = q0;

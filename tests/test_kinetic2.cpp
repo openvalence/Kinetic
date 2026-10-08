@@ -13,7 +13,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0x8634649201e3bbefull   // accepted 2026-10-08 (kin-1ir): the corner walk-back stops at its first settled round
+#define KINETIC2_FINGERPRINT 0xc7482d96f374ecf0ull   // accepted 2026-10-08 (kin-9od3): a piece after an on-curve corner exit is the render's curve from there
 #endif
 
 using namespace kinetic2;
@@ -548,17 +548,19 @@ Score randomRun(uint32_t seed, float smoothness) {
 
 TEST_CASE("property: random knot sequences never exceed a ceiling or the window and are never late") {
     // Every set at smoothness 0, 0.25, 0.5, 0.75, 1 and a random value per run
-    // (kin-rfw7): the smooth path is held to the bars pchip is.
+    // (kin-rfw7): the smooth path is held to the bars pchip is. 2000 seeds per
+    // set (kin-9od3): 400 held while 401 to 2000 put speed, acceleration and
+    // the window over. About 12 s on the host.
     for (const float set : {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, -1.0f}) {
         int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, junction = 0, why[6] = {}, withFail = 0, withoutFail = 0;
-        for (uint32_t seed = 1; seed <= 400; ++seed) {
+        for (uint32_t seed = 1; seed <= 2000; ++seed) {
             // The random set draws from its own sequence: the knots stay the seed's.
             const float sm = set >= 0.0f ? set : Rng(seed * 2654435761u).uni(0.0f, 1.0f);
             const Score sc = randomRun(seed, sm);
             ++runs; violations += sc.violations; spent += sc.spent; hits += sc.hit; missed += sc.missed; off += sc.off; knots += sc.knots; failed += sc.failed; junction += sc.junction;
             for (int w = 0; w < 6; ++w) why[w] += sc.why[w];
             if (sc.violations) { if (sc.failed) ++withFail; else ++withoutFail; }
-            if (sc.violations && (sc.why[0] || sc.why[1] || sc.why[3] || !sc.failed)) MESSAGE("smoothness " << sm << " seed " << seed << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed);
+            if ((sc.violations && (sc.why[0] || sc.why[1] || sc.why[3] || !sc.failed)) || sc.junction || sc.missed || sc.off) MESSAGE("smoothness " << sm << " seed " << seed << ": v" << sc.why[0] << " a" << sc.why[1] << " j" << sc.why[2] << " win" << sc.why[3] << " rest" << sc.why[4] << " late" << sc.why[5] << " failed " << sc.failed << " junction " << sc.junction << " missed " << sc.missed << " off " << sc.off);
         }
         CAPTURE(set);
         MESSAGE("smoothness " << (set >= 0.0f ? std::to_string(set) : std::string("random per run")) << ": " << runs << " runs, " << knots << " knots, " << hits << " hit at their time, " << missed << " feasible missed, " << off << " untrimmed off their position, " << spent << " trimmed, " << failed << " PieceOverCeiling, " << violations
@@ -574,11 +576,11 @@ TEST_CASE("property: random knot sequences never exceed a ceiling or the window 
         CHECK(junction == 0);
         // Constraint: a G1 knot whose corner ramp has no room in its spans keeps
         // an acceleration step (a 1 ms jerk spike) and is reported
-        // PieceOverCeiling: 17 of 400 runs at smoothness 0 as of 2026-10-08, the
-        // most of any set. Acceptance (c) bars it; rule 5 as written renders it.
-        // Operator ruling owed (kin-y6e).
+        // PieceOverCeiling: 36 of 2000 runs at smoothness 0 as of 2026-10-08,
+        // 41 at 0.5, the most of any set. Acceptance (c) bars it; rule 5 as
+        // written renders it. Operator ruling owed (kin-y6e).
         CHECK(withoutFail == 0);
-        CHECK(violations <= 17);
+        CHECK(why[2] <= 41);
         CHECK(why[5] == 0);
         CHECK(why[4] == 0);
         // A corner ramp passes a reachable knot: its walk-back settles, or keeps

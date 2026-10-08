@@ -46,8 +46,8 @@
 //   (nudge). Then two rounds of solve on the trimmed chords and fit again,
 //   plus one round for each last round that capped an angle or asked an end
 //   acceleration, at most four (render). The solver renders again with
-//   tightened ceilings, at most kSlackPasses (3) times (solver.hpp
-//   renderRun). Angles are solved at a third, so a G2 knot whose piece scales
+//   tightened ceilings until a pass tightens nothing (solver.hpp renderRun,
+//   kSlackCap). Angles are solved at a third, so a G2 knot whose piece scales
 //   loses the match and is G1: the solver rounds its acceleration step with a
 //   corner ramp at jmax.
 // - Parity with the model (tests/test_kinetic2_handles.cpp): trims within
@@ -352,7 +352,7 @@ inline float overOf(const Piece& q, float pStart, const Cfg& c, float stop = INF
     const float out = std::fmax(0.0f, std::fmax(c.lo - pMin, pMax - c.hi));
     if (parts) *parts = Over{pv / c.lim.vmax, pa / c.lim.amax, pj / c.lim.jmax, 1.0f + out / (c.hi - c.lo)};
     const float o = std::fmax(pv / c.lim.vmax, std::fmax(pa / c.lim.amax, pj / c.lim.jmax));
-    const float wall = c.railStop && out > kTol * (c.hi - c.lo) ? 1e3f : 1.0f;
+    const float wall = c.railStop && out > 0.5f * kTol * (c.hi - c.lo) ? 1e3f : 1.0f;
     return std::fmax(o, wall + out / (c.hi - c.lo));
 }
 
@@ -401,9 +401,11 @@ inline float overSampled(const Piece& q, float pStart, const Cfg& c, float stop,
     const float out = std::fmax(0.0f, std::fmax(c.lo - pMin, pMax - c.hi));
     if (parts) *parts = Over{pv / c.lim.vmax, pa / c.lim.amax, pj / c.lim.jmax, 1.0f + out / (c.hi - c.lo)};
     float o = std::fmax(pv / c.lim.vmax, std::fmax(pa / c.lim.amax, pj / c.lim.jmax));
-    // Under railStop the window is a wall: leaving it past the tolerance ranks
-    // below any ceiling ratio short of a thousand, so the least-over fit stays inside.
-    const float wall = c.railStop && out > kTol * (c.hi - c.lo) ? 1e3f : 1.0f;
+    // Under railStop the window is a wall: leaving it past half the tolerance
+    // ranks below any ceiling ratio short of a thousand, so the least-over fit
+    // stays inside (the other half is the engine's: a built piece reads a
+    // little past its render).
+    const float wall = c.railStop && out > 0.5f * kTol * (c.hi - c.lo) ? 1e3f : 1.0f;
     return std::fmax(o, wall + out / (c.hi - c.lo));
 }
 
@@ -626,6 +628,7 @@ inline float bandHold(float v, float D, float T) {
 // rest) is legal at some length factor: every peak of that piece is linear in
 // the angle. The window gap is the one the angle heads toward.
 // intoFlat: R is a flat knot, so the corner ramp to rest fits in half the span.
+// The end acceleration stays within R's ask (aTarget, aTol) when it has one.
 inline float zeroStrokeMax(const HKnot& L, const HKnot& R, float pL, float dir, const Cfg& c, bool intoFlat) {
     const float floor = std::fmax(kLMin, c.lfloor);
     const float gap = dir > 0.0f ? c.hi - pL : pL - c.lo;
@@ -648,6 +651,10 @@ inline float zeroStrokeMax(const HKnot& L, const HKnot& R, float pL, float dir, 
         float s = std::fmin(c.lim.vmax * R.slack[0] / pv, std::fmin(c.lim.amax * R.slack[1] / pa, c.lim.jmax * R.slack[2] / pj));
         if (px > 0.0f) s = std::fmin(s, std::fmax(0.0f, gap) / px);
         if (intoFlat) s = std::fmin(s, c.lim.jmax * R.slack[2] * std::fmax(0.0f, 0.5f * q.T - kTick) / std::fabs(aEndOf(q)));
+        if (!std::isnan(R.aTarget)) {
+            const float e1 = aEndOf(q);
+            s = std::fmin(s, std::fmax(0.0f, (R.aTol + (e1 > 0.0f ? R.aTarget : -R.aTarget)) / std::fabs(e1)));
+        }
         best = std::fmax(best, s);
     }
     return best;
@@ -750,8 +757,10 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     if (f1.o < best.o) best = f1;
     bool overV, overAJ, roomOver_;
     // Constraint: the side rule holds for lengths of a third (every pchip
-    // solve). A smooth solve's lengths can sum past 1, where longer handles
-    // raise the jerk: those walk both sides, as the model does (kin-rfw7).
+    // solve, trimmed knots included: a fit scales the solved lengths, never
+    // the fitted ones). A smooth or mid solve's lengths are not a third and
+    // can sum past 1, where longer handles raise the jerk: those walk both
+    // sides, as the model does (kin-rfw7, kin-9od3).
     if (L.lOut != kThird || R.lIn != kThird) {
         overV = overAJ = roomOver_ = true;
     } else if (hinted) {
@@ -861,10 +870,11 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
         // Under railStop a trimmed knot's angle keeps to its trimmed chord, so
         // the whole trim is a zero stroke at rest.
         int hint = 0;   // the trim bisection's last legal factor (fitPiece)
+        Room cur = rm;
         auto fitAt = [&](float pR, float bound, bool hinted = false) {
             HKnot Rt = R;
             if (c.railStop && pR != R.p) Rt.vel = bandHold(R.vel, pR - pL, R.t - L.t);
-            Room r2 = rm;
+            Room r2 = cur;
             r2.intoFlat = intoFlat && Rt.vel == 0.0f;
             Fit f = fitPiece(L, Rt, pL, pR, c, bound, c.railStop ? &r2 : nullptr, hinted ? &hint : nullptr);
             f.s1 = Rt.vel;
@@ -872,40 +882,57 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
         };
         const bool hold = holdChord(k, i, R.p - L.p, c);
         const bool canTrim = c.trim > 0.0f && (i + 2 < n || c.trimLast);
-        float dp = hold ? L.dp : 0.0f;
-        Fit f = fitAt(R.p + dp, INFINITY);
-        if (!f.legal && !hold && canTrim) {
-            const float dir = (pL > R.p) ? 1.0f : (pL < R.p) ? -1.0f : 0.0f;
-            float lo = 0.0f, hi = std::fmin(c.trim, std::fabs(R.p - pL));
-            Fit fh = fitAt(R.p + dir * hi, 1.0f + kTol, true);
-            if (fh.legal) {
-                for (int s = 0; s < 16; ++s) {
-                    const float mid = 0.5f * (lo + hi);
-                    const Fit fm = fitAt(R.p + dir * mid, 1.0f + kTol, true);
-                    if (fm.legal) { hi = mid; fh = fm; } else { lo = mid; }
-                }
-                f = fh;
-                dp = dir * hi;
-            } else {
-                // Constraint: reachable (kin-ay9). The full move is a zero stroke,
-                // illegal while L's angle heads into the span faster than the span
-                // turns it (its cap lands a round later, at most four), and a
-                // partial move can be legal then: without this the property suite's
-                // PieceOverCeiling rose from 48 to 472 (seed 6: speed,
-                // acceleration and the window over).
-                for (int q = 1; q <= 4; ++q) {
-                    const float d = dir * 0.25f * static_cast<float>(q) * hi;
-                    const Fit fq = fitAt(R.p + d, f.o);
-                    if (fq.o < f.o) { f = fq; dp = d; }
+        float dp = 0.0f;
+        Fit f;
+        auto search = [&]() {
+            hint = 0;
+            dp = hold ? L.dp : 0.0f;
+            f = fitAt(R.p + dp, INFINITY);
+            if (!f.legal && !hold && canTrim) {
+                const float dir = (pL > R.p) ? 1.0f : (pL < R.p) ? -1.0f : 0.0f;
+                float lo = 0.0f, hi = std::fmin(c.trim, std::fabs(R.p - pL));
+                Fit fh = fitAt(R.p + dir * hi, 1.0f + kTol, true);
+                if (fh.legal) {
+                    for (int s = 0; s < 16; ++s) {
+                        const float mid = 0.5f * (lo + hi);
+                        const Fit fm = fitAt(R.p + dir * mid, 1.0f + kTol, true);
+                        if (fm.legal) { hi = mid; fh = fm; } else { lo = mid; }
+                    }
+                    f = fh;
+                    dp = dir * hi;
+                } else {
+                    // Constraint: reachable (kin-ay9). The full move is a zero stroke,
+                    // illegal while L's angle heads into the span faster than the span
+                    // turns it (its cap lands a round later, at most four), and a
+                    // partial move can be legal then: without this the property suite's
+                    // PieceOverCeiling rose from 48 to 472 (seed 6: speed,
+                    // acceleration and the window over).
+                    for (int q = 1; q <= 4; ++q) {
+                        const float d = dir * 0.25f * static_cast<float>(q) * hi;
+                        const Fit fq = fitAt(R.p + d, f.o);
+                        if (fq.o < f.o) { f = fq; dp = d; }
+                    }
                 }
             }
-        }
-        // An illegal hold (a chord within holdEps rendered too fast) lies flat
-        // at its predecessor instead when that is less over. The model has no
-        // such piece; its hold chords are long enough to be legal.
-        if (!f.legal && hold && canTrim) {
-            const Fit ff = fitAt(pL, f.o);
-            if (ff.o < f.o) { f = ff; dp = pL - R.p; }
+            // An illegal hold (a chord within holdEps rendered too fast) lies flat
+            // at its predecessor instead when that is less over. The model has no
+            // such piece; its hold chords are long enough to be legal.
+            if (!f.legal && hold && canTrim) {
+                const Fit ff = fitAt(pL, f.o);
+                if (ff.o < f.o) { f = ff; dp = pL - R.p; }
+            }
+        };
+        search();
+        // An end acceleration asked by the next piece's start ramp (aEnd) is
+        // dropped when no fit honors it legally: the ask is the next piece's
+        // jerk, never this piece's speed or acceleration.
+        if (!f.legal && c.railStop && !std::isnan(rm.aEnd)) {
+            const Fit fa = f;
+            const float da = dp;
+            cur.aEnd = NAN;
+            cur.aEndTol = INFINITY;
+            search();
+            if (!f.legal) { f = fa; dp = da; }
         }
         // Still over (railStop): L's angle is faster than its span can stop.
         // Its cap holds it from the next solve on; the origin's live angle is
@@ -928,11 +955,12 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
             q.T = R.t - L.t; q.D = rendered(R) - pL; q.s0 = L.vel; q.s1 = R.vel; q.i0 = f.i0; q.i1 = f.i1;
             R.aIn = aEndOf(q);
             // Over because the start ramp at L does not fit: the piece into L
-            // is asked to end near this piece's start (from the next round).
+            // is asked to end near this piece's start, held to amax (from the
+            // next round; an ask past amax put that piece over it).
             if (!f.legal && c.railStop && startRoom(q, rm, c.lim.jmax * R.slack[2]) > 1.0f + kTol) {
                 const float span = rm.fromFlat ? 0.5f * q.T - kTick : std::fmin(q.T, rm.tIn) - 2.0f * kTick;
                 const float tol = 0.95f * c.lim.jmax * L.slack[2] * span;
-                const float target = aStartOf(q);
+                const float am = c.lim.amax * L.slack[1], target = std::fmax(-am, std::fmin(am, aStartOf(q)));
                 if (tol > 0.0f && !(L.aTarget == target && L.aTol == tol)) {
                     L.aTarget = target;
                     L.aTol = tol;

@@ -1472,7 +1472,7 @@ static const float kFigureTightMs[] = {
 static const unsigned kRailCapsT[] = { 0, 123, 145, 225, 316, 593, 653, 689, 716, 751 };
 static const float kRailCapsP[] = { 0.99, 0.81, 0.36, 0.83, 0.83, 0.833, 0.12, 0.67, 0.98, 0.48 };
 static const float kRailCapsDp[] = { 0, 0, 0.409577179, 0, 0, 0, 0.375462997, -0.0356871923, -0.263479934, 0.151203075 };
-static const unsigned char kRailCapsInfeasible[] = { 0, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+static const unsigned char kRailCapsInfeasible[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 static const unsigned kRailBandT[] = { 0, 462, 827, 931, 955, 1099, 1119, 1157 };
 static const float kRailBandP[] = { 0.85, 0.77, 0.7, 0.72, 0.96, 0.04, 0.32, 0.324 };
