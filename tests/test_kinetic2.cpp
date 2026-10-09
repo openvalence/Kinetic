@@ -1183,8 +1183,8 @@ TEST_CASE("truncateAfter: a flush at now drops the whole window and hands off at
 }
 
 // Nucleus val-17u: a travel-window change mid-stream. The frame moved, so the
-// state in flight is restated in it; the knots are window shares and stay.
-TEST_CASE("reseedAt: the pending knots stay and re-solve from the restated state, continuous, inside the ceilings") {
+// curve in flight is restated in it; the knots are window shares and stay.
+TEST_CASE("reframe: the pending knots stay and re-solve from the restated curve, continuous, inside the ceilings") {
     Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
     // The new frame: the same millimeters, the window shifted by 0.01 of it.
     // A shift the ceilings cannot close before the next knot trims the whole
@@ -1198,7 +1198,7 @@ TEST_CASE("reseedAt: the pending knots stay and re-solve from the restated state
         const uint64_t now = 110 * kMs;
         const State at = restate(e.stateAt(0, now));
         const size_t kept = e.pending();
-        e.reseedAt(at, now);
+        e.reframe(1.0f, -0.01f, now);
         CHECK(e.pending() == kept);
         CHECK(e.isBusy(now));
         std::vector<State> s{at};
@@ -1227,7 +1227,7 @@ TEST_CASE("reseedAt: the pending knots stay and re-solve from the restated state
         while (e.pending() > 0) REQUIRE(e.truncateAfter(now, now) > 0);
         const State at = restate(e.stateAt(0, now));
         REQUIRE(std::fabs(at.v) > 0.1f);
-        e.reseedAt(at, now);
+        e.reframe(1.0f, -0.01f, now);
         CHECK(e.pending() == 0);
         std::vector<State> s{at};
         for (uint64_t t = now + kMs; t <= 400 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
@@ -1244,8 +1244,7 @@ TEST_CASE("reseedAt: the pending knots stay and re-solve from the restated state
         (void)sweep(e, 0, 110 * kMs);
         const uint64_t now = 110 * kMs;
         e.brake(now);
-        const State at = restate(e.stateAt(0, now));
-        e.reseedAt(at, now);
+        e.reframe(1.0f, -0.01f, now);
         const uint64_t end = e.newest().t_us;
         REQUIRE(end > now + kMs);
         CHECK_FALSE(e.submit(knotAt(end - kMs / 2, 0.5f), now + kMs));
@@ -1253,11 +1252,85 @@ TEST_CASE("reseedAt: the pending knots stay and re-solve from the restated state
     }
     SUBCASE("at rest, nothing pending: a hold at the restated position") {
         Engine<> e(cfg, 0.2f);
-        e.reseedAt(State{0.35f, 0.0f, 0.0f}, 10 * kMs);
+        e.reframe(1.0f, 0.15f, 10 * kMs);
         CHECK_FALSE(e.isBusy(10 * kMs));
         CHECK(e.stateAt(0, 50 * kMs).p == doctest::Approx(0.35f));
         CHECK(e.stateAt(0, 50 * kMs).v == 0.0f);
     }
+}
+
+// Nucleus val-4dt / val-83q: the window dragged 80 mm in 2 mm writes mid-sweep
+// on a 320 mm window at the factory set. Re-planned from now, a write inside a
+// knot's horizon trimmed that knot to rest on the write's state: the plan ran
+// out and back (-336 mm/s) or held a tick at the knot (128 -> 0 -> 90 mm/s).
+TEST_CASE("reframe inside a knot's horizon: the curve is kept through it, never out and back, never a held tick (kin-n6jy)") {
+    constexpr float kSpan = 320.0f;   // mm
+    Config cfg; cfg.limits = {1200.0f / kSpan, 1.0e5f / kSpan, 5.0e6f / kSpan};
+    for (uint64_t off = 0; off < 10 * kMs; off += kMs) {
+        Engine<> e(cfg, 0.1f);
+        constexpr int kSegs = 20;
+        const uint64_t first = 120 * kMs;
+        float lo = 0.0f;   // the window's low edge, mm
+        int sent = 0, writes = 0;
+        float hi_mm = -1e9f, back_mm = 0.0f, v_min = 0.0f, v_max = 0.0f, a_max = 0.0f;
+        int held = 0;
+        State prev{}, prev2{};
+        for (uint64_t t = 0; t <= first + 2600 * kMs; t += kMs) {
+            while (sent < kSegs && t + 120 * kMs >= first + uint64_t(sent) * 100 * kMs) {
+                const float p = 0.1f + 0.04f * float(sent + 1);
+                REQUIRE(e.submit(knotFromSegment(p, 100 * kMs, true, sent + 1 < kSegs ? 0.4f : 0.0f,
+                                                 first + uint64_t(sent) * 100 * kMs), t));
+                ++sent;
+            }
+            // From mid-sweep, a 4 mm move every 10 ms in two writes a tick apart.
+            const uint64_t from = first + 1000 * kMs + off;
+            if (t >= from && writes < 40 && ((t - from) % (10 * kMs) == 0 || (t - from) % (10 * kMs) == kMs)) {
+                e.reframe(1.0f, -2.0f / kSpan, t);
+                lo += 2.0f;
+                ++writes;
+            }
+            const State s = e.stateAt(0, t);
+            const float mm = lo + s.p * kSpan;
+            if (t >= from) {
+                hi_mm = std::fmax(hi_mm, mm);
+                back_mm = std::fmax(back_mm, hi_mm - mm);
+                v_min = std::fmin(v_min, s.v * kSpan);
+            }
+            v_max = std::fmax(v_max, std::fabs(s.v));
+            a_max = std::fmax(a_max, std::fabs(s.a));
+            if (t >= first + 2 * kMs && t < first + 2000 * kMs && std::fabs(prev.v) < 1e-4f &&
+                std::fabs(prev2.v) > 0.1f && std::fabs(s.v) > 0.1f)
+                ++held;
+            prev2 = prev;
+            prev = s;
+        }
+        CAPTURE(off);
+        MESSAGE("off " << off / kMs << " ms: back " << back_mm << " mm, slowest " << v_min << " mm/s, peak v "
+                       << v_max * kSpan << " mm/s, a " << a_max * kSpan << " mm/s^2, held " << held);
+        REQUIRE(writes == 40);
+        CHECK(back_mm <= 2e-3f * kSpan);   // kin-554's tolerance
+        CHECK(held == 0);
+        CHECK(v_max <= cfg.limits.vmax * 1.001f);
+        CHECK(a_max <= cfg.limits.amax * 1.001f);
+        CHECK(lo + e.stateAt(0, first + 2600 * kMs).p * kSpan == doctest::Approx(80.0f + 0.9f * kSpan).epsilon(1e-4));
+    }
+}
+
+TEST_CASE("one solve reporting 40 times: every report is drained, none overwritten (kin-a7n9)") {
+    // A line at vmax authored at 1.5 vmax: every knot's velocity is clamped
+    // and its chord trimmed, two reports a knot.
+    Config cfg; cfg.limits = {1.0f, 1000.0f, 1.0e6f};
+    Engine<> e(cfg, 0.1f);
+    for (int i = 0; i < 20; ++i)
+        REQUIRE(e.submit(knotAt(uint64_t(i + 1) * 10 * kMs, 0.1f + 0.01f * float(i + 1), true, 1.5f), 0));
+    (void)e.stateAt(0, kMs);   // the one solve
+    const auto an = drain(e);
+    CHECK(an.size() == 40);
+    CHECK(countKind(an, AnomalyKind::EndVelClamped) == 20);
+    CHECK(countKind(an, AnomalyKind::KnotTrimmed) == 20);
+    REQUIRE_FALSE(an.empty());
+    CHECK(an.front().seq == 1);
+    for (size_t i = 1; i < an.size(); ++i) CHECK(an[i].seq == an[i - 1].seq + 1);
 }
 
 // ---- the solve budget (kin-ys0) -------------------------------------------------

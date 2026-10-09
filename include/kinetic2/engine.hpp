@@ -42,35 +42,42 @@ public:
     void resetAt(size_t axis, float p, uint64_t now_us) { resetAxis(axis, p, now_us); }
     void resetAt(float p, uint64_t now_us) { resetAt(0, p, now_us); }
 
-    // The caller's frame moved under the plan (its window units now mean
-    // other positions): `s` is the state at now_us in the new frame. Every
-    // pending knot stays and the window re-solves from s; the curve in
-    // flight, committed or not, is replaced. Nothing pending: the brake from
-    // s while it moves (an explicit brake stays explicit), else a hold. Set
-    // the new frame's limits first: the brake and the solve read them.
-    void reseedAt(size_t axis, const State& s, uint64_t now_us) {
+    // The caller's frame moved under the plan: a position the engine holds
+    // is p * scale + offset in the new frame, a velocity and an acceleration
+    // times scale. Every pending knot is in the caller's units and stays. The
+    // curve in flight is restated and kept through the reaction horizon, or
+    // through the next knot when that lies inside it or in the later half of
+    // its segment (RFC-105 (bb)), and the window re-solves from there:
+    // re-planned from now_us, a knot that near is a piece too short to bend,
+    // trimmed to rest on its start. Nothing pending, the hold or the brake in
+    // flight is restated; an explicit brake stays explicit. Set the new
+    // frame's limits first: the solve reads them.
+    void reframe(size_t axis, float scale, float offset, uint64_t now_us) {
         Axis& a = _ax[axis];
         (void)stateAt(axis, now_us);   // retires every knot already due
-        const bool braking = a.explicit_brake && now_us < a.origin_us;
-        const bool moving = std::fabs(s.v) > 1e-6f || std::fabs(s.a) > 1e-6f;
-        a.has_committed = false;
-        a.replan_open = false;
-        a.explicit_brake = false;
-        boundary(a, moving ? s : State{s.p, 0.0f, 0.0f}, now_us);
-        a.piece = Piece::hold(s.p, now_us);
-        a.piece_valid = a.tl.empty();
-        a.n_sol = 0;
-        a.solved_valid = a.tl.empty();
+        commitHorizon(axis, now_us, false, true);
+        auto state = [&](State& s) { s.p = s.p * scale + offset; s.v *= scale; s.a *= scale; };
+        auto profile = [&](Profile& pr) {
+            state(pr.s0);
+            for (int i = 0; i < pr.n; ++i) pr.jerk[i] *= scale;
+        };
+        auto piece = [&](Piece& pc) {
+            pc.p0 = pc.p0 * scale + offset;
+            pc.q.D *= scale; pc.q.s0 *= scale; pc.q.s1 *= scale; pc.q.da *= scale;
+            profile(pc.lead);
+            profile(pc.tail);
+        };
+        state(a.origin);
+        state(a.seg);
+        piece(a.piece);
+        piece(a.committed);
+        a.replan_open = false;   // its undo restores a curve of the old frame
+        if (a.tl.empty()) return;
+        a.solved_valid = false;
+        a.piece_valid = false;
         a.dirty_us = now_us;
-        if (!braking && !(a.tl.empty() && moving)) return;
-        const Profile pr = Profile::brake(s, now_us, _cfg.limits);
-        if (pr.n == 0) return;
-        if (a.tl.empty()) a.piece = Piece::profile(pr);
-        else { a.committed = Piece::profile(pr); a.has_committed = true; }
-        boundary(a, pr.end(), pr.end_us());
-        a.explicit_brake = braking;
     }
-    void reseedAt(const State& s, uint64_t now_us) { reseedAt(0, s, now_us); }
+    void reframe(float scale, float offset, uint64_t now_us) { reframe(0, scale, offset, now_us); }
 
     const Config& config() const { return _cfg; }
     // The next solve (at the next submit or flush) renders the whole window
@@ -357,7 +364,9 @@ public:
     }
 
 private:
-    static constexpr size_t kAnomalyRing = 16;
+    // One solve reports every knot of the window before any drain: 64 holds
+    // three kinds on each of 21 knots. Held twice (_an, _an_keep), 24 B a slot.
+    static constexpr size_t kAnomalyRing = 64;
 
     struct Axis {
         Timeline<Capacity> tl;
@@ -531,8 +540,11 @@ private:
     // 67 mm on the bench), the re-plan never starts inside a piece too
     // short to bend legally, and nothing freezes a one-knot guess into
     // later motion: RFC-105 (bb). Once per sample: a commit already made
-    // stands until the sampler passes it.
-    void commitHorizon(size_t axis, uint64_t now_us, bool successor = false) {
+    // stands until the sampler passes it. whole: the later half counts from
+    // the segment's authored start (seg_us), for a frame move: re-planned at
+    // every write of a drag, the origin creeps toward the knot and its half
+    // with it, until a write inside the knot's last ticks re-plans it.
+    void commitHorizon(size_t axis, uint64_t now_us, bool successor = false, bool whole = false) {
         Axis& a = _ax[axis];
         if (a.tl.empty() || now_us <= a.origin_us || a.has_committed) return;
         (void)stateAt(axis, now_us);   // retires what is due, builds the piece
@@ -550,7 +562,8 @@ private:
             // this one, and too short to bend it trims the knot. Never the
             // newest free knot: committed through, it stays the rest end it
             // was rendered as, and a stream would stop at every knot.
-            const uint64_t span = k0.base_us > a.origin_us ? k0.base_us - a.origin_us : 0;
+            const uint64_t from = whole ? a.seg_us : a.origin_us;
+            const uint64_t span = k0.base_us > from ? k0.base_us - from : 0;
             // Never a chased sample: committed through, the stream would come
             // to its rest at every sample instead of re-planning toward the newest.
             const bool chased = a.tl.at(0).sample && !a.tl.at(0).has_v;

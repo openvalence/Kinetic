@@ -52,7 +52,7 @@ while (engine.popAnomaly(an))                // anomalies the planner recorded
 ```
 
 The rest of the API: `truncateAfter()` replaces what is queued, `brake()`
-stops from the current state, `reseedAt()` restates the state when the
+stops from the current state, `reframe()` restates the plan when the
 caller's frame moves, `solved()` and `peek()` expose the plan for telemetry or
 a renderer, `setConfig()` / `setLimits()` apply at the next submit or reset.
 `engine.hpp` documents each.
