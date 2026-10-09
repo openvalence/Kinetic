@@ -4,8 +4,10 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest/doctest.h"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -731,96 +733,247 @@ TEST_CASE("corner: a G1 knot keeps the author's acceleration step as a jerk-limi
     CHECK(jpk == doctest::Approx(2000.0f).epsilon(0.05));
 }
 
-// ---- the oscillation modulator (kin-b5g, RFC-103) -----------------------------
+// ---- the oscillator stage (kin-b5g, kin-4d0; Valence RFC-103, SPEC 9.7) --------
 #include "kinetic2/oscillator.hpp"
 
 namespace {
-// Sample the sum of a planned state stream and the oscillator at 1 ms.
-std::vector<State> oscSweep(Oscillator& o, const Limits& L, const std::vector<State>& planned, uint64_t t0 = 0) {
-    std::vector<State> s;
-    for (size_t i = 0; i < planned.size(); ++i) s.push_back(o.apply(planned[i], t0 + i * kMs, L, 0.0f, 1.0f));
-    return s;
+using Osc = Oscillator<128, 150>;
+// The plan on the 1 ms grid. Nothing is submitted while the oscillator
+// renders over it, so its look-ahead is the plan that runs.
+std::vector<float> planOf(Engine<>& e, size_t n) {
+    std::vector<float> p(n);
+    for (size_t i = 0; i < n; ++i) p[i] = e.stateAt(0, i * kMs).p;
+    return p;
 }
-std::vector<State> rest(float p, size_t n) { return std::vector<State>(n, State{p, 0.0f, 0.0f}); }
+std::vector<float> restPlan(float p, size_t n) { return std::vector<float>(n, p); }
+// One render per tick as the hub's strip does, `strip` outputs a call; the
+// head (out[0]) is what executes. Holds from tick `hold_from`.
+struct OscRun { std::vector<float> sum, osc, eff; };
+OscRun oscRun(Osc& o, const Limits& L, const std::vector<float>& plan, size_t ticks, float lo = 0.0f,
+              float hi = 1.0f, size_t strip = 128, size_t hold_from = SIZE_MAX) {
+    OscRun r;
+    std::array<float, 128> out{};
+    for (size_t i = Osc::kPlanEdge; i < ticks; ++i) {
+        o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], strip, L, lo, hi, i >= hold_from, out.data());
+        r.sum.push_back(plan[i] + out[0]);
+        r.osc.push_back(out[0]);
+        r.eff.push_back(o.amplitudeEffective());
+    }
+    return r;
+}
+// Peaks of executed positions by the grid's own differences: what the steer
+// renders and the drive sees, the envelope's derivatives included.
+Peaks fdPeaks(const std::vector<float>& s) {
+    Peaks pk;
+    for (size_t i = 0; i < s.size(); ++i) {
+        pk.lo = std::min(pk.lo, s[i]); pk.hi = std::max(pk.hi, s[i]);
+        if (i > 0) pk.v = std::max(pk.v, float(std::fabs(double(s[i]) - s[i - 1]) / 1e-3));
+        if (i > 1) pk.a = std::max(pk.a, float(std::fabs(double(s[i]) - 2.0 * s[i - 1] + s[i - 2]) / 1e-6));
+        if (i > 2) pk.j = std::max(pk.j, float(std::fabs(double(s[i]) - 3.0 * s[i - 1] + 3.0 * s[i - 2] - s[i - 3]) / 1e-9));
+    }
+    return pk;
+}
+// Ticks between successive rising zero crossings of the oscillation.
+std::vector<size_t> periodsOf(const std::vector<float>& osc, size_t from) {
+    std::vector<size_t> up, d;
+    for (size_t i = from + 1; i < osc.size(); ++i) if (osc[i - 1] < 0.0f && osc[i] >= 0.0f) up.push_back(i);
+    for (size_t k = 1; k < up.size(); ++k) d.push_back(up[k] - up[k - 1]);
+    return d;
+}
+OscParams oscAt(float f, float a, OscShape sh = OscShape::Sine, float crest = 0.0f, float trough = 0.0f) {
+    OscParams p; p.enabled = true; p.frequency = f; p.amplitude = a; p.shape = sh; p.dwell_crest = crest; p.dwell_trough = trough;
+    return p;
+}
+// The hub's input set on a 500 mm window: 1200 mm/s, 1e5 mm/s2, 2e7 mm/s3.
+constexpr Limits kHubSet{2.4f, 200.0f, 40000.0f};
+// What float rounding of positions under 1 adds to a grid difference: half an
+// ulp per term, 2, 4 and 8 terms for v, a and j.
+constexpr float kUlp = 5.96e-8f;
+constexpr float kFdV = 1.0f * kUlp / 1e-3f, kFdA = 2.0f * kUlp / 1e-6f, kFdJ = 4.0f * kUlp / 1e-9f;
 }  // namespace
 
 TEST_CASE("oscillator: a sine at rest swings the asked amplitude at the asked period, inside the ceilings") {
     const Limits L{5.0f, 200.0f, 20000.0f};
-    Oscillator o; OscParams p; p.enabled = true; p.frequency = 10.0f; p.amplitude = 0.02f; p.shape = OscShape::Sine; o.set(p);
-    const auto s = oscSweep(o, L, rest(0.5f, 2000));
-    float lo = 1, hi = 0; for (const State& x : s) { lo = std::min(lo, x.p); hi = std::max(hi, x.p); }
-    CHECK(hi == doctest::Approx(0.52f).epsilon(2e-3));
-    CHECK(lo == doctest::Approx(0.48f).epsilon(2e-3));
+    Osc o; o.set(oscAt(10.0f, 0.02f));
+    const auto r = oscRun(o, L, restPlan(0.5f, 2400), 2200);
+    const Peaks s = fdPeaks(std::vector<float>(r.sum.begin() + 400, r.sum.end()));
+    CHECK(s.hi == doctest::Approx(0.52f).epsilon(1e-3));
+    CHECK(s.lo == doctest::Approx(0.48f).epsilon(1e-3));
     CHECK(o.amplitudeEffective() == doctest::Approx(0.02f));
-    // Period: the crest recurs every 100 ms.
-    size_t first = 0; for (size_t i = 1; i + 1 < 300; ++i) if (s[i].p > s[i - 1].p && s[i].p >= s[i + 1].p) { first = i; break; }
-    size_t second = 0; for (size_t i = first + 50; i + 1 < 400; ++i) if (s[i].p > s[i - 1].p && s[i].p >= s[i + 1].p) { second = i; break; }
-    CHECK(second - first == doctest::Approx(100).epsilon(0.03));
-    const Peaks pk = peaksOf(s);
-    CHECK(pk.v <= L.vmax * 1.001f); CHECK(pk.a <= L.amax * 1.001f); CHECK(pk.j <= L.jmax * 1.05f);
-    // 10 Hz at 0.02: v peak 1.26, a peak 79, j peak 4960: all under, so nothing was shed.
-    CHECK(pk.a > 70.0f);
+    CHECK_FALSE(o.shaped());
+    for (const size_t d : periodsOf(r.osc, 400)) CHECK(d == doctest::Approx(100).epsilon(0.011));
+    const Peaks pk = fdPeaks(r.sum);
+    CHECK(pk.v <= L.vmax); CHECK(pk.a <= L.amax); CHECK(pk.j <= L.jmax);
+    CHECK(pk.a > 70.0f);   // 10 Hz at 0.02: a peak 79, nothing shed
+    // The fade in from rest starts at the trough, rising.
+    CHECK(r.osc[1] < 0.0f);
 }
 
-TEST_CASE("oscillator: yields first; a full-speed stroke sheds it to nothing, half speed keeps part") {
+TEST_CASE("oscillator: yields first; a full-speed cruise sheds it to nothing, a half-speed one keeps part") {
     const Limits L{4.0f, 60.0f, 2000.0f};
-    Oscillator o; OscParams p; p.enabled = true; p.frequency = 20.0f; p.amplitude = 0.05f; o.set(p);
-    std::vector<State> full(500, State{0.5f, 4.0f, 0.0f}), half(500, State{0.5f, 2.0f, 0.0f});
-    oscSweep(o, L, full);
-    CHECK(o.amplitudeEffective() == 0.0f);
-    CHECK_FALSE(o.active());
-    o.set(p);
-    const auto s = oscSweep(o, L, half);
-    CHECK(o.amplitudeEffective() > 0.0f);
-    CHECK(o.amplitudeEffective() < 0.05f);   // the jerk ceiling binds at 20 Hz
-    const Peaks pk = peaksOf(s);
-    CHECK(pk.v <= L.vmax * 1.001f); CHECK(pk.a <= L.amax * 1.001f); CHECK(pk.j <= L.jmax * 1.05f);
+    auto cruise = [](float v) { std::vector<float> p(1600); for (size_t i = 0; i < p.size(); ++i) p[i] = v * float(i) * 1e-3f; return p; };
+    Osc full; full.set(oscAt(5.0f, 0.05f));
+    const auto f = oscRun(full, L, cruise(4.0f), 1200, -100.0f, 100.0f);
+    CHECK(full.amplitudeEffective() == 0.0f);
+    CHECK_FALSE(full.active());
+    CHECK(full.shaped());
+    for (const float x : f.osc) CHECK(x == 0.0f);
+    Osc half; half.set(oscAt(5.0f, 0.05f));
+    const auto h = oscRun(half, L, cruise(2.0f), 1200, -100.0f, 100.0f);
+    CHECK(half.amplitudeEffective() > 0.0f);
+    CHECK(half.amplitudeEffective() < 0.05f);
+    CHECK(half.shaped());
+    const Peaks pk = fdPeaks(h.sum);
+    CHECK(pk.v <= L.vmax * 1.0005f); CHECK(pk.a <= L.amax); CHECK(pk.j <= L.jmax);
 }
 
-TEST_CASE("oscillator: every shape stays under the ceilings and inside its amplitude; dwells hold the extremes") {
-    const Limits L{5.0f, 300.0f, 30000.0f};
-    for (const OscShape sh : {OscShape::Sine, OscShape::Square, OscShape::Saw, OscShape::SawReverse}) {
-        Oscillator o; OscParams p; p.enabled = true; p.frequency = 4.0f; p.amplitude = 0.05f; p.shape = sh; p.dwell_crest = 0.3f; o.set(p);
-        const auto s = oscSweep(o, L, rest(0.5f, 2600));
-        const Peaks pk = peaksOf(s);
-        CHECK(pk.v <= L.vmax * 1.001f); CHECK(pk.a <= L.amax * 1.001f); CHECK(pk.j <= L.jmax * 1.05f);
-        CHECK(pk.hi <= 0.55f + 1e-3f); CHECK(pk.lo >= 0.45f - 1e-3f);
-        // Period with a 0.3 crest dwell: 1.3 / 4 Hz = 325 ms; the crest holds 75 ms of it.
-        const float crest = 0.5f + o.amplitudeEffective();   // the ramped shapes shed amplitude to the jerk ceiling
-        size_t atCrest = 0; for (size_t i = 325; i < 325 * 5; ++i) if (s[i].p > crest - 2e-3f) ++atCrest;
-        const float share = float(atCrest) / (325.0f * 4.0f);
-        // A saw arrives at its crest moving, so the saw shapes ignore dwells by design.
-        if (sh == OscShape::Sine || sh == OscShape::Square) CHECK(share >= 0.3f / 1.3f * 0.9f);
-        CHECK(o.amplitudeEffective() > 0.0f);
+TEST_CASE("oscillator over planned strokes: the executed sum keeps every ceiling and the window") {
+    Config cfg; cfg.limits = kHubSet;
+    for (const uint64_t stroke : {100, 250, 400, 800}) {
+        Engine<> e(cfg, 0.1f);
+        int k = 0;
+        for (uint64_t t = stroke * kMs; t <= 2000 * kMs; t += stroke * kMs, ++k) REQUIRE(e.submit(knotAt(t, k % 2 ? 0.1f : 0.9f), 0));
+        const auto plan = planOf(e, 2800);
+        const Peaks own = fdPeaks(std::vector<float>(plan.begin() + 2, plan.begin() + 2400));
+        for (const OscShape sh : {OscShape::Sine, OscShape::Square, OscShape::Saw, OscShape::SawReverse}) {
+            for (const float f : {2.0f, 5.0f, 10.0f, 20.0f}) {
+                CAPTURE(stroke); CAPTURE(int(sh)); CAPTURE(f);
+                Osc o; o.set(oscAt(f, 0.03f, sh));
+                const auto r = oscRun(o, kHubSet, plan, 2400);
+                const Peaks pk = fdPeaks(r.sum);
+                CHECK(pk.v <= std::max(kHubSet.vmax, own.v) + kFdV);
+                CHECK(pk.a <= std::max(kHubSet.amax, own.a) + kFdA);
+                CHECK(pk.j <= std::max(kHubSet.jmax, own.j) + kFdJ);
+                CHECK(pk.lo >= 0.0f); CHECK(pk.hi <= 1.0f);
+                // It rides the slow strokes, and the rest after them.
+                if (stroke == 800) CHECK(*std::max_element(r.eff.begin(), r.eff.end()) > 0.0f);
+            }
+        }
     }
 }
 
-TEST_CASE("oscillator: never leaves the window and is bit-exact") {
-    const Limits L{5.0f, 300.0f, 30000.0f};
-    auto run = [&] {
-        Oscillator o; OscParams p; p.enabled = true; p.frequency = 3.0f; p.amplitude = 0.2f; o.set(p);
-        return oscSweep(o, L, rest(0.05f, 700));   // 0.05 from the low rail
-    };
-    const auto a = run(), b = run();
-    const Peaks pk = peaksOf(a);
-    CHECK(pk.lo >= -1e-6f);
-    CHECK(pk.hi <= 0.1f + 1e-3f);   // amplitude limited to the gap, 0.05
-    CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(State)) == 0);
+TEST_CASE("oscillator: never leaves the window; the edge bounds the amplitude and never cuts the wave") {
+    const Limits L{5.0f, 3000.0f, 3e7f};   // ceilings far off: the window binds
+    for (const OscShape sh : {OscShape::Sine, OscShape::Saw, OscShape::SawReverse}) {
+        CAPTURE(int(sh));
+        Osc o; o.set(oscAt(3.0f, 0.2f, sh));
+        const auto r = oscRun(o, L, restPlan(0.05f, 1600), 1400);   // 0.05 from the low edge
+        const Peaks pk = fdPeaks(r.sum);
+        CHECK(pk.lo >= 0.0f);
+        CHECK(o.amplitudeEffective() <= 0.05f);
+        CHECK(o.amplitudeEffective() > 0.04f);
+        CHECK(o.shaped());
+        // Bounded, not cut: the swing is the effective amplitude both ways
+        // (a saw's flyback overshoot is inside its normalized peak).
+        const Peaks late = fdPeaks(std::vector<float>(r.sum.begin() + 600, r.sum.end()));
+        CHECK(late.hi - 0.05f == doctest::Approx(0.05f - late.lo).epsilon(0.02));
+    }
 }
 
-TEST_CASE("oscillator over a planned stroke: the sum keeps every ceiling") {
-    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+TEST_CASE("oscillator: dwells stretch the period and hold the extremes; the saw shapes ignore them") {
+    const Limits L{5.0f, 300.0f, 300000.0f};
+    for (const OscShape sh : {OscShape::Sine, OscShape::Square, OscShape::Saw, OscShape::SawReverse}) {
+        CAPTURE(int(sh));
+        Osc o; o.set(oscAt(4.0f, 0.02f, sh, 0.3f));
+        const auto r = oscRun(o, L, restPlan(0.5f, 3000), 2800);
+        const bool saw = sh == OscShape::Saw || sh == OscShape::SawReverse;
+        // (1 + 0.3) / 4 Hz = 325 ms; a saw keeps 250.
+        for (const size_t d : periodsOf(r.osc, 600)) CHECK(d == doctest::Approx(saw ? 250 : 325).epsilon(0.01));
+        if (saw) continue;
+        const float e = o.amplitudeEffective();
+        size_t at = 0;
+        for (size_t i = 650; i < 650 + 4 * 325; ++i) if (r.osc[i] > e * 0.999f) ++at;
+        CHECK(float(at) / (4.0f * 325.0f) >= 0.3f / 1.3f * 0.95f);
+    }
+}
+
+TEST_CASE("oscillator: a square with dwells is a pulse") {
+    const Limits L{5.0f, 300.0f, 3e7f};
+    auto duty = [&](float crest, float trough) {
+        Osc o; o.set(oscAt(5.0f, 0.02f, OscShape::Square, crest, trough));
+        const auto r = oscRun(o, L, restPlan(0.5f, 3400), 3200);
+        size_t hi = 0;
+        for (size_t i = 800; i < 3198; ++i) if (r.osc[i] > 0.0f) ++hi;
+        return float(hi) / float(3198 - 800);
+    };
+    CHECK(duty(0.0f, 0.0f) == doctest::Approx(0.5f).epsilon(0.02));
+    CHECK(duty(0.0f, 1.0f) == doctest::Approx(0.25f).epsilon(0.04));   // half of a doubled period
+    CHECK(duty(1.0f, 0.0f) == doctest::Approx(0.75f).epsilon(0.02));
+}
+
+TEST_CASE("oscillator: a new frequency fades out, latches at rest and fades in from the trough") {
+    const Limits L{5.0f, 300.0f, 300000.0f};
+    const auto plan = restPlan(0.5f, 2600);
+    Osc o; o.set(oscAt(10.0f, 0.02f));
+    std::array<float, 128> out{};
+    std::vector<float> osc, eff, sum;
+    constexpr size_t kE = Osc::kPlanEdge, kSet = 800 - kE;   // the tick of the change, as an index
+    for (size_t i = kE; i < 2400; ++i) {
+        if (i == 800) o.set(oscAt(20.0f, 0.005f));
+        o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], 128, L, 0.0f, 1.0f, false, out.data());
+        osc.push_back(out[0]); eff.push_back(o.amplitudeEffective()); sum.push_back(plan[i] + out[0]);
+    }
+    size_t rest = 0;
+    for (size_t i = kSet; i < eff.size(); ++i) if (eff[i] == 0.0f) { rest = i; break; }
+    REQUIRE(rest > kSet);
+    CHECK(rest < kSet + 160);   // one fade
+    size_t first = rest;
+    while (first < osc.size() && osc[first] == 0.0f) ++first;
+    REQUIRE(first < osc.size());
+    CHECK(osc[first] < 0.0f);   // the trough
+    for (const size_t d : periodsOf(osc, first + 200)) CHECK(d == doctest::Approx(50).epsilon(0.03));
+    const Peaks pk = fdPeaks(sum);
+    CHECK(pk.v <= L.vmax); CHECK(pk.a <= L.amax); CHECK(pk.j <= L.jmax);
+}
+
+TEST_CASE("oscillator: hold sheds it and restarts the phase at the trough; disabled it goes idle") {
+    const Limits L{5.0f, 300.0f, 300000.0f};
+    const auto plan = restPlan(0.5f, 2600);
+    Osc o; o.set(oscAt(7.0f, 0.02f));
+    std::array<float, 128> out{};
+    std::vector<float> osc, eff;
+    constexpr size_t kE = Osc::kPlanEdge, kOn = 600 - kE, kOff = 1000 - kE;   // the hold, as indexes
+    for (size_t i = kE; i < 2000; ++i) {
+        o.render(i * kMs, 1000, &plan[i - kE], 128, L, 0.0f, 1.0f, i >= 600 && i < 1000, out.data());
+        osc.push_back(out[0]); eff.push_back(o.amplitudeEffective());
+    }
+    CHECK(eff[kOn - 1] > 0.0f);
+    for (size_t i = kOn + 160; i < kOff; ++i) CHECK(osc[i] == 0.0f);
+    CHECK(eff[kOff - 1] == 0.0f);
+    size_t first = kOff;
+    while (first < osc.size() && osc[first] == 0.0f) ++first;
+    REQUIRE(first < osc.size());
+    CHECK(first <= kOff + 2);
+    CHECK(osc[first] < 0.0f);
+    OscParams off = o.params(); off.enabled = false; o.set(off);
+    for (size_t i = 2000; i < 2300 && !o.idle(); ++i) o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], 128, L, 0.0f, 1.0f, false, out.data());
+    CHECK(o.idle());
+    CHECK(o.amplitudeEffective() == 0.0f);
+}
+
+TEST_CASE("oscillator: the strip predicts the head it later renders, and a run is bit-exact") {
+    Config cfg; cfg.limits = kHubSet;
     Engine<> e(cfg, 0.2f);
-    REQUIRE(e.submit(knotAt(600 * kMs, 0.8f, true, 0.0f), 0));
-    REQUIRE(e.submit(knotAt(1200 * kMs, 0.2f, true, 0.0f), 0));
-    Oscillator o; OscParams p; p.enabled = true; p.frequency = 8.0f; p.amplitude = 0.03f; o.set(p);
-    std::vector<State> sum;
-    for (uint64_t t = 0; t <= 1400 * kMs; t += kMs) sum.push_back(o.apply(e.stateAt(0, t), t, cfg.limits, 0.0f, 1.0f));
-    const Peaks pk = peaksOf(sum);
-    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
-    CHECK(pk.a <= cfg.limits.amax * 1.001f);
-    CHECK(pk.j <= cfg.limits.jmax * 1.10f);
-    CHECK(pk.lo >= -1e-3f); CHECK(pk.hi <= 1.0f + 1e-3f);
+    REQUIRE(e.submit(knotAt(700 * kMs, 0.6f), 0));
+    REQUIRE(e.submit(knotAt(1500 * kMs, 0.3f), 0));
+    const auto plan = planOf(e, 2200);
+    auto run = [&](std::vector<float>* predicted) {
+        Osc o; o.set(oscAt(8.0f, 0.02f));
+        std::array<float, 128> out{};
+        std::vector<float> head;
+        for (size_t i = Osc::kPlanEdge; i < 1900; ++i) {
+            o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], 128, kHubSet, 0.0f, 1.0f, false, out.data());
+            head.push_back(out[0]);
+            if (predicted && i == 500) predicted->assign(out.begin(), out.end());
+        }
+        return head;
+    };
+    std::vector<float> ahead;
+    const auto a = run(&ahead), b = run(nullptr);
+    CHECK(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+    // Equal to float rounding: the smoothing's running sums start at another
+    // sample each tick.
+    for (size_t k = 0; k < 128; ++k) CHECK(std::fabs(a[500 - Osc::kPlanEdge + k] - ahead[k]) <= 1e-6f);
 }
 
 // ---- continuity under submits in flight (the arbiter's measured 67 mm jump) ----

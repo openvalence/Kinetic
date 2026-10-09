@@ -1,120 +1,289 @@
-// kinetic2/oscillator.hpp -- the oscillation modulator (Valence RFC-103): an
-// additive stage after the planner that yields first under the ceilings
+// kinetic2/oscillator.hpp -- the oscillator stage (Valence RFC-103, SPEC 9.7): a
+// periodic offset on the planned position that yields first under the ceilings
+// and never leaves the window
 // Constraints:
-// - Additive on the planned state, never on the timeline: the engine knows
-//   nothing about it, the caller sums (the hub's arbiter, the wasm shim).
-// - Yields first: the amplitude actually rendered is the largest that keeps
-//   planned + oscillation inside every ceiling at this instant, never more
-//   than asked; a full-speed stroke sheds the oscillation to nothing and
-//   `amplitudeEffective()` says so. The planned motion is never touched.
-// - Every shape is band-limited by construction: square edges and saw
-//   flybacks are quintic ramps whose duration is set by the ceilings, so the
-//   stage can never be the thing that exceeds jmax.
-// - Dwells hold the crest and the trough for a share of the period, which
-//   lengthens the period (RFC-095's additive rule, applied to a cycle).
-// - Deterministic: phase advances from the caller's clock in whole
-//   microseconds; no state but the phase and the last effective amplitude.
+// - Additive on the plan, never on the timeline: the engine knows nothing
+//   about it. The caller hands render() the planned positions on a uniform
+//   grid and sums what it returns (the hub's strip, the wasm shim).
+// - The ceilings hold on the SUM'S POSITIONS, the envelope's own derivatives
+//   included. The amplitude rendered is the target (the least the asked
+//   amplitude, the window and every ceiling's headroom allow over the next
+//   fade, planned jerk included) smoothed by a quadratic B-spline one fade
+//   long, and the budget factors (kappa) pay for the smoothing: the
+//   oscillation is shed before the planned motion that needs the headroom
+//   arrives. Proven while the plan inside the look-ahead does not change; a
+//   plan changed with less notice than a fade (a PAUSE brake, a knot landing
+//   inside the look-ahead) can exceed a ceiling until the fade ends.
+// - The window bounds the amplitude and never cuts the waveform: every shape
+//   is normalized to a peak of exactly 1.
+// - Frequency, shape and dwells change only at rest: a change fades the
+//   oscillation out, latches, and fades it in from the trough. Amplitude
+//   changes ride the envelope.
+// - Fixed storage, no allocation: the caller hosts the object (a few KB).
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 
 #include "types.hpp"
 
 namespace kinetic2 {
 
+// The registry's osc_shapes numbers (Valence registry.yaml): never renumber.
 enum class OscShape : uint8_t { Sine = 0, Square = 1, Saw = 2, SawReverse = 3 };
 
 struct OscParams {
     bool     enabled      = false;
-    float    frequency    = 1.0f;   // Hz, 0 .. osc_max_hz (the hub's declared limit)
+    float    frequency    = 1.0f;   // Hz: the moving part of one cycle takes 1 / frequency
     float    amplitude    = 0.0f;   // window units, peak (half the swing)
     OscShape shape        = OscShape::Sine;
-    float    dwell_crest  = 0.0f;   // share of one period held at the crest
-    float    dwell_trough = 0.0f;   // share of one period held at the trough
+    float    dwell_crest  = 0.0f;   // share of the moving cycle held at the crest
+    float    dwell_trough = 0.0f;   // share of the moving cycle held at the trough
 };
 
+// MaxOut: the most samples one render() returns. MaxFade: the longest fade,
+// in grid steps (kFadeMaxUs at the caller's step).
+template <size_t MaxOut = 128, size_t MaxFade = 150>
 class Oscillator {
+    static_assert(MaxFade >= 3, "a fade is three boxes of at least one step");
+
 public:
     static constexpr float kPi = 3.14159265358979f;
+    // A fade lasts three periods, capped here: the longer the fade, the less
+    // its derivatives cost and the further ahead the plan must be known.
+    static constexpr uint32_t kFadeMaxUs = 150000;
 
-    const OscParams& params() const { return _p; }
-    void set(const OscParams& p) {
-        _p = p;
-        if (!p.enabled) { _phase = 0.0f; _eff = 0.0f; }
-        measurePeaks();
+    // Planned positions render() reads before t0 and past its look-ahead,
+    // for the finite differences.
+    static constexpr size_t kPlanEdge = 3;
+    // Grid steps of plan render() reads past its last output: plan[] holds
+    // n + lookahead(step_us) + 2 * kPlanEdge positions.
+    static constexpr size_t lookahead(uint32_t step_us) {
+        return std::min<size_t>(MaxFade / 3, kFadeMaxUs / 3 / step_us) * 3;
     }
 
-    // The amplitude the last apply() rendered (RFC-103 `osc.amplitude_effective`).
+    const OscParams& params() const { return _want; }
+    // Takes effect at the next render(): amplitude through the envelope,
+    // frequency, shape and dwells through a fade to rest.
+    void set(const OscParams& p) {
+        _want = p;
+        if (!(_want.frequency > 0.0f)) _want.frequency = 0.0f;
+        if (!(_want.amplitude > 0.0f)) _want.amplitude = 0.0f;
+        if (!(_want.dwell_crest > 0.0f)) _want.dwell_crest = 0.0f;
+        if (!(_want.dwell_trough > 0.0f)) _want.dwell_trough = 0.0f;
+    }
+    // Stops at once, phase at the trough: for a caller that stopped the motion
+    // itself (an e-stop, a reset of the plan). Parameters untouched.
+    void reset() {
+        _hist.fill(0.0f);
+        _n_pred = 0;
+        _phase = 0.0f;
+        _eff = 0.0f;
+        _shaped = false;
+    }
+    // The window's span moved by `k` (old over new): the envelope keeps its
+    // physical size, and the target moves it from there.
+    void rescale(float k) {
+        for (float& x : _hist) x *= k;
+        for (size_t i = 0; i < _n_pred; ++i) _pred[i] *= k;
+        _eff *= k;
+    }
+
+    // The amplitude the last render() gave its first sample (RFC-103
+    // `osc.amplitude_effective`), window units.
     float amplitudeEffective() const { return _eff; }
-    bool  active() const { return _p.enabled && _eff > 0.0f; }
+    bool  active() const { return _eff > 0.0f; }
+    // The ceilings or the window cut the target below the asked amplitude.
+    bool  shaped() const { return _shaped; }
+    // Disabled and faded out: render() would return zeros.
+    bool  idle() const { return !_want.enabled && quiet(); }
 
-    // The planned state plus the oscillation at now_us, clamped by the
-    // ceilings. The window is the caller's clamp (the oscillation never
-    // leaves it: the sum is limited to [lo, hi] by amplitude, not by cutting).
-    State apply(const State& planned, uint64_t now_us, const Limits& L, float lo, float hi) {
-        if (!_p.enabled || !(_p.frequency > 0.0f) || !(_p.amplitude > 0.0f)) { _eff = 0.0f; _last_us = now_us; return planned; }
-        // Phase advances by the elapsed clock; the first call seeds it.
-        if (_seeded) { const float dt = float(now_us - _last_us) * 1e-6f; _phase = std::fmod(_phase + dt / period(), 1.0f); }
-        _seeded = true; _last_us = now_us;
+    // out[i] = the oscillation at t0 + i * step_us, window units, i in [0, n).
+    // plan[j] = the planned position at t0 + (j - kPlanEdge) * step_us. L: the ceilings
+    // the sum keeps; lo, hi: the window. hold: shed it (PAUSE): it fades out,
+    // and its phase restarts at the trough once it has. t0 advances by whole
+    // steps between calls; the same t0 with the same plan renders the same.
+    void render(uint64_t t0_us, uint32_t step_us, const float* plan, size_t n, const Limits& L, float lo,
+                float hi, bool hold, float* out) {
+        n = std::min(n, MaxOut);
+        const float dt = float(step_us) * 1e-6f;
+        // Advance the head: the targets the last call predicted are history
+        // now, one per whole step; the phase by the exact time elapsed.
+        if (_seeded && t0_us > _head_us) {
+            const uint64_t k = (t0_us - _head_us + step_us / 2) / step_us;
+            for (uint64_t i = 0; i < k && i < MaxFade; ++i) push(i < _n_pred ? _pred[size_t(i)] : 0.0f);
+            if (_latched && _on.frequency > 0.0f) {
+                const double adv = double(t0_us - _head_us) * 1e-6 * double(_on.frequency) / double(periodShare());
+                _phase = frac(_phase + float(adv - std::floor(adv)));
+            }
+        }
+        _seeded = true;
+        _head_us = t0_us;
 
-        // Unit waveform and its derivatives at this phase, for amplitude 1.
-        float u, du, ddu, dddu;
-        shape(_phase, u, du, ddu, dddu);
+        const bool zero = hold || !_want.enabled || !(_want.frequency > 0.0f);
+        if (quiet()) {
+            // At rest: a new frequency, shape or dwell latches, and a shed
+            // oscillation starts its next period at the trough.
+            if (!_latched || !sameShape(_on, _want)) {
+                _on = _want;
+                _latched = true;
+                measurePeaks();
+                _phase = 0.0f;
+            }
+            if (zero) _phase = 0.0f;
+        }
+        const bool fading = zero || !sameShape(_on, _want);
 
-        // Yield first: the headroom under each ceiling after the planned
-        // motion, divided by the oscillation's own peak demand at amplitude 1,
-        // bounds the amplitude; the window bounds it too.
-        float A = _p.amplitude;
-        // The moving part of a cycle takes 1 / frequency whatever the dwells
-        // add, so its angular rate is the plain one; the dwells only stretch
-        // the period.
-        const float w = 2.0f * kPi * _p.frequency;
-        const float pv = std::fmax(0.0f, L.vmax - std::fabs(planned.v)), pa = std::fmax(0.0f, L.amax - std::fabs(planned.a));
-        const float pj = L.jmax;   // the planner's jerk is not in State; the stage keeps its own jerk under jmax
-        const float dv = _pk_dv * w, da = _pk_da * w * w, dj = _pk_dj * w * w * w;
-        if (dv > 0.0f) A = std::fmin(A, pv / dv);
-        if (da > 0.0f) A = std::fmin(A, pa / da);
-        if (dj > 0.0f) A = std::fmin(A, pj / dj);
-        A = std::fmin(A, std::fmin(planned.p - lo, hi - planned.p));
-        A = std::fmax(0.0f, A);
-        _eff = A;
-
-        State s = planned;
-        s.p += A * u;
-        s.v += A * du * w;
-        s.a += A * ddu * w * w;
-        (void)dddu;
-        return s;
+        const size_t h = boxSteps(step_us);
+        const size_t ln = 3 * h;   // the look-ahead: one fade
+        const size_t past = 3 * h - 3;
+        // s: the committed targets of the fade behind the head, then T, the
+        // targets of the outputs, which the boxes below smooth into the
+        // envelope in place.
+        float* s = _s.data();
+        for (size_t i = 0; i < past; ++i) s[i] = _hist[(_hist_at + MaxFade - past + i) % MaxFade];
+        // B: the largest amplitude each instant allows, from the planned
+        // state by finite differences on the grid.
+        if (fading) {
+            std::fill(s + past, s + past + n, 0.0f);
+        } else {
+            const float w = 2.0f * kPi * _on.frequency, dw = float(3 * h) * dt * w;
+            // The smoothing's cost per ceiling (oscillator.hpp header), and a
+            // 5 % margin for the grid.
+            const float kv = 0.95f / (1.0f + 2.25f / (dw * _pk_dv));
+            const float ka = 0.95f / (1.0f + (4.5f * _pk_dv / dw + 18.0f / (dw * dw)) / _pk_da);
+            const float kj = 0.95f / (1.0f + (6.75f * _pk_da / dw + 54.0f * _pk_dv / (dw * dw) +
+                                             108.0f / (dw * dw * dw)) / _pk_dj);
+            const float cv = kv / (_pk_dv * w), ca = ka / (_pk_da * w * w), cj = kj / (_pk_dj * w * w * w);
+            // The plan's derivatives as the grid's own differences measure
+            // them: the largest of every stencil that touches sample j.
+            const float i1 = 1.0f / dt, i2 = 1.0f / (dt * dt), i3 = 1.0f / (dt * dt * dt);
+            auto d2 = [](const float* q) { return std::fabs(q[1] - 2.0f * q[0] + q[-1]); };
+            auto d3 = [](const float* q) { return std::fabs(q[0] - 3.0f * q[-1] + 3.0f * q[-2] - q[-3]); };
+            for (size_t j = 0; j < n + ln; ++j) {
+                const float* p = plan + j + kPlanEdge;
+                const float v = std::fmax(std::fabs(p[1] - p[0]), std::fabs(p[0] - p[-1])) * i1;
+                const float a = std::fmax(d2(p - 1), std::fmax(d2(p), d2(p + 1))) * i2;
+                const float jk = std::fmax(std::fmax(d3(p), d3(p + 1)), std::fmax(d3(p + 2), d3(p + 3))) * i3;
+                float b = std::fmin(_want.amplitude, std::fmin(p[0] - lo, hi - p[0]));
+                b = std::fmin(b, cv * std::fmax(0.0f, L.vmax - std::fabs(v)));
+                b = std::fmin(b, ca * std::fmax(0.0f, L.amax - std::fabs(a)));
+                b = std::fmin(b, cj * std::fmax(0.0f, L.jmax - std::fabs(jk)));
+                _b[j] = std::fmax(0.0f, b);
+            }
+            // T: the least B over the fade ahead (a monotonic deque, front
+            // the least, walked backward).
+            size_t qh = 0, qt = 0;
+            for (size_t j = n + ln; j-- > 0;) {
+                while (qt > qh && _b[_q[qt - 1]] >= _b[j]) --qt;
+                _q[qt++] = uint16_t(j);
+                if (_q[qh] > j + ln) ++qh;
+                if (j < n) s[past + j] = _b[_q[qh]];
+            }
+        }
+        // The targets next call commits.
+        for (size_t j = 0; j < n; ++j) _pred[j] = s[past + j];
+        _n_pred = n;
+        _shaped = !fading && n > 0 && s[past] < _want.amplitude * 0.999f;
+        const size_t m = past + n;
+        if (h > 1 && m >= h) {
+            box(s, m, h, h - 1);
+            box(s, m, h, 2 * h - 2);
+            box(s, m, h, 3 * h - 3);
+        }
+        const float d = dphi(dt);
+        // The plain sine by rotation, one cos and sin a call rather than one a
+        // sample: the trig is most of a render on a core without a fast libm.
+        const bool sine = _on.shape == OscShape::Sine && !dwells();
+        float c = std::cos(2.0f * kPi * _phase), sn = std::sin(2.0f * kPi * _phase);
+        const float cd = std::cos(2.0f * kPi * d), sd = std::sin(2.0f * kPi * d);
+        _eff = n > 0 ? std::fmax(0.0f, s[past]) : 0.0f;
+        for (size_t j = 0; j < n; ++j) {
+            const float e = std::fmax(0.0f, s[past + j]);
+            float u = -c;
+            if (sine) {
+                const float c1 = c * cd - sn * sd;
+                sn = sn * cd + c * sd;
+                c = c1;
+            }
+            if (e == 0.0f) { out[j] = 0.0f; continue; }
+            if (!sine) {
+                float du, ddu, dddu;
+                shape(frac(_phase + float(j) * d), u, du, ddu, dddu);
+            }
+            out[j] = e * u * _scale;
+        }
     }
 
 private:
-    // One period in seconds, dwells included.
-    float period() const { return periodShare() / _p.frequency; }
-    // The period as a multiple of the undwelled one: 1 + both dwell shares.
-    // A saw has no rest at its extremes to hold (its ramp arrives moving), so
-    // the saw shapes ignore the dwells: a documented constraint, not a bug.
-    bool dwells() const { return _p.shape != OscShape::Saw && _p.shape != OscShape::SawReverse && (_p.dwell_crest > 0.0f || _p.dwell_trough > 0.0f); }
-    float periodShare() const { return dwells() ? 1.0f + std::fmax(0.0f, _p.dwell_crest) + std::fmax(0.0f, _p.dwell_trough) : 1.0f; }
+    static float frac(float x) { return x - std::floor(x); }
+    static bool sameShape(const OscParams& a, const OscParams& b) {
+        return a.frequency == b.frequency && a.shape == b.shape && a.dwell_crest == b.dwell_crest &&
+               a.dwell_trough == b.dwell_trough;
+    }
+    bool quiet() const {
+        for (const float x : _hist) if (x != 0.0f) return false;
+        return true;
+    }
+    void push(float t) {
+        _hist[_hist_at] = t;
+        _hist_at = (_hist_at + 1) % MaxFade;
+    }
+    // Phase per grid step: the moving cycle takes 1 / frequency, the dwells
+    // stretch the period past it.
+    float dphi(float dt) const { return _on.frequency > 0.0f ? dt * _on.frequency / periodShare() : 0.0f; }
+    // One box of the fade, in steps: three periods, capped at kFadeMaxUs.
+    size_t boxSteps(uint32_t step_us) const {
+        const float fade = _on.frequency > 0.0f ? std::fmin(3.0f / _on.frequency, float(kFadeMaxUs) * 1e-6f)
+                                                : float(kFadeMaxUs) * 1e-6f;
+        const size_t h = size_t(std::lround(fade / (3.0f * float(step_us) * 1e-6f)));
+        return std::clamp<size_t>(h, 1, lookahead(step_us) / 3);
+    }
+    // S[i] = the mean of S[i - h + 1 .. i] for i in [first, m), in place,
+    // backward so every read is of an unwritten entry.
+    static void box(float* s, size_t m, size_t h, size_t first) {
+        const float inv = 1.0f / float(h);
+        float sum = 0.0f;
+        for (size_t k = m - h; k < m; ++k) sum += s[k];
+        for (size_t i = m; i-- > first;) {
+            const float x = s[i];
+            s[i] = sum * inv;
+            sum -= x;
+            if (i >= h) sum += s[i - h];
+        }
+    }
 
-    // Peak |du|, |ddu|, |dddu| of the unit shape per unit omega, measured on
-    // a fine grid of one moving cycle when the shape is set: the analytic
-    // derivatives and, for the jerk, also the finite difference of ddu, so a
-    // junction between pieces can never hide a step the ceilings would see.
+    // A saw has no rest at its extremes to hold (its ramp arrives moving), so
+    // the saw shapes ignore the dwells: a constraint of the shape.
+    bool dwells() const { return _on.shape != OscShape::Saw && _on.shape != OscShape::SawReverse && (_on.dwell_crest > 0.0f || _on.dwell_trough > 0.0f); }
+    float periodShare() const { return dwells() ? 1.0f + _on.dwell_crest + _on.dwell_trough : 1.0f; }
+
+    // Peaks of |u|, |du|, |ddu|, |dddu| over one period, measured on a fine
+    // grid when a shape latches, then normalized so |u| peaks at exactly 1:
+    // the analytic derivatives and, for the jerk, also the finite difference
+    // of ddu, so a junction between pieces can never hide a step.
     void measurePeaks() {
-        _pk_dv = _pk_da = _pk_dj = 0.0f;
+        float pu = 0.0f, pv = 0.0f, pa = 0.0f, pj = 0.0f;
         constexpr int N = 4000;
         float u, du, ddu, dddu, ddu_prev = 0.0f;
         const float m = 1.0f / periodShare();
         for (int i = 0; i <= N; ++i) {
-            const float ph = float(i) / float(N) * 0.999999f;   // the whole period, dwells included
+            const float ph = float(i) / float(N) * 0.999999f;
             shape(ph, u, du, ddu, dddu);
-            _pk_dv = std::fmax(_pk_dv, std::fabs(du));
-            _pk_da = std::fmax(_pk_da, std::fabs(ddu));
-            _pk_dj = std::fmax(_pk_dj, std::fabs(dddu));
-            if (i) _pk_dj = std::fmax(_pk_dj, std::fabs(ddu - ddu_prev) / (2.0f * kPi * m / float(N)));
+            pu = std::fmax(pu, std::fabs(u));
+            pv = std::fmax(pv, std::fabs(du));
+            pa = std::fmax(pa, std::fabs(ddu));
+            pj = std::fmax(pj, std::fabs(dddu));
+            if (i) pj = std::fmax(pj, std::fabs(ddu - ddu_prev) / (2.0f * kPi * m / float(N)));
             ddu_prev = ddu;
         }
+        _scale = pu > 0.0f ? 1.0f / pu : 1.0f;
+        _pk_dv = std::fmax(1e-6f, pv * _scale);
+        _pk_da = std::fmax(1e-6f, pa * _scale);
+        _pk_dj = std::fmax(1e-6f, pj * _scale);
     }
 
     // A quintic Hermite on x in 0..1 from (p0, m0, k0) to (p1, m1, k1): the
@@ -134,7 +303,7 @@ private:
     }
 
     // Ramp share of a period for the band-limited shapes: a square edge or a
-    // saw flyback takes this share of the period, as a rest-to-rest quintic.
+    // saw flyback takes this share of the period, as a quintic.
     static constexpr float kRamp = 0.15f;
 
     // Quintic rest-to-rest smoothstep s(x) on 0..1 and its derivatives.
@@ -147,23 +316,22 @@ private:
         ddds = 60.0f - 360.0f * x + 360.0f * x2;
     }
 
-    // u in -1..1 over one period of phase 0..1 with the dwells folded in:
-    // the moving part occupies share m = 1 / periodShare of the period, the
-    // crest dwell follows the crest, the trough dwell follows the trough.
-    // Derivatives are per unit of the UNDWELLED phase angle (2 pi per moving
-    // period), which is what apply() scales by omega.
+    // u over one period of phase 0..1 with the dwells folded in, before
+    // normalization (_scale): the moving part occupies share m = 1 /
+    // periodShare of the period, the crest dwell follows the crest, the trough
+    // dwell follows the trough. Derivatives are per unit of the UNDWELLED
+    // phase angle (2 pi per moving cycle), which render()'s budget scales by
+    // omega.
     void shape(float ph, float& u, float& du, float& ddu, float& dddu) const {
         const float m = 1.0f / periodShare();
-        const float dc = dwells() ? std::fmax(0.0f, _p.dwell_crest) / periodShare() : 0.0f;
-        // Phase layout: [0, m/2) rise to the crest, [m/2, m/2 + dc) crest dwell,
-        // then the fall, then the trough dwell to 1.
+        const float dc = dwells() ? _on.dwell_crest / periodShare() : 0.0f;
         float t;   // 0..1 within the moving cycle, rise then fall
         if (ph < 0.5f * m) t = ph / m;
         else if (ph < 0.5f * m + dc) { u = 1.0f; du = ddu = dddu = 0.0f; return; }
         else if (ph < m + dc) t = (ph - dc) / m;
         else { u = -1.0f; du = ddu = dddu = 0.0f; return; }
         const float ang = 2.0f * kPi * t;
-        switch (_p.shape) {
+        switch (_on.shape) {
             case OscShape::Sine: {
                 if (dwells()) {
                     // A held extreme must be reached at rest in acceleration, which a
@@ -190,17 +358,15 @@ private:
             }
             case OscShape::Saw:
             case OscShape::SawReverse: {
-                // Saw: a linear rise over (1 - r) of the cycle, then a quintic flyback of share r.
+                // Saw: a linear rise over (1 - r) of the cycle, then a quintic flyback of share r
+                // that keeps the ramp's slope at both ends (it overshoots, which _scale absorbs).
                 // SawReverse mirrors it in time.
                 const float r = kRamp;
-                const float tt = _p.shape == OscShape::Saw ? t : 1.0f - t;
-                const float sgn = _p.shape == OscShape::Saw ? 1.0f : -1.0f;
+                const float tt = _on.shape == OscShape::Saw ? t : 1.0f - t;
+                const float sgn = _on.shape == OscShape::Saw ? 1.0f : -1.0f;
                 const float slope = 2.0f / (1.0f - r);   // du/dt on the linear part
                 if (tt < 1.0f - r) { u = -1.0f + 2.0f * tt / (1.0f - r); du = sgn * slope / (2.0f * kPi); ddu = dddu = 0.0f; }
                 else {
-                    // The flyback keeps the ramp's slope at both ends, so the
-                    // velocity is continuous and only the quintic's own
-                    // acceleration and jerk appear.
                     float v, dv, ddv, dddv;
                     hermite5((tt - (1.0f - r)) / r, 1.0f, slope * r, 0.0f, -1.0f, slope * r, 0.0f, v, dv, ddv, dddv);
                     const float k = 1.0f / (2.0f * kPi * r);
@@ -212,12 +378,26 @@ private:
         u = du = ddu = dddu = 0.0f;
     }
 
-    OscParams _p{};
+    OscParams _want{};   // as set()
+    OscParams _on{};     // as latched: what renders
+    bool      _latched = false;
+    float     _scale = 1.0f;   // 1 / the shape's peak |u|
     float     _pk_dv = 1.0f, _pk_da = 1.0f, _pk_dj = 1.0f;
-    float     _phase = 0.0f;
-    float     _eff = 0.0f;
-    uint64_t  _last_us = 0;
+    float     _phase = 0.0f;   // at the head
+    uint64_t  _head_us = 0;
     bool      _seeded = false;
+    float     _eff = 0.0f;
+    bool      _shaped = false;
+    // The committed targets of the last MaxFade steps (a ring), and the
+    // targets the last render() predicted for its outputs.
+    std::array<float, MaxFade> _hist{};
+    size_t    _hist_at = 0;
+    std::array<float, MaxOut> _pred{};
+    size_t    _n_pred = 0;
+    // Scratch, sized for one render(): B then T, the box sequence, the deque.
+    std::array<float, MaxOut + MaxFade> _b{};
+    std::array<float, MaxOut + MaxFade> _s{};
+    std::array<uint16_t, MaxOut + MaxFade> _q{};
 };
 
 }  // namespace kinetic2
