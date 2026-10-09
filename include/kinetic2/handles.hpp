@@ -877,9 +877,9 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
         // the whole trim is a zero stroke at rest.
         int hint = 0;   // the trim bisection's last legal factor (fitPiece)
         Room cur = rm;
-        auto fitAt = [&](float pR, float bound, bool hinted = false) {
+        auto fitAt = [&](float pR, float bound, bool hinted = false, bool flat = false) {
             HKnot Rt = R;
-            if (c.railStop && pR != R.p) Rt.vel = bandHold(R.vel, pR - pL, R.t - L.t);
+            if (c.railStop && (pR != R.p || flat)) Rt.vel = bandHold(R.vel, pR - pL, R.t - L.t);
             Room r2 = cur;
             r2.intoFlat = intoFlat && Rt.vel == 0.0f;
             Fit f = fitPiece(L, Rt, pL, pR, c, bound, c.railStop ? &r2 : nullptr, hinted ? &hint : nullptr);
@@ -922,9 +922,11 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
             }
             // An illegal hold (a chord within holdEps rendered too fast) lies flat
             // at its predecessor instead when that is less over. The model has no
-            // such piece; its hold chords are long enough to be legal.
+            // such piece; its hold chords are long enough to be legal. Flat is at
+            // rest on a zero chord too: an authored angle kept there is a zero
+            // stroke that no cap on L's angle makes legal (kin-jsw1).
             if (!f.legal && hold && canTrim) {
-                const Fit ff = fitAt(pL, f.o);
+                const Fit ff = fitAt(pL, f.o, false, true);
                 if (ff.o < f.o) { f = ff; dp = pL - R.p; }
             }
         };

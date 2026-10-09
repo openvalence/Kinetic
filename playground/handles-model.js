@@ -309,8 +309,8 @@
         intoFlat = i + 2 >= n || holdChord(knots, i + 1, pos(knots[i + 2]) - pos(R), c);
       }
       // railStop: a trimmed knot's angle keeps to its trimmed chord, so the whole trim is a zero stroke at rest
-      const fitAt = (pR) => {
-        const s1 = rs && pR !== pos(R) ? bandHold(R.vIn, pR - pL, R.t - L.t) : R.vIn;
+      const fitAt = (pR, flat) => {
+        const s1 = rs && (pR !== pos(R) || flat) ? bandHold(R.vIn, pR - pL, R.t - L.t) : R.vIn;
         const f = fitPiece(L, R, pL, pR, c, s1, room && { ...room, intoFlat: intoFlat && s1 === 0 });
         f.s1 = s1;
         return f;
@@ -331,8 +331,9 @@
             for (const q of [0.25, 0.5, 0.75, 1]) { const fq = fitAt(pos(R) + dir * q * hi); if (fq.o < f.o) { f = fq; dp = dir * q * hi; } }
           }
         }
-        // railStop: an illegal hold lies flat at its predecessor instead when that is less over
-        if (rs && !f.legal && hold && canTrim) { const ff = fitAt(pL); if (ff.o < f.o) { f = ff; dp = pL - pos(R); } }
+        // railStop: an illegal hold lies flat at its predecessor instead when that is less over,
+        // at rest on a zero chord too (an authored angle kept there is a zero stroke no cap makes legal)
+        if (rs && !f.legal && hold && canTrim) { const ff = fitAt(pL, true); if (ff.o < f.o) { f = ff; dp = pL - pos(R); } }
       };
       search();
       // railStop: an end-acceleration ask no fit honors legally is dropped (it is the

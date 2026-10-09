@@ -554,12 +554,12 @@ Score randomRun(uint32_t seed, float smoothness) {
 
 TEST_CASE("property: random knot sequences never exceed a ceiling or the window and are never late") {
     // Every set at smoothness 0, 0.25, 0.5, 0.75, 1 and a random value per run
-    // (kin-rfw7): the smooth path is held to the bars pchip is. 2000 seeds per
-    // set (kin-9od3): 400 held while 401 to 2000 put speed, acceleration and
-    // the window over. About 12 s on the host.
+    // (kin-rfw7): the smooth path is held to the bars pchip is. 4000 seeds per
+    // set (kin-jsw1): 2000 held while 2001 to 4000 put speed and acceleration
+    // over and a solved knot past vmax. About 25 s on the host.
     for (const float set : {0.0f, 0.25f, 0.5f, 0.75f, 1.0f, -1.0f}) {
         int runs = 0, violations = 0, spent = 0, hits = 0, missed = 0, off = 0, knots = 0, failed = 0, junction = 0, why[6] = {}, withFail = 0, withoutFail = 0;
-        for (uint32_t seed = 1; seed <= 2000; ++seed) {
+        for (uint32_t seed = 1; seed <= 4000; ++seed) {
             // The random set draws from its own sequence: the knots stay the seed's.
             const float sm = set >= 0.0f ? set : Rng(seed * 2654435761u).uni(0.0f, 1.0f);
             const Score sc = randomRun(seed, sm);
@@ -582,11 +582,11 @@ TEST_CASE("property: random knot sequences never exceed a ceiling or the window 
         CHECK(junction == 0);
         // Constraint: a G1 knot whose corner ramp has no room in its spans keeps
         // an acceleration step (a 1 ms jerk spike) and is reported
-        // PieceOverCeiling: 36 of 2000 runs at smoothness 0 as of 2026-10-08,
-        // 41 at 0.5, the most of any set. Acceptance (c) bars it; rule 5 as
+        // PieceOverCeiling: 81 of 4000 runs at smoothness 0 as of 2026-10-09,
+        // 82 at 0.25, the most of any set. Acceptance (c) bars it; rule 5 as
         // written renders it. Operator ruling owed (kin-y6e).
         CHECK(withoutFail == 0);
-        CHECK(why[2] <= 41);
+        CHECK(why[2] <= 82);
         CHECK(why[5] == 0);
         CHECK(why[4] == 0);
         // A corner ramp passes a reachable knot: its walk-back settles, or keeps
