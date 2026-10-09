@@ -520,7 +520,13 @@ Score randomRun(uint32_t seed, float smoothness) {
     if (pk.j > cfg.limits.jmax * 1.001f) { ++sc.violations; ++sc.why[2]; }   // finite difference over 1 ms
     if (pk.lo < -1e-3f || pk.hi > 1.0f + 1e-3f) { ++sc.violations; ++sc.why[3]; }
     for (const Anomaly& x : drain(e)) an.push_back(x);
+    // A piece over a ceiling counts by the solver's own flag: one solve of a long
+    // bundle can report more than the anomaly ring keeps (kin-a7n9), and a
+    // report overwritten before this drain is not a silent run (kin-jsw1).
     sc.failed = countKind(an, AnomalyKind::PieceOverCeiling);
+    int flagged = 0;
+    for (const Solved& o : sol) flagged += o.infeasible;
+    if (flagged > sc.failed) sc.failed = flagged;
     sc.spent = countKind(an, AnomalyKind::KnotTrimmed);
     // Every knot is passed at its own time, at its solved (trimmed) position.
     for (size_t i = 0; i < sol.size(); ++i) {
