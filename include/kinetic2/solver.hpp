@@ -27,7 +27,8 @@
 //   item 8, kin-tnv), never a cut window.
 // - A knot's solved state (where the next piece, a starvation brake and a
 //   re-plan start) is inside vmax and amax, whatever the piece into it did
-//   (emitRun, kin-554).
+//   (emitRun, kin-554); a chase knot its convergence passes keeps the
+//   convergence's state (chaseRun), reported.
 // - A knot whose two pieces differ in acceleration by more than jmax * kStepS
 //   carries a corner ramp at jmax: centered on the knot, ending on it into a
 //   flat span, starting on it out of one. Its Solved state is then the ramp's
@@ -448,6 +449,20 @@ inline float vaxOf(const Piece& pc, const handles::Cfg& c) {
     return w;
 }
 
+// The worst ratio of a built piece over every ceiling and the window: vaxOf
+// with the jerk of its Bezier and profiles.
+inline float overAll(const Piece& pc, const handles::Cfg& c) {
+    float w = vaxOf(pc, c);
+    if (pc.T > 0.0f) {
+        handles::Over po;
+        handles::overOf(pc.q, pc.p0, c, INFINITY, &po);
+        w = std::fmax(w, po.j);
+    }
+    for (const Profile* pr : {pc.has_lead ? &pc.lead : nullptr, pc.has_tail ? &pc.tail : nullptr})
+        for (int i = 0; pr && i < pr->n; ++i) w = std::fmax(w, std::fabs(pr->jerk[i]) / c.lim.jmax);
+    return w;
+}
+
 // ---- one run of the renderer -------------------------------------------------
 // Fills out[r - 1] for r in [1, me) from the render of knots k[0..m) (te: their
 // times), piece by piece from state s as the engine will build them, with the
@@ -770,12 +785,51 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
 // later (stretched, like a HARD knot). Each new sample re-plans the run from
 // the live origin, so a stream in motion never reaches the rest. False when
 // the profile is full or leaves the window: the run then renders as knots.
-inline bool chaseRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, const handles::Cfg& c, Solved* out) {
+// From an origin outside the ceilings (Profile::inside), or one whose stop
+// they no longer fit in the window (lowered under the motion: plan, the set
+// it was planned under, is over them), the move starts with Profile::converge
+// at jmax, or at plan's jerk when none at jmax stays in the window, to the
+// highest speed from which the move is legal; every knot whose piece the
+// convergence overlaps is infeasible when it is over a ceiling, worst its
+// ratio, and the knots it passes keep its states (the next solve converges
+// on from them).
+inline bool chaseRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, const handles::Cfg& c, Solved* out,
+                     const Limits& plan) {
     const Knot& last = kn[cnt - 1];
-    float fastest = 0.0f;
-    const Profile pr = Profile::point(s, last.p, s_us, c.lim, 0.0f, &fastest);
-    const float ratio = pr.n < 0 ? kIllegal : pr.worstRatio(c.lim, c.lo, c.hi);
-    if (!(ratio <= 1.0001f)) return false;
+    Profile pr;
+    float over = 0.0f, ratio = 0.0f;
+    uint64_t conv_us = s_us;
+    Limits cap{c.lim.vmax, plan.amax, c.lim.jmax};
+    // The move from s keeping share of the speed a convergence aims at.
+    auto build = [&](float share) {
+        float fastest = 0.0f;
+        pr = Profile::converge(s, s_us, c.lim, cap, share);
+        over = pr.n ? std::fmax(pr.worstRatio(c.lim, c.lo, c.hi), cap.jmax / c.lim.jmax) : 0.0f;
+        conv_us = pr.n ? pr.end_us() : s_us;
+        const Profile mv = Profile::point(pr.n ? pr.atSeconds(pr.duration()) : s, last.p, conv_us, c.lim, 0.0f, &fastest);
+        ratio = mv.n < 0 ? kIllegal : mv.worstRatio(c.lim, c.lo, c.hi);
+        if (!(ratio <= 1.0001f) || over >= 1e29f) return false;
+        if (!pr.n) { pr = mv; return true; }
+        for (int i = 0; i < mv.n; ++i) if (!pr.add(mv.dt[i], mv.jerk[i])) return false;
+        pr.ends_at_rest = true;
+        return true;
+    };
+    if (!build(1.0f)) {
+        if (!pr.n && !(plan.amax > c.lim.amax) && !(plan.jmax > c.lim.jmax)) return false;
+        if (!build(0.0f)) {
+            if (!(plan.jmax > c.lim.jmax)) return false;
+            cap.jmax = plan.jmax;
+            if (!build(0.0f)) return false;
+        }
+        // The highest share to 1/4096, then 2 percent under it: a re-plan
+        // from a point on a move at the edge of legal lands just past it.
+        float lo = 0.0f, hi = 1.0f;
+        for (int it = 0; it < 12; ++it) {
+            const float mid = 0.5f * (lo + hi);
+            if (build(mid)) lo = mid; else hi = mid;
+        }
+        if (!build(0.98f * lo)) (void)build(lo);
+    }
     const uint64_t end_us = pr.n > 0 ? pr.end_us() : s_us;
     uint64_t prev_us = s_us;
     for (size_t r = 0; r < cnt; ++r) {
@@ -786,7 +840,6 @@ inline bool chaseRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, 
         o.knot_p = K.p;
         o.hard = true;
         o.ramp = pr;
-        o.worst = ratio;
         const bool newest = r + 1 == cnt;
         uint64_t t_us = K.t_us > prev_us + kMinSpanUs ? K.t_us : prev_us + kMinSpanUs;
         if (newest && end_us > t_us) t_us = end_us;
@@ -795,6 +848,8 @@ inline bool chaseRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, 
         const State st = pr.n > 0 ? pr.atSeconds(float(t_us - s_us) * 1e-6f) : State{s.p, 0.0f, 0.0f};
         o.p = st.p; o.v = st.v; o.a = st.a;
         if (newest || t_us >= end_us) { o.p = last.p; o.v = 0.0f; o.a = 0.0f; }
+        o.infeasible = over > 1.0f + handles::kTol && prev_us < conv_us;
+        o.worst = o.infeasible ? over : ratio;
         prev_us = t_us;
     }
     return true;
@@ -806,9 +861,12 @@ inline bool chaseRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt, 
 // and every clamped authored velocity through `report`. Returns n: a window is
 // always solved whole. until_us: a successor of the newest knot is expected
 // until then, 0 none (renderRun).
+// plan: the ceilings the motion in flight was planned under, when they were
+// lowered under it (chaseRun); null, the current ones.
 template <typename Report>
 inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* knots, size_t n,
-                          const Config& cfg, Solved* out, Report&& report, Workspace& ws, uint64_t until_us = 0) {
+                          const Config& cfg, Solved* out, Report&& report, Workspace& ws, uint64_t until_us = 0,
+                          const Limits* plan = nullptr) {
     if (n == 0) return 0;
     K2_STAT(windows, 1);
     handles::Cfg c;
@@ -829,7 +887,9 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             // A run of position-only samples: the chase.
             size_t j = i + 1;
             while (j < n && j - i < kWindowKnots && knots[j].sample && !knots[j].has_v) ++j;
-            if (chaseRun(s, s_us, knots + i, j - i, c, out + i)) {
+            if (chaseRun(s, s_us, knots + i, j - i, c, out + i, plan ? *plan : cfg.limits)) {
+                for (size_t r = i; r < j; ++r)
+                    if (out[r].infeasible) report(AnomalyKind::PieceOverCeiling, r, out[r].t_us, knots[r].p, out[r].worst);
                 s = State{out[j - 1].p, 0.0f, 0.0f};
                 s_us = out[j - 1].t_us;
                 i = j;

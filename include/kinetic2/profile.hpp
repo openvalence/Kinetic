@@ -26,7 +26,9 @@
 namespace kinetic2 {
 
 struct Profile {
-    static constexpr int kMaxPhases = 12;   // point(): see there
+    // point(): 12, see there. A chase run (solver.hpp chaseRun) is converge()
+    // (3 at most) and point() from its end, which has no acceleration (10).
+    static constexpr int kMaxPhases = 13;
     uint64_t start_us = 0;
     State    s0{};
     int      n = 0;
@@ -110,6 +112,39 @@ struct Profile {
         State mid0 = mid; mid0.a = 0.0f;
         const Profile rest = brake(mid0, 0, L);
         for (int i = 0; i < rest.n && pr.n < kMaxPhases; ++i) { pr.dt[pr.n] = rest.dt[i]; pr.jerk[pr.n] = rest.jerk[i]; ++pr.n; }
+        return pr;
+    }
+
+    // The speed s reaches when its acceleration ramps out at jmax at once.
+    static float freeSpeed(const State& s, const Limits& L) { return s.v + s.a * std::fabs(s.a) / (2.0f * L.jmax); }
+
+    // s within L at the bar a chase run judges at: its speed, its acceleration
+    // and freeSpeed(). Past the last, no jerk-limited move keeps the speed
+    // inside vmax.
+    static bool inside(const State& s, const Limits& L) {
+        const float bar = 1.0001f;
+        return std::fabs(s.v) <= L.vmax * bar && std::fabs(s.a) <= L.amax * bar && std::fabs(freeSpeed(s, L)) <= L.vmax * bar;
+    }
+
+    // The fastest return inside vmax and amax from a state outside them (a
+    // ceiling lowered under the motion): the velocity changes to the nearest
+    // one vmax allows, times share, at cap's jerk and up to its acceleration
+    // (never under amax: cap is the set the motion was planned under), ending
+    // with none; an acceleration alone over amax ramps out. An entry
+    // acceleration past cap's starts at it (startOf, kin-554). Empty when s
+    // is inside() and share is 1.
+    static Profile converge(const State& entry, uint64_t start_us, const Limits& L, const Limits& cap, float share = 1.0f) {
+        const Limits C{L.vmax, std::fmax(L.amax, cap.amax), cap.jmax};
+        const State s = startOf(entry, C);
+        Profile pr; pr.start_us = start_us; pr.s0 = s; pr.ends_at_rest = false;
+        if (share == 1.0f && inside(s, L)) return pr;
+        const float v_free = freeSpeed(s, C);
+        const float v_to = share * std::fmax(-L.vmax, std::fmin(L.vmax, v_free));
+        const Profile d = brake(State{0.0f, s.v - v_to, s.a}, 0, C);
+        for (int i = 0; i < d.n; ++i) {
+            if (pr.n && pr.jerk[pr.n - 1] == d.jerk[i]) pr.dt[pr.n - 1] += d.dt[i];
+            else (void)pr.add(d.dt[i], d.jerk[i]);
+        }
         return pr;
     }
 

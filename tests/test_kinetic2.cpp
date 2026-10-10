@@ -1959,9 +1959,9 @@ TEST_CASE("a live jog handed motion its ceilings cannot stop renders as its prof
     CHECK(worst > 1.0f);
 }
 
-TEST_CASE("a stream sample under ceilings lowered mid-chase keeps the chase in flight to its rest: it never runs away") {
-    // The chase's own way out of the one-tick render: a re-plan the new
-    // ceilings cannot make is undone, and the chase in flight lands first.
+TEST_CASE("a stream sample under ceilings lowered mid-chase converges to them, reported: it never runs away") {
+    // The chase's own way out of the one-tick render: the re-plan converges
+    // to the new ceilings at jmax (chaseRun), never undone (kin-h1ii).
     Config cfg; cfg.limits = kInput;
     Engine<> e(cfg, 0.0f);
     uint64_t now = 1000 * kMs;
@@ -1969,6 +1969,7 @@ TEST_CASE("a stream sample under ceilings lowered mid-chase keeps the chase in f
     std::vector<State> s;
     for (uint64_t end = now + 50 * kMs; now < end; now += kMs) s.push_back(e.stateAt(0, now));
     REQUIRE(s.back().v > 0.5f * kInput.vmax);
+    (void)drain(e);
     e.setLimits({0.25f * kInput.vmax, kInput.amax, kInput.jmax});
     REQUIRE(e.submit(knotFromSample(0.7f, now, 61 * kMs), now));
     for (uint64_t end = now + 3000 * kMs; now <= end; now += kMs) s.push_back(e.stateAt(0, now));
@@ -1980,6 +1981,217 @@ TEST_CASE("a stream sample under ceilings lowered mid-chase keeps the chase in f
     CHECK(s.back().p == doctest::Approx(0.7f).epsilon(1e-4));
     CHECK(s.back().v == 0.0f);
     CHECK_FALSE(e.isBusy(now));
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::PieceOverCeiling) >= 1);
+    CHECK(countKind(an, AnomalyKind::KnotTrimmed) == 0);
+}
+
+// ---- ceilings lowered under a moving chase (kin-h1ii) -----------------------------
+
+namespace {
+
+// The least time a jerk-limited change of velocity takes from (v0, a0) to
+// (vt, 0) under |a| <= A and |j| <= J, in closed form: the bound a
+// convergence is held to. An entry acceleration past A starts at A.
+float changeTime(float v0, float a0, float vt, float A, float J) {
+    float u = v0 - vt, b = u >= 0.0f ? -a0 : a0;   // b > 0 already closes the gap
+    u = std::fabs(u);
+    b = std::fmax(-A, std::fmin(b, A));
+    float t = 0.0f;
+    if (b > 0.0f && b * b / (2.0f * J) > u) {   // closing too hard: through vt and back
+        t = b / J;
+        u = b * b / (2.0f * J) - u;
+        b = 0.0f;
+    }
+    const float peak = std::sqrt(J * u + 0.5f * b * b);
+    if (peak <= A) return t + (peak - b) / J + peak / J;
+    return t + (A - b) / J + (u - (A * A - b * b) / (2.0f * J) - A * A / (2.0f * J)) / A + A / J;
+}
+
+// The stop from (v, 0) under A and J, distance.
+float stopDistance(float v, float A, float J) {
+    return v >= A * A / J ? 0.5f * v * (v / A + A / J) : v * std::sqrt(v / J);
+}
+
+struct Lowered {
+    int over = 0, silent = 0, refused = 0;
+    float late_v = -1e9f, late_a = -1e9f;   // ms past the bound; negative inside it
+    bool tight = false, landed = false;
+    float a_out = 0.0f, j_out = 0.0f, lo = 1e9f, hi = -1e9f;   // after the horizon, over the caps
+};
+
+// A sine stream of samples under random ceilings, lowered at one submit while
+// it moves: vmax and amax always, jmax in a third of the runs. Sampled every
+// 1 ms, anomalies drained at every sample.
+Lowered loweredRun(uint32_t seed) {
+    Rng r(seed);
+    Config cfg;
+    cfg.limits = {r.uni(1.0f, 6.0f), r.uni(20.0f, 200.0f), r.uni(500.0f, 20000.0f)};
+    const Limits L0 = cfg.limits;
+    const uint64_t period = uint64_t(r.uni(2.0f, 20.0f)) * kMs;
+    const uint32_t lat = uint32_t(float(period) * r.uni(1.0f, 4.0f));
+    const float amp = r.uni(0.15f, 0.4f), speed = r.uni(0.3f, 1.2f) * L0.vmax, ph = r.uni(0.0f, 6.28f);
+    const float w = std::fmin(speed / amp, std::sqrt(L0.amax / amp));
+    const uint64_t drop = uint64_t(r.uni(200.0f, 600.0f)) / (period / kMs) * period;
+    Limits L1{L0.vmax * r.uni(0.05f, 1.0f), L0.amax * r.uni(0.01f, 1.0f), L0.jmax};
+    if (r.pick(3) == 0) L1.jmax *= r.uni(0.3f, 1.0f);
+    const float p0 = 0.5f + amp * std::sin(ph);
+    Engine<> e(cfg, p0);
+    Lowered out;
+    // One tick past the horizon: a knot that near is committed through, so
+    // the convergence starts by then.
+    const uint64_t t0 = drop + cfg.react_us + kMs, stream_end = 1500 * kMs;
+    uint64_t covered = 0, last_v = 0, last_a = 0;
+    bool reported = false;
+    State prev{}, from{};
+    float last_p = p0;
+    for (uint64_t t = 0;; t += kMs) {
+        if (t % period == 0 && t <= stream_end) {
+            if (t == drop) e.setLimits(L1);
+            last_p = 0.5f + amp * std::sin(ph + w * float(t) * 1e-6f);
+            if (!e.submit(knotFromSample(last_p, t, lat), t)) ++out.refused;
+        }
+        const State s = e.stateAt(0, t);
+        Anomaly an;
+        while (e.popAnomaly(an))
+            if (t >= drop && an.kind == uint8_t(AnomalyKind::PieceOverCeiling)) { reported = true; covered = std::max(covered, an.t_us); }
+        if (t == t0) from = s;
+        if (t > drop) {
+            const bool ov = std::fabs(s.v) > L1.vmax * 1.001f, oa = std::fabs(s.a) > L1.amax * 1.001f;
+            const bool oj = std::fabs(s.a - prev.a) / 1e-3f > L1.jmax * 1.01f;
+            if (ov) last_v = t;
+            if (oa || oj) last_a = t;
+            // Reported by the time it renders: a report whose knot lies at or
+            // past the sample (a jerk: past the tick before it).
+            if (ov || oa || oj) { ++out.over; if (!reported || covered < (ov || oa ? t : t - kMs + 1)) ++out.silent; }
+            if (t > t0) {
+                out.a_out = std::fmax(out.a_out, std::fabs(s.a) / std::fmax(L0.amax, L1.amax));
+                out.j_out = std::fmax(out.j_out, std::fabs(s.a - prev.a) / 1e-3f / std::fmax(L0.jmax, L1.jmax));
+            }
+            out.lo = std::fmin(out.lo, s.p);
+            out.hi = std::fmax(out.hi, s.p);
+        }
+        prev = s;
+        if (t > stream_end + 200 * kMs && !e.isBusy(t)) { out.landed = std::fabs(s.p - last_p) < 1e-3f && s.v == 0.0f; break; }
+        if (t > 60000 * kMs) break;
+    }
+    // The bound: the fastest jerk-limited change from the state at t0, at
+    // most at the amax the motion was planned under, into the new speed
+    // ceiling, and to rest when the new set's stop from there leaves the
+    // window (5 percent of margin), plus the 1 ms grid.
+    const float A = std::fmax(L0.amax, L1.amax), J = L1.jmax;
+    const float vnear = std::fmax(-L1.vmax, std::fmin(L1.vmax, from.v + from.a * std::fabs(from.a) / (2.0f * J)));
+    const float t_box = changeTime(from.v, from.a, vnear, A, J), t_rest = changeTime(from.v, from.a, 0.0f, A, J);
+    const float stop = from.p + 0.5f * (from.v + vnear) * t_box + std::copysign(stopDistance(std::fabs(vnear), L1.amax, J), vnear);
+    out.tight = stop > 0.05f && stop < 0.95f;
+    auto late = [&](uint64_t last, float bound_s) {
+        return last ? (float(last) - float(t0) - bound_s * 1e6f - float(kMs)) * 1e-3f : -1e9f;
+    };
+    out.late_v = late(last_v, t_box);
+    out.late_a = late(last_a, out.tight ? t_box : t_rest);
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("ceilings lowered under a moving chase converge at the jerk-limited rate and report the excess (kin-h1ii)") {
+    // 4/60/2000, there and back from 0.1, 80 samples 10 ms apart at 16.7 ms
+    // latency; at sample 20 (2.5 window/s) the ceilings drop to 0.2/2. The
+    // trap: an open re-plan's undo kept the chase planned under the old set
+    // and restored the anomaly ring, 88 ms over 0.2 window/s, unreported.
+    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+    const Limits low{0.2f, 2.0f, 2000.0f};
+    Engine<> e(cfg, 0.1f);
+    const uint64_t drop = 200 * kMs, t0 = drop + cfg.react_us + kMs;
+    std::vector<State> s;
+    std::vector<Anomaly> an;
+    uint64_t first_over = 0, last_over = 0, first_report = 0;
+    State from{};
+    for (int i = 0; i < 80; ++i) {
+        const uint64_t t = uint64_t(i) * 10 * kMs;
+        if (t == drop) e.setLimits(low);
+        REQUIRE(e.submit(knotFromSample(0.1f + 0.4f * (1.0f - std::cos(3.14159f * float(i) / 40.0f)), t, 16667), t));
+        for (uint64_t q = t; q < t + 10 * kMs; q += kMs) {
+            s.push_back(e.stateAt(0, q));
+            for (const Anomaly& x : drain(e)) if (q >= drop) { an.push_back(x); if (!first_report) first_report = q; }
+            if (q == t0) from = s.back();
+            if (q > drop && (std::fabs(s.back().v) > low.vmax * 1.001f || std::fabs(s.back().a) > low.amax * 1.001f)) {
+                if (!first_over) first_over = q;
+                last_over = q;
+            }
+        }
+    }
+    for (uint64_t q = 800 * kMs; q < 4000 * kMs; q += kMs) s.push_back(e.stateAt(0, q));
+    const float bound = changeTime(from.v, from.a, low.vmax, cfg.limits.amax, low.jmax);
+    MESSAGE("from v ", from.v, " a ", from.a, ": over until ", last_over / kMs, " ms, bound ", (float(t0) + bound * 1e6f) / 1e3f, " ms");
+    REQUIRE(first_over > 0);
+    // Reported by the first sample over the new ceilings, never undone.
+    CHECK(first_report > 0);
+    CHECK(first_report <= first_over);
+    float worst = 0.0f;
+    CHECK(countKind(an, AnomalyKind::PieceOverCeiling, &worst) >= 1);
+    CHECK(worst > 1.0f);
+    CHECK(countKind(an, AnomalyKind::KnotTrimmed) == 0);
+    CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);
+    // Back inside both as fast as jmax allows from the horizon, decelerating
+    // at most at the amax the motion was planned under.
+    CHECK(float(last_over) <= float(t0) + bound * 1e6f + float(kMs));
+    const std::vector<State> rest(s.begin() + long(last_over / kMs) + 1, s.end());
+    const Peaks after = peaksOf(rest), all = peaksOf(s);
+    CHECK(after.v <= low.vmax * 1.001f);
+    CHECK(after.a <= low.amax * 1.001f);
+    CHECK(all.a <= cfg.limits.amax * 1.001f);
+    CHECK(all.j <= cfg.limits.jmax * 1.001f);
+    CHECK(all.lo >= 0.1f - 1e-3f);
+    CHECK(all.hi <= 1.0f + 1e-3f);
+    CHECK(worstJump(s) <= 0.0f);
+    CHECK(s.back().p == doctest::Approx(0.1f + 0.4f * (1.0f - std::cos(3.14159f * 79.0f / 40.0f))).epsilon(1e-4));
+    CHECK(s.back().v == 0.0f);
+}
+
+TEST_CASE("property: ceilings lowered under a moving chase converge at the jerk-limited rate, every sample over them reported (kin-h1ii)") {
+    // 4000 streams (2 to 20 ms apart, 1 to 4 periods of latency) under random
+    // ceilings, lowered at one submit: vmax to 5..100 percent, amax to 1..100,
+    // jmax to 30..100 in a third. About 1 s on the host.
+    int runs = 0, with_over = 0, tight = 0, silent = 0, late_v = 0, late_a = 0, refused = 0, unlanded = 0, a_out = 0, j_out = 0, window = 0;
+    float closest = -1e9f;
+    for (uint32_t seed = 1; seed <= 4000; ++seed) {
+        const Lowered r = loweredRun(seed);
+        ++runs;
+        with_over += r.over > 0;
+        tight += r.tight;
+        silent += r.silent > 0;
+        late_v += r.late_v > 0.0f;
+        late_a += r.late_a > 0.0f;
+        refused += r.refused > 0;
+        unlanded += !r.landed;
+        a_out += r.a_out > 1.001f;
+        j_out += r.j_out > 1.01f;
+        window += r.lo < -1e-3f || r.hi > 1.0f + 1e-3f;
+        closest = std::fmax(closest, std::fmax(r.late_v, r.late_a));
+        if (r.silent || r.late_v > 0.0f || r.late_a > 0.0f || r.refused || !r.landed || r.a_out > 1.001f || r.j_out > 1.01f)
+            MESSAGE("seed " << seed << ": silent " << r.silent << " late v " << r.late_v << " a " << r.late_a << " ms, refused " << r.refused
+                    << " landed " << r.landed << " a/cap " << r.a_out << " j/cap " << r.j_out);
+    }
+    MESSAGE(runs << " runs, " << with_over << " over the new ceilings after the drop, " << tight << " with the stop inside the window; closest to the bound "
+            << closest << " ms; silent " << silent << ", late v " << late_v << " a " << late_a << ", refused " << refused << ", unlanded " << unlanded);
+    // Not vacuous: most drops leave the motion over the new ceilings.
+    CHECK(with_over > runs / 2);
+    // Every sample over the new ceilings is reported by the time it renders.
+    CHECK(silent == 0);
+    // Inside the new speed ceiling as fast as jmax allows from one tick past
+    // the horizon (plus the 1 ms grid); inside amax and jmax as fast too, or,
+    // when the new set's stop from there leaves the window, no later than the
+    // stop at the amax the motion was planned under.
+    CHECK(late_v == 0);
+    CHECK(late_a == 0);
+    // Never harder than the set the motion was planned under, never out of
+    // the window, never a refusal; the chase lands on its last sample.
+    CHECK(a_out == 0);
+    CHECK(j_out == 0);
+    CHECK(window == 0);
+    CHECK(refused == 0);
+    CHECK(unlanded == 0);
 }
 
 TEST_CASE("a stream paused mid-chase, then a jog during the brake: both are profiles, under their ceilings, unreported") {

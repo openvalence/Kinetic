@@ -81,7 +81,11 @@ public:
 
     const Config& config() const { return _cfg; }
     // The next solve (at the next submit or flush) renders the whole window
-    // under it; the curve in flight is not re-solved.
+    // under it; the curve in flight is not re-solved. Ceilings lowered under
+    // a moving chase: the re-plan converges to them at jmax, decelerating at
+    // most at the amax the motion was planned under (solver.hpp chaseRun),
+    // and what renders over them, the curve committed through the horizon
+    // included, is reported PieceOverCeiling.
     void setConfig(const Config& c) { _cfg = c; }
     void setLimits(const Limits& l) { Config c = _cfg; c.limits = l; setConfig(c); }
 
@@ -402,6 +406,12 @@ private:
         bool     replan_open = false;
         Piece    replan_piece{};
         Solved   replan_k0{};
+        // The ceilings of the last solve, and those of the last one whose
+        // first knot did not converge (chaseRun): a convergence from motion
+        // the ceilings were lowered under decelerates at most at their amax,
+        // and takes their jerk only when none at jmax stays in the window.
+        Limits   lim{};
+        Limits   plan{};
         // expect(): more is expected until expect_us. dirty_us: when the
         // window last changed (a solve reads the expectation as of then).
         uint64_t expect_us = 0;
@@ -426,6 +436,8 @@ private:
         a.has_committed = false;
         a.rep_n = 0;
         a.replan_open = false;
+        a.lim = _cfg.limits;
+        a.plan = _cfg.limits;
         a.expect_us = 0;
         a.dirty_us = now_us;
     }
@@ -463,23 +475,73 @@ private:
         };
         const bool undoable = a.replan_open && n > 1;
         a.replan_open = false;
+        const Limits& L = _cfg.limits;
+        const bool changed = a.lim.vmax != L.vmax || a.lim.amax != L.amax || a.lim.jmax != L.jmax;
+        a.lim = L;
+        const float held = changed && a.has_committed && !a.explicit_brake ? committedOver(a) : 0.0f;
         if (undoable) keepReports(a);
-        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.expect_us > a.dirty_us ? a.expect_us : 0);
+        const Limits cap{L.vmax, std::fmax(L.amax, a.plan.amax), std::fmax(L.jmax, a.plan.jmax)};
+        solveWindow(a.origin, a.origin_us, tmp, n, _cfg, a.sol, report, a.ws, a.expect_us > a.dirty_us ? a.expect_us : 0,
+                    &cap);
+        if (!(n && a.sol[0].hard && a.sol[0].infeasible)) a.plan = L;
         a.n_sol = n;
         a.solved_valid = true;
         a.piece_valid = false;
-        if (undoable && a.sol[0].infeasible) {
+        // A chase re-plan over a ceiling is a convergence (chaseRun), never
+        // undone: undone, the motion stayed over a lowered vmax and amax for
+        // 90 ms, its reports erased (kin-h1ii). Under ceilings changed since
+        // it was planned, any other piece kept over them is reported.
+        const bool undo = undoable && a.sol[0].infeasible && !a.sol[0].hard;
+        const float kept = undo && changed ? overNow(a.replan_piece, a.origin) : 0.0f;
+        if (undo) {
             // The successor came too late to re-solve its predecessor inside
             // the ceilings: the piece in flight is kept through that knot.
             restoreReports(a);
             const Solved& k0 = a.replan_k0;
+            if (kept > 1.0f + handles::kTol) record(AnomalyKind::PieceOverCeiling, k0.t_us, k0.knot_p, kept);
             a.committed = a.replan_piece;
             a.has_committed = true;
             boundary(a, State{k0.p, k0.v, k0.a}, k0.t_us);
             a.tl.popFront();
             a.solved_valid = false;
             ensureSolved(a);
+        } else if (held > 1.0f + handles::kTol && !(n && a.sol[0].infeasible)) {
+            record(AnomalyKind::PieceOverCeiling, a.committed.end_us, a.origin.p, held);
         }
+    }
+
+    // The ceilings changed since the last solve: the curve committed through
+    // the horizon was planned under the old ones and never moves. Its worst
+    // ratio over the new ones from the change on (the submit that asked this
+    // solve) to its end, at the 1 ms grid and that end, its jerk over each
+    // step: reported when the solve's first piece, which starts where it
+    // ends, reports nothing. An explicit brake is the stop ordered under its
+    // own set (SettleEngaged), never judged.
+    float committedOver(const Axis& a) const {
+        const Limits& L = _cfg.limits;
+        const uint64_t end = a.committed.end_us;
+        if (end <= a.dirty_us) return 0.0f;
+        uint64_t tp = a.dirty_us;
+        float w = 0.0f, ap = a.committed.at(tp).a;
+        for (uint64_t t = a.dirty_us;; t += 1000) {
+            const uint64_t u = t < end ? t : end;
+            const State x = a.committed.at(u);
+            w = std::fmax(w, std::fmax(std::fabs(x.v) / L.vmax, std::fabs(x.a) / L.amax));
+            if (u >= tp + 10) {
+                w = std::fmax(w, std::fabs(x.a - ap) / (float(u - tp) * 1e-6f * L.jmax));
+                tp = u; ap = x.a;
+            }
+            if (u == end) return w;
+        }
+    }
+
+    // A piece's worst ratio under the current ceilings and window (from origin o).
+    float overNow(const Piece& pc, const State& o) const {
+        handles::Cfg c;
+        c.lim = _cfg.limits;
+        c.lo = std::fmin(0.0f, o.p);
+        c.hi = std::fmax(1.0f, o.p);
+        return overAll(pc, c);
     }
 
     void keepReports(const Axis& a) {
