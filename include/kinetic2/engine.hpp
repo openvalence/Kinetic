@@ -148,7 +148,9 @@ public:
     // successor (SPEC 9.6) and a knot submitted after t_us chains from it; a
     // t_us within a tick of the horizon or before it drops the whole pending
     // window and the hand-off is the horizon. Never an anomaly: a flush is the
-    // sender's intent. Returns the knots dropped; 0 changed nothing. A HARD
+    // sender's intent. Returns the knots it took off the window: those dropped
+    // and one the horizon committed through first (newest() then reads it as
+    // reached, kin-g1f); 0 changed nothing. A HARD
     // knot counts at its solved time when that is later (a live jog landing
     // at its profile's end); a corner's later solved time is its ramp's end
     // and never counts. A live jog authored
@@ -157,7 +159,7 @@ public:
     size_t truncateAfter(size_t axis, uint64_t t_us, uint64_t now_us) {
         Axis& a = _ax[axis];
         if (a.tl.empty() || (a.tl.newest().t_us <= t_us && !a.tl.newest().sample)) return 0;
-        commitHorizon(axis, now_us);
+        const size_t took = commitHorizon(axis, now_us) ? 1 : 0;
         // The hand-off needs the plan at t_us: sol is aligned with tl after it.
         ensureSolved(a);
         const size_t n = a.tl.size();
@@ -165,11 +167,11 @@ public:
             const Knot& k = a.tl.at(i);
             return a.sol[i].hard && a.sol[i].t_us > k.t_us ? a.sol[i].t_us : k.t_us;
         };
-        if (n == 0 || due(n - 1) <= t_us) return 0;
+        if (n == 0 || due(n - 1) <= t_us) return took;
         const bool past_horizon = t_us > a.origin_us + 1000;
         size_t keep = 0;
         if (past_horizon) while (keep < n && due(keep) <= t_us) ++keep;
-        if (keep == n) return 0;
+        if (keep == n) return took;
         const bool handoff = past_horizon && (keep == 0 || a.sol[keep - 1].t_us < t_us);
         const State hs = handoff ? planAt(a, t_us) : State{};
         a.tl.truncate(keep);
@@ -188,7 +190,7 @@ public:
         a.solved_valid = false;
         a.piece_valid = false;
         a.dirty_us = now_us;
-        return n - keep;
+        return took + n - keep;
     }
     size_t truncateAfter(uint64_t t_us, uint64_t now_us) { return truncateAfter(0, t_us, now_us); }
 
@@ -544,9 +546,10 @@ private:
     // the segment's authored start (seg_us), for a frame move: re-planned at
     // every write of a drag, the origin creeps toward the knot and its half
     // with it, until a write inside the knot's last ticks re-plans it.
-    void commitHorizon(size_t axis, uint64_t now_us, bool successor = false, bool whole = false) {
+    // True when it committed through a knot (one left the window).
+    bool commitHorizon(size_t axis, uint64_t now_us, bool successor = false, bool whole = false) {
         Axis& a = _ax[axis];
-        if (a.tl.empty() || now_us <= a.origin_us || a.has_committed) return;
+        if (a.tl.empty() || now_us <= a.origin_us || a.has_committed) return false;
         (void)stateAt(axis, now_us);   // retires what is due, builds the piece
         if (!a.tl.empty()) {
             const uint64_t tr = now_us + _cfg.react_us;
@@ -579,6 +582,8 @@ private:
                 a.tl.popFront();
                 for (size_t i = 0; i + 1 < cnt; ++i) a.sol[i] = a.sol[i + 1];
                 if (a.n_sol) --a.n_sol;
+                a.has_committed = true;
+                return true;
             } else {
                 // Commit the curve up to the horizon and re-plan from there.
                 if (successor && a.tl.size() == 1 && !a.tl.at(0).has_v) {
@@ -600,6 +605,7 @@ private:
             // end (a 29 mm step on the playground's starved stream).
             replanFromBrake(a, now_us);
         }
+        return false;
     }
 
     bool refuse(const Knot& k, uint64_t now_us, float detail) {

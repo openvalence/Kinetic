@@ -1358,6 +1358,25 @@ TEST_CASE("truncateAfter: a flush at now drops the whole window and hands off at
     CHECK(idle.pending() == 5);
 }
 
+TEST_CASE("truncateAfter counts a knot its horizon commit took: a window it empties never reads as unchanged (kin-g1f)") {
+    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+    Engine<> e(cfg, 0.2f);
+    queueRamp(e);
+    (void)sweep(e, 0, 247 * kMs);
+    REQUIRE(e.pending() == 1);
+    const Solved last = e.solved(0, 0);
+    // The last knot is inside the reaction horizon: the flush commits through
+    // it and drops nothing, and the caller re-reads newest() on a count.
+    CHECK(e.truncateAfter(247 * kMs, 247 * kMs) == 1);
+    CHECK(e.pending() == 0);
+    CHECK(e.newest().t_us == last.t_us);
+    CHECK(e.newest().p == last.p);
+    // A knot the caller times at or before the origin is reached one tick
+    // after it (the solver's span floor), never before.
+    REQUIRE(e.submit(knotFromSegment(0.25f, 1 * kMs, false, 0.0f, 247 * kMs), 247 * kMs));
+    CHECK(e.solved(0, 0).t_us >= last.t_us + kMinSpanUs);
+}
+
 // Nucleus val-17u: a travel-window change mid-stream. The frame moved, so the
 // curve in flight is restated in it; the knots are window shares and stay.
 TEST_CASE("reframe: the pending knots stay and re-solve from the restated curve, continuous, inside the ceilings") {
