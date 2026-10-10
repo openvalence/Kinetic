@@ -838,7 +838,7 @@ TEST_CASE("oscillator over planned strokes: the executed sum keeps every ceiling
         const auto plan = planOf(e, 2800);
         const Peaks own = fdPeaks(std::vector<float>(plan.begin() + 2, plan.begin() + 2400));
         for (const OscShape sh : {OscShape::Sine, OscShape::Square, OscShape::Saw, OscShape::SawReverse}) {
-            for (const float f : {2.0f, 5.0f, 10.0f, 20.0f}) {
+            for (const float f : {2.0f, 5.0f, 10.0f, 20.0f, 50.0f, 100.0f}) {
                 CAPTURE(stroke); CAPTURE(int(sh)); CAPTURE(f);
                 Osc o; o.set(oscAt(f, 0.03f, sh));
                 const auto r = oscRun(o, kHubSet, plan, 2400);
@@ -976,6 +976,160 @@ TEST_CASE("oscillator: the strip predicts the head it later renders, and a run i
     // Equal to float rounding: the smoothing's running sums start at another
     // sample each tick.
     for (size_t k = 0; k < 128; ++k) CHECK(std::fabs(a[500 - Osc::kPlanEdge + k] - ahead[k]) <= 1e-6f);
+}
+
+// ---- the oscillator driven (kin-kzq4; SPEC 9.7 drives, the osc.drive stream) --
+
+namespace {
+constexpr uint64_t kLead = Osc::driveLeadUs(1000);
+OscParams driven() { OscParams p; p.enabled = true; p.driven = true; return p; }
+struct Ask { float hz, amp; };
+// The osc.drive stream: a sample every `every` ms stamped on its own time, none
+// in [until, again) ms, each arriving `lead_us` before its stamp; one render a
+// tick. The strip of tick `at` lands in *ahead.
+template <class Drive>
+OscRun driveRun(Osc& o, const Limits& L, const std::vector<float>& plan, size_t ticks, Drive ask, uint64_t every,
+                uint64_t lead_us, uint64_t until = UINT64_MAX, uint64_t again = UINT64_MAX, size_t at = SIZE_MAX,
+                std::vector<float>* ahead = nullptr) {
+    OscRun r;
+    std::array<float, 128> out{};
+    uint64_t next = 0;
+    for (size_t i = Osc::kPlanEdge; i < ticks; ++i) {
+        for (; next <= i * kMs + lead_us; next += every * kMs) {
+            if (next >= until * kMs && next < again * kMs) continue;
+            const Ask a = ask(next);
+            REQUIRE(o.drive(next, a.hz, a.amp));
+        }
+        o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], 128, L, 0.0f, 1.0f, false, out.data());
+        r.sum.push_back(plan[i] + out[0]);
+        r.osc.push_back(out[0]);
+        r.eff.push_back(o.amplitudeEffective());
+        if (i == at && ahead) ahead->assign(out.begin(), out.end());
+    }
+    return r;
+}
+}  // namespace
+
+TEST_CASE("oscillator driven: a 5 -> 100 -> 5 Hz sweep and 5 <-> 100 Hz jumps keep every ceiling and the window, the phase never jumping") {
+    // The sweep: 5 Hz to 0.25 s, up to 100 Hz by 2.25 s, held to 2.75 s, down to 5 Hz by 4.75 s.
+    // The jumps (a funscript V9 in one sample): 5 and 100 Hz in turns of 0.6 s. 0.02 throughout.
+    auto sweep = [](uint64_t t_us) {
+        const float t = float(t_us) * 1e-6f;
+        const float up = std::clamp((t - 0.25f) / 2.0f, 0.0f, 1.0f), down = std::clamp((t - 2.75f) / 2.0f, 0.0f, 1.0f);
+        return Ask{5.0f + 95.0f * (up - down), 0.02f};
+    };
+    auto jumps = [](uint64_t t_us) { return Ask{(t_us / 600000) % 2 ? 100.0f : 5.0f, 0.02f}; };
+    constexpr size_t kE = Osc::kPlanEdge, kTicks = 5800;
+    Config cfg; cfg.limits = kHubSet;
+    std::vector<std::vector<float>> plans{restPlan(0.5f, 6100)};
+    for (const uint64_t stroke : {400, 800}) {
+        Engine<> e(cfg, 0.1f);
+        int k = 0;
+        for (uint64_t t = stroke * kMs; t <= 5600 * kMs; t += stroke * kMs, ++k) REQUIRE(e.submit(knotAt(t, k % 2 ? 0.1f : 0.9f), 0));
+        plans.push_back(planOf(e, 6100));
+    }
+    for (size_t pi = 0; pi < plans.size(); ++pi) {
+        const Peaks own = fdPeaks(std::vector<float>(plans[pi].begin() + 2, plans[pi].begin() + kTicks));
+        for (const bool jump : {false, true}) {
+            for (const uint64_t lead : {kLead, uint64_t(0)}) {
+                for (const uint64_t every : {8, 50}) {
+                    CAPTURE(pi); CAPTURE(jump); CAPTURE(lead); CAPTURE(every);
+                    Osc o; o.set(driven());
+                    const bool strip = pi == 0 && !jump && lead == kLead && every == 8;
+                    std::vector<float> ahead;
+                    auto ask = [&](uint64_t t_us) { return jump ? jumps(t_us) : sweep(t_us); };
+                    const auto r = driveRun(o, kHubSet, plans[pi], kTicks, ask, every, lead, UINT64_MAX, UINT64_MAX,
+                                            strip ? 4000 : SIZE_MAX, &ahead);
+                    // Continuous position, velocity and acceleration: every ceiling on the executed sum.
+                    const Peaks pk = fdPeaks(r.sum);
+                    CHECK(pk.v <= std::max(kHubSet.vmax, own.v) + kFdV);
+                    CHECK(pk.a <= std::max(kHubSet.amax, own.a) + kFdA);
+                    CHECK(pk.j <= std::max(kHubSet.jmax, own.j) + kFdJ);
+                    CHECK(pk.lo >= 0.0f); CHECK(pk.hi <= 1.0f);
+                    if (pi != 0 || jump) continue;
+                    // At rest: all of 0.02 at 5 Hz, the ceilings' share at 100 Hz (0.95 of the jerk
+                    // ceiling over 100 Hz and its fade, 1.4e-4), and the period follows the drive.
+                    CHECK(r.eff[240 - kE] == doctest::Approx(0.02f).epsilon(1e-3));
+                    CHECK(r.eff[2650 - kE] == doctest::Approx(1.42e-4f).epsilon(0.02));
+                    CHECK(r.eff.back() == doctest::Approx(0.02f).epsilon(1e-3));
+                    for (const size_t d : periodsOf(std::vector<float>(r.osc.begin() + 2560, r.osc.begin() + 2750), 0))
+                        CHECK(d == doctest::Approx(10).epsilon(0.11));
+                    for (const size_t d : periodsOf(std::vector<float>(r.osc.begin() + 5100, r.osc.end()), 0))
+                        CHECK(d == doctest::Approx(200).epsilon(0.01));
+                    if (!strip) continue;
+                    // The strip on the way down predicts the heads it later renders: the drive
+                    // lands past the strip and, falling, only raises the budget past the lead.
+                    REQUIRE(ahead.size() == 128);
+                    for (size_t k = 0; k < 128; ++k) CHECK(std::fabs(r.osc[4000 - kE + k] - ahead[k]) <= 1e-6f);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("oscillator driven: an amplitude step slews over one fade; a step down lands by its stamp") {
+    const Limits L{5.0f, 300.0f, 300000.0f};
+    auto steps = [](uint64_t t_us) { return Ask{12.0f, t_us >= 1000 * kMs && t_us < 2000 * kMs ? 0.02f : 0.004f}; };
+    Osc o; o.set(driven());
+    const auto r = driveRun(o, L, restPlan(0.5f, 3000), 2700, steps, 20, kLead);
+    auto eff = [&](size_t tick) { return r.eff[tick - Osc::kPlanEdge]; };
+    CHECK(eff(999) == doctest::Approx(0.004f).epsilon(1e-3));
+    CHECK(eff(1075) > 0.006f);
+    CHECK(eff(1075) < 0.018f);
+    CHECK(eff(1150) == doctest::Approx(0.02f).epsilon(1e-3));
+    CHECK(eff(1849) == doctest::Approx(0.02f).epsilon(1e-3));
+    CHECK(eff(2000) == doctest::Approx(0.004f).epsilon(1e-3));
+    // No jump: no step steeper than the envelope's B-spline over the 0.016 step (0.75 / 50 a tick).
+    float step = 0.0f;
+    for (size_t i = 1; i < r.eff.size(); ++i) step = std::max(step, std::fabs(r.eff[i] - r.eff[i - 1]));
+    CHECK(step <= 0.016f * 0.75f / 50.0f * 1.01f);
+    const Peaks pk = fdPeaks(r.sum);
+    CHECK(pk.v <= L.vmax); CHECK(pk.a <= L.amax); CHECK(pk.j <= L.jmax);
+}
+
+TEST_CASE("oscillator driven: input loss fades it to rest; the drive back fades in from the trough") {
+    const Limits L{5.0f, 300.0f, 300000.0f};
+    auto ask = [](uint64_t) { return Ask{15.0f, 0.02f}; };
+    Osc o; o.set(driven());
+    // A sample every 20 ms to 1 s (the last at 980 ms), again from 2.5 s.
+    const auto r = driveRun(o, L, restPlan(0.5f, 3400), 3100, ask, 20, kLead, 1000, 2500);
+    constexpr size_t kE = Osc::kPlanEdge;
+    const size_t quiet = 980 + size_t(Osc::kDriveQuietUs / kMs);   // nothing asked past it
+    CHECK(r.eff[1300 - kE] == doctest::Approx(0.02f).epsilon(1e-3));
+    CHECK(r.eff[quiet - 75 - kE] > 0.0f);
+    CHECK(r.eff[quiet - 75 - kE] < 0.02f);
+    for (size_t i = quiet; i < 2300; ++i) { CHECK(r.osc[i - kE] == 0.0f); CHECK(r.eff[i - kE] == 0.0f); }
+    size_t first = 2300 - kE;
+    while (first < r.osc.size() && std::fabs(r.osc[first]) <= 1e-6f) ++first;
+    REQUIRE(first < r.osc.size());
+    CHECK(first + kE >= 2500);
+    CHECK(first + kE <= 2510);
+    CHECK(r.osc[first] < 0.0f);
+    CHECK(r.eff.back() == doctest::Approx(0.02f).epsilon(1e-3));
+    const Peaks pk = fdPeaks(r.sum);
+    CHECK(pk.v <= L.vmax); CHECK(pk.a <= L.amax); CHECK(pk.j <= L.jmax);
+}
+
+TEST_CASE("oscillator driven: fixed to driven goes through rest") {
+    const Limits L{5.0f, 300.0f, 300000.0f};
+    const auto plan = restPlan(0.5f, 1800);
+    Osc o; o.set(oscAt(10.0f, 0.02f));
+    std::array<float, 128> out{};
+    std::vector<float> osc, eff, sum;
+    constexpr size_t kE = Osc::kPlanEdge;
+    for (size_t i = kE; i < 1600; ++i) {
+        if (i == 500) o.set(driven());
+        if (i >= 500 && i % 20 == 0) REQUIRE(o.drive(i * kMs + kLead, 20.0f, 0.005f));
+        o.render(i * kMs, 1000, &plan[i - kE], 128, L, 0.0f, 1.0f, false, out.data());
+        osc.push_back(out[0]); eff.push_back(o.amplitudeEffective()); sum.push_back(plan[i] + out[0]);
+    }
+    size_t rest = 500 - kE;
+    while (rest < eff.size() && eff[rest] != 0.0f) ++rest;
+    CHECK(rest + kE < 500 + 160);   // one fade
+    CHECK(eff.back() == doctest::Approx(0.005f).epsilon(1e-3));
+    for (const size_t d : periodsOf(osc, 1000)) CHECK(d == doctest::Approx(50).epsilon(0.03));
+    const Peaks pk = fdPeaks(sum);
+    CHECK(pk.v <= L.vmax); CHECK(pk.a <= L.amax); CHECK(pk.j <= L.jmax);
 }
 
 // ---- continuity under submits in flight (the arbiter's measured 67 mm jump) ----

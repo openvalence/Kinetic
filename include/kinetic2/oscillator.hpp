@@ -11,15 +11,31 @@
 //   fade, planned jerk included) smoothed by a quadratic B-spline one fade
 //   long, and the budget factors (kappa) pay for the smoothing: the
 //   oscillation is shed before the planned motion that needs the headroom
-//   arrives. Proven while the plan inside the look-ahead does not change; a
-//   plan changed with less notice than a fade (a PAUSE brake, a knot landing
-//   inside the look-ahead) can exceed a ceiling until the fade ends.
+//   arrives. Proven while the plan and the drive inside the look-ahead do not
+//   change; a plan changed with less notice than a fade (a PAUSE brake, a knot
+//   landing inside the look-ahead) can exceed a ceiling until the fade ends.
 // - The window bounds the amplitude and never cuts the waveform: every shape
 //   is normalized to a peak of exactly 1.
-// - Frequency, shape and dwells change only at rest: a change fades the
-//   oscillation out, latches, and fades it in from the trough. Amplitude
-//   changes ride the envelope.
-// - Fixed storage, no allocation: the caller hosts the object (a few KB).
+// - Fixed (the default): frequency, shape and dwells change only at rest: a
+//   change fades the oscillation out, latches, and fades it in from the
+//   trough. Amplitude changes ride the envelope.
+// - Driven (OscParams::driven; SPEC 9.7 drives, the osc.drive stream): a plain
+//   sine whose frequency and amplitude follow drive() while it runs. The
+//   frequency is the drive's steps through the envelope's three boxes,
+//   integrated into the phase, never jumped, its slew paid for in the budget;
+//   the amplitude rides the envelope. A point lands no nearer than
+//   driveLeadUs() past the head, so the look-ahead never changes under the
+//   budget. Nothing is asked from kDriveQuietUs past the last point: it fades
+//   to rest. Fixed to driven and back goes through rest.
+// - Fixed storage, no allocation: the caller hosts the object (about 7 KB).
+//
+// The hub, driven (val-o9r): set() with enabled and driven. Per osc.drive
+// sample, drive(t_base + t_off, hz, amplitude), each parameter mapped through
+// its bounds (SPEC 8.11), a fixed one passing its field's value. The speed and
+// position drives: drive(t0 + driveLeadUs(step), ...) from the plan at that
+// instant, every few ticks (kDriveMax). render() per tick as when fixed.
+// driveLeadUs() is the osc-drive grant's schedule_latency_us (SPEC 5.4): a
+// player that leads by it lands on its stamps.
 #pragma once
 
 #include <algorithm>
@@ -42,6 +58,7 @@ struct OscParams {
     OscShape shape        = OscShape::Sine;
     float    dwell_crest  = 0.0f;   // share of the moving cycle held at the crest
     float    dwell_trough = 0.0f;   // share of the moving cycle held at the trough
+    bool     driven       = false;  // frequency and amplitude from drive(), a plain sine: the four above unused
 };
 
 // MaxOut: the most samples one render() returns. MaxFade: the longest fade,
@@ -65,9 +82,21 @@ public:
         return std::min<size_t>(MaxFade / 3, kFadeMaxUs / 3 / step_us) * 3;
     }
 
+    // Driven: a point lands no nearer than this past the head (the fade and
+    // the stencils it reads), with one render() per step.
+    static constexpr uint32_t driveLeadUs(uint32_t step_us) {
+        return uint32_t(3 * driveBox(step_us) + 2 * kPlanEdge) * step_us;
+    }
+    // Driven: nothing is asked this long past the last point (SPEC
+    // stream_quiet_release_ms).
+    static constexpr uint64_t kDriveQuietUs = 500000;
+    // Driven: the points held, from the one the smoothing reaches behind the
+    // head to the last stamp ahead: about 120 Hz under the 250 ms lead cap.
+    static constexpr size_t kDriveMax = 64;
+
     const OscParams& params() const { return _want; }
     // Takes effect at the next render(): amplitude through the envelope,
-    // frequency, shape and dwells through a fade to rest.
+    // frequency, shape, dwells and driven through a fade to rest.
     void set(const OscParams& p) {
         _want = p;
         if (!(_want.frequency > 0.0f)) _want.frequency = 0.0f;
@@ -75,11 +104,23 @@ public:
         if (!(_want.dwell_crest > 0.0f)) _want.dwell_crest = 0.0f;
         if (!(_want.dwell_trough > 0.0f)) _want.dwell_trough = 0.0f;
     }
+    // Driven: from t_us on the drive asks hz and amplitude (window units,
+    // peak). A point nearer than driveLeadUs() past the head lands there, and
+    // replaces every point at or after its time. False when kDriveMax points
+    // are held: the point is dropped.
+    bool drive(uint64_t t_us, float hz, float amplitude) {
+        if (_seeded) t_us = std::max<uint64_t>(t_us, _head_us + driveLeadUs(_step_us));
+        while (_drv_n > 0 && _drv[_drv_n - 1].t_us >= t_us) --_drv_n;
+        if (_drv_n == kDriveMax) return false;
+        _drv[_drv_n++] = DrivePoint{t_us, hz > 0.0f ? hz : 0.0f, amplitude > 0.0f ? amplitude : 0.0f};
+        return true;
+    }
     // Stops at once, phase at the trough: for a caller that stopped the motion
-    // itself (an e-stop, a reset of the plan). Parameters untouched.
+    // itself (an e-stop, a reset of the plan). Parameters and drive untouched.
     void reset() {
         _hist.fill(0.0f);
         _n_pred = 0;
+        _n_dph = 0;
         _phase = 0.0f;
         _eff = 0.0f;
         _shaped = false;
@@ -105,25 +146,36 @@ public:
     // plan[j] = the planned position at t0 + (j - kPlanEdge) * step_us. L: the ceilings
     // the sum keeps; lo, hi: the window. hold: shed it (PAUSE): it fades out,
     // and its phase restarts at the trough once it has. t0 advances by whole
-    // steps between calls; the same t0 with the same plan renders the same.
+    // steps between calls; the same t0 with the same plan and drive renders
+    // the same.
     void render(uint64_t t0_us, uint32_t step_us, const float* plan, size_t n, const Limits& L, float lo,
                 float hi, bool hold, float* out) {
         n = std::min(n, MaxOut);
         const float dt = float(step_us) * 1e-6f;
         // Advance the head: the targets the last call predicted are history
-        // now, one per whole step; the phase by the exact time elapsed.
+        // now, one per whole step; the phase by the exact time elapsed, or
+        // driven, by the phase steps the last call rendered.
         if (_seeded && t0_us > _head_us) {
             const uint64_t k = (t0_us - _head_us + step_us / 2) / step_us;
             for (uint64_t i = 0; i < k && i < MaxFade; ++i) push(i < _n_pred ? _pred[size_t(i)] : 0.0f);
-            if (_latched && _on.frequency > 0.0f) {
+            if (_latched && _on.driven) {
+                if (_n_dph > 0) {
+                    const size_t m = size_t(std::min<uint64_t>(k, _n_dph));
+                    for (size_t i = 0; i < m; ++i) _phase = frac(_phase + _dph[i]);
+                    const double rest = double(k - m) * double(_dph[_n_dph - 1]);
+                    _phase = frac(_phase + float(rest - std::floor(rest)));
+                }
+            } else if (_latched && _on.frequency > 0.0f) {
                 const double adv = double(t0_us - _head_us) * 1e-6 * double(_on.frequency) / double(periodShare());
                 _phase = frac(_phase + float(adv - std::floor(adv)));
             }
         }
         _seeded = true;
         _head_us = t0_us;
+        _step_us = step_us;
+        prune(t0_us, step_us);
 
-        const bool zero = hold || !_want.enabled || !(_want.frequency > 0.0f);
+        const bool zero = hold || !_want.enabled || (!_want.driven && !(_want.frequency > 0.0f));
         if (quiet()) {
             // At rest: a new frequency, shape or dwell latches, and a shed
             // oscillation starts its next period at the trough.
@@ -136,10 +188,28 @@ public:
             if (zero) _phase = 0.0f;
         }
         const bool fading = zero || !sameShape(_on, _want);
+        const bool drv = _on.driven;
 
-        const size_t h = boxSteps(step_us);
+        const size_t h = drv ? driveBox(step_us) : boxSteps(step_us);
         const size_t ln = 3 * h;   // the look-ahead: one fade
         const size_t past = 3 * h - 3;
+        // Driven: fq[j] = the frequency at t0 + j * step for j in [-G, n + ln +
+        // kPlanEdge), the drive's steps through the envelope's three boxes, and
+        // _b[j] = the amplitude asked, j in [0, n + ln).
+        const size_t G = ln + kPlanEdge;
+        const float* fq = _fq.data() + G;
+        if (drv) {
+            const size_t m = G + n + ln + kPlanEdge;
+            stairs(t0_us, step_us, G, m, n + ln, 0.25f / dt);
+            if (h > 1) {
+                box(_fq.data(), m, h, h - 1);
+                box(_fq.data(), m, h, 2 * h - 2);
+                box(_fq.data(), m, h, 3 * h - 3);
+            }
+            // At rest with nothing asked: the next period starts at the trough.
+            if (quiet() && _b[0] == 0.0f) _phase = 0.0f;
+        }
+        const float ask = drv ? _b[0] : _want.amplitude;
         // s: the committed targets of the fade behind the head, then T, the
         // targets of the outputs, which the boxes below smooth into the
         // envelope in place.
@@ -150,29 +220,60 @@ public:
         if (fading) {
             std::fill(s + past, s + past + n, 0.0f);
         } else {
-            const float w = 2.0f * kPi * _on.frequency, dw = float(3 * h) * dt * w;
-            // The smoothing's cost per ceiling (oscillator.hpp header), and a
-            // 5 % margin for the grid.
-            const float kv = 0.95f / (1.0f + 2.25f / (dw * _pk_dv));
-            const float ka = 0.95f / (1.0f + (4.5f * _pk_dv / dw + 18.0f / (dw * dw)) / _pk_da);
-            const float kj = 0.95f / (1.0f + (6.75f * _pk_da / dw + 54.0f * _pk_dv / (dw * dw) +
-                                             108.0f / (dw * dw * dw)) / _pk_dj);
-            const float cv = kv / (_pk_dv * w), ca = ka / (_pk_da * w * w), cj = kj / (_pk_dj * w * w * w);
-            // The plan's derivatives as the grid's own differences measure
-            // them: the largest of every stencil that touches sample j.
+            // The plan's headroom under each ceiling at sample j, its
+            // derivatives as the grid's own differences measure them: the
+            // largest of every stencil that touches sample j.
             const float i1 = 1.0f / dt, i2 = 1.0f / (dt * dt), i3 = 1.0f / (dt * dt * dt);
             auto d2 = [](const float* q) { return std::fabs(q[1] - 2.0f * q[0] + q[-1]); };
             auto d3 = [](const float* q) { return std::fabs(q[0] - 3.0f * q[-1] + 3.0f * q[-2] - q[-3]); };
-            for (size_t j = 0; j < n + ln; ++j) {
+            auto room = [&](size_t j, float& hv, float& ha, float& hj) {
                 const float* p = plan + j + kPlanEdge;
                 const float v = std::fmax(std::fabs(p[1] - p[0]), std::fabs(p[0] - p[-1])) * i1;
                 const float a = std::fmax(d2(p - 1), std::fmax(d2(p), d2(p + 1))) * i2;
                 const float jk = std::fmax(std::fmax(d3(p), d3(p + 1)), std::fmax(d3(p + 2), d3(p + 3))) * i3;
-                float b = std::fmin(_want.amplitude, std::fmin(p[0] - lo, hi - p[0]));
-                b = std::fmin(b, cv * std::fmax(0.0f, L.vmax - std::fabs(v)));
-                b = std::fmin(b, ca * std::fmax(0.0f, L.amax - std::fabs(a)));
-                b = std::fmin(b, cj * std::fmax(0.0f, L.jmax - std::fabs(jk)));
-                _b[j] = std::fmax(0.0f, b);
+                hv = std::fmax(0.0f, L.vmax - std::fabs(v));
+                ha = std::fmax(0.0f, L.amax - std::fabs(a));
+                hj = std::fmax(0.0f, L.jmax - std::fabs(jk));
+            };
+            if (drv) {
+                // The sine's budget with the frequency moving: the kappa terms
+                // below with the frequency's own slew (w1, w2) added, 1 / F
+                // the fade's inverse, and the same 5 % margin.
+                const float iF = 1.0f / (float(ln) * dt), tw = 2.0f * kPi;
+                for (size_t j = 0; j < n + ln; ++j) {
+                    float hv, ha, hj;
+                    room(j, hv, ha, hj);
+                    const float* q = fq + j;
+                    const float w = tw * q[0];
+                    const float w1 = tw * std::fmax(std::fabs(q[1] - q[0]), std::fabs(q[0] - q[-1])) * i1;
+                    const float w2 = tw * std::fmax(d2(q - 1), std::fmax(d2(q), d2(q + 1))) * i2;
+                    const float p0 = plan[j + kPlanEdge];
+                    float b = std::fmin(_b[j], std::fmin(p0 - lo, hi - p0));
+                    b = std::fmin(b, 0.95f * hv / (w + 2.25f * iF));
+                    b = std::fmin(b, 0.95f * ha / (w * w + (4.5f * w + 18.0f * iF) * iF + w1));
+                    b = std::fmin(b, 0.95f * hj / (w * w * w + (6.75f * w * w + (54.0f * w + 108.0f * iF) * iF) * iF +
+                                                   (6.75f * iF + 3.0f * w) * w1 + w2));
+                    _b[j] = std::fmax(0.0f, b);
+                }
+            } else {
+                const float w = 2.0f * kPi * _on.frequency, dw = float(3 * h) * dt * w;
+                // The smoothing's cost per ceiling (oscillator.hpp header), and a
+                // 5 % margin for the grid.
+                const float kv = 0.95f / (1.0f + 2.25f / (dw * _pk_dv));
+                const float ka = 0.95f / (1.0f + (4.5f * _pk_dv / dw + 18.0f / (dw * dw)) / _pk_da);
+                const float kj = 0.95f / (1.0f + (6.75f * _pk_da / dw + 54.0f * _pk_dv / (dw * dw) +
+                                                 108.0f / (dw * dw * dw)) / _pk_dj);
+                const float cv = kv / (_pk_dv * w), ca = ka / (_pk_da * w * w), cj = kj / (_pk_dj * w * w * w);
+                for (size_t j = 0; j < n + ln; ++j) {
+                    float hv, ha, hj;
+                    room(j, hv, ha, hj);
+                    const float p0 = plan[j + kPlanEdge];
+                    float b = std::fmin(_want.amplitude, std::fmin(p0 - lo, hi - p0));
+                    b = std::fmin(b, cv * hv);
+                    b = std::fmin(b, ca * ha);
+                    b = std::fmin(b, cj * hj);
+                    _b[j] = std::fmax(0.0f, b);
+                }
             }
             // T: the least B over the fade ahead (a monotonic deque, front
             // the least, walked backward).
@@ -187,20 +288,33 @@ public:
         // The targets next call commits.
         for (size_t j = 0; j < n; ++j) _pred[j] = s[past + j];
         _n_pred = n;
-        _shaped = !fading && n > 0 && s[past] < _want.amplitude * 0.999f;
+        _shaped = !fading && n > 0 && s[past] < ask * 0.999f;
         const size_t m = past + n;
         if (h > 1 && m >= h) {
             box(s, m, h, h - 1);
             box(s, m, h, 2 * h - 2);
             box(s, m, h, 3 * h - 3);
         }
+        _eff = n > 0 ? std::fmax(0.0f, s[past]) : 0.0f;
+        if (drv) {
+            // The sine by rotation, each step at its own sample's frequency.
+            float c = std::cos(2.0f * kPi * _phase), sn = std::sin(2.0f * kPi * _phase);
+            for (size_t j = 0; j < n; ++j) {
+                const float e = std::fmax(0.0f, s[past + j]);
+                out[j] = e == 0.0f ? 0.0f : -e * c;
+                _dph[j] = fq[j] * dt;
+                turn(c, sn, 2.0f * kPi * _dph[j]);
+            }
+            _n_dph = n;
+            return;
+        }
+        _n_dph = 0;
         const float d = dphi(dt);
         // The plain sine by rotation, one cos and sin a call rather than one a
         // sample: the trig is most of a render on a core without a fast libm.
         const bool sine = _on.shape == OscShape::Sine && !dwells();
         float c = std::cos(2.0f * kPi * _phase), sn = std::sin(2.0f * kPi * _phase);
         const float cd = std::cos(2.0f * kPi * d), sd = std::sin(2.0f * kPi * d);
-        _eff = n > 0 ? std::fmax(0.0f, s[past]) : 0.0f;
         for (size_t j = 0; j < n; ++j) {
             const float e = std::fmax(0.0f, s[past + j]);
             float u = -c;
@@ -221,6 +335,7 @@ public:
 private:
     static float frac(float x) { return x - std::floor(x); }
     static bool sameShape(const OscParams& a, const OscParams& b) {
+        if (a.driven || b.driven) return a.driven == b.driven;
         return a.frequency == b.frequency && a.shape == b.shape && a.dwell_crest == b.dwell_crest &&
                a.dwell_trough == b.dwell_trough;
     }
@@ -242,6 +357,8 @@ private:
         const size_t h = size_t(std::lround(fade / (3.0f * float(step_us) * 1e-6f)));
         return std::clamp<size_t>(h, 1, lookahead(step_us) / 3);
     }
+    // Driven: one box of the fade, the longest, whatever the frequency does.
+    static constexpr size_t driveBox(uint32_t step_us) { return std::max<size_t>(1, lookahead(step_us) / 3); }
     // S[i] = the mean of S[i - h + 1 .. i] for i in [first, m), in place,
     // backward so every read is of an unwritten entry.
     static void box(float* s, size_t m, size_t h, size_t first) {
@@ -253,6 +370,45 @@ private:
             s[i] = sum * inv;
             sum -= x;
             if (i >= h) sum += s[i - h];
+        }
+    }
+    // (c, s) turned by x radians, |x| <= pi / 2: Taylor to x^13, under 1e-8.
+    static void turn(float& c, float& s, float x) {
+        const float x2 = x * x;
+        const float cx = 1.0f - x2 / 2.0f * (1.0f - x2 / 12.0f * (1.0f - x2 / 30.0f * (1.0f - x2 / 56.0f *
+                         (1.0f - x2 / 90.0f * (1.0f - x2 / 132.0f)))));
+        const float sx = x * (1.0f - x2 / 6.0f * (1.0f - x2 / 20.0f * (1.0f - x2 / 42.0f * (1.0f - x2 / 72.0f *
+                         (1.0f - x2 / 110.0f * (1.0f - x2 / 156.0f))))));
+        const float c1 = c * cx - s * sx;
+        s = s * cx + c * sx;
+        c = c1;
+    }
+    // Driven: drops the points the grid no longer reads, keeping the one in
+    // force where the smoothing's reach behind the head begins.
+    void prune(uint64_t t0_us, uint32_t step_us) {
+        const uint64_t back = uint64_t(3 * driveBox(step_us) + kPlanEdge) * step_us;
+        if (t0_us <= back) return;
+        size_t d = 0;
+        while (d + 1 < _drv_n && _drv[d + 1].t_us <= t0_us - back) ++d;
+        if (d == 0) return;
+        std::copy(_drv.begin() + d, _drv.begin() + _drv_n, _drv.begin());
+        _drv_n -= d;
+    }
+    // Driven: the drive's steps on the grid. _fq[k] = the frequency at t0 +
+    // (k - back) * step for k in [0, m), at most hz_max (the rotation's
+    // reach); _b[j] = the amplitude asked at t0 + j * step for j in [0, nb).
+    // Before the first point the frequency is its own; nothing is asked
+    // before it, kDriveQuietUs past the last, or at 0 Hz.
+    void stairs(uint64_t t0_us, uint32_t step_us, size_t back, size_t m, size_t nb, float hz_max) {
+        size_t p = 0;
+        for (size_t k = 0; k < m; ++k) {
+            const int64_t t = int64_t(t0_us) + (int64_t(k) - int64_t(back)) * int64_t(step_us);
+            while (p + 1 < _drv_n && int64_t(_drv[p + 1].t_us) <= t) ++p;
+            const DrivePoint* d = _drv_n > 0 ? &_drv[p] : nullptr;
+            _fq[k] = d ? std::fmin(d->hz, hz_max) : 0.0f;
+            if (k < back || k - back >= nb) continue;
+            const bool live = d && int64_t(d->t_us) <= t && t - int64_t(d->t_us) <= int64_t(kDriveQuietUs);
+            _b[k - back] = live && d->hz > 0.0f ? d->amp : 0.0f;
         }
     }
 
@@ -398,6 +554,15 @@ private:
     std::array<float, MaxOut + MaxFade> _b{};
     std::array<float, MaxOut + MaxFade> _s{};
     std::array<uint16_t, MaxOut + MaxFade> _q{};
+    // Driven: the points (time order), the frequency on the grid, and the
+    // phase step of each output the last render() made.
+    struct DrivePoint { uint64_t t_us; float hz, amp; };
+    std::array<DrivePoint, kDriveMax> _drv{};
+    size_t    _drv_n = 0;
+    uint32_t  _step_us = 0;
+    std::array<float, MaxOut + 2 * MaxFade + 2 * kPlanEdge> _fq{};
+    std::array<float, MaxOut> _dph{};
+    size_t    _n_dph = 0;
 };
 
 }  // namespace kinetic2
