@@ -1866,8 +1866,9 @@ struct ScriptRun {
 // per 100 ms knot with the PCHIP slope as its end velocity, each submitted
 // 250 ms before its start, under the 84 mm rig's ceilings. The rendered
 // velocity is compared on the 1 ms grid with the derivative of the script's
-// own PCHIP curve; v_err_max is taken after the first span (the carriage
-// starts at rest with no acceleration, the first cubic does not).
+// own PCHIP curve; v_err_max after the first span, v_err_first in it (the
+// carriage starts at rest with no acceleration, the first cubic does not: the
+// lead ramp carries the step, kin-tt8).
 // open: the knots carry no end velocity (the renderer solves the angles).
 ScriptRun runPchipSine(bool open) {
     Config cfg; cfg.limits = {1000.0f / 84.0f, 50000.0f / 84.0f, 1.0e7f / 84.0f};
@@ -1937,6 +1938,7 @@ TEST_CASE("a PCHIP script renders as its author's curve; with no velocities its 
             << "), first span " << au.v_err_first << "; open: v error " << g2.v_err_max << ", a step " << g2.a_jump);
     // An authored velocity is the knot's angle.
     CHECK(au.v_err_max <= 0.02 * au.v_peak);
+    CHECK(au.v_err_first <= 0.02 * au.v_peak);
     CHECK(au.dips == 0);
     CHECK(au.refused == 0);
     CHECK(au.trimmed == 0);
