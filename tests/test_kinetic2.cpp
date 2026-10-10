@@ -318,6 +318,8 @@ TEST_CASE("amplitude gives: an impossible stroke is trimmed on time to the ceili
     CHECK(countKind(an, AnomalyKind::KnotTrimmed, &share) == 1);
     CHECK(share == doctest::Approx(s[120].p).epsilon(1e-3));
     CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
+    // A solver kind carries the knot's solved time, not the clock (kin-7p7).
+    for (const Anomaly& x : an) if (x.kind == uint8_t(AnomalyKind::KnotTrimmed)) CHECK(x.t_us == o.t_us);
 }
 
 TEST_CASE("a stroke past the ceilings is trimmed on time and the next knot keeps its own time") {

@@ -127,7 +127,9 @@ inline constexpr float kDetailTimelineFull = -96.0f;
 struct Anomaly {
     uint8_t  kind   = 0;      // AnomalyKind
     uint16_t seq    = 0;      // rolling event id
-    uint64_t t_us   = 0;      // engine time at record
+    // Where on the engine clock it lies: a solver kind at its knot's solved
+    // time, SettleEngaged where the brake starts, KnotRefused at the submit.
+    uint64_t t_us   = 0;
     float    target = 0.0f;   // the knot's p
     float    detail = 0.0f;   // kind-specific
 };
