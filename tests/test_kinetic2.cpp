@@ -584,8 +584,8 @@ TEST_CASE("property: random knot sequences never exceed a ceiling or the window 
         CHECK(junction == 0);
         // Constraint: a G1 knot whose corner ramp has no room in its spans keeps
         // an acceleration step (a 1 ms jerk spike) and is reported
-        // PieceOverCeiling: 81 of 4000 runs at smoothness 0 as of 2026-10-09,
-        // 82 at 0.25, the most of any set. Acceptance (c) bars it; rule 5 as
+        // PieceOverCeiling: 81 of 4000 runs at smoothness 0 and at 0.25 as of
+        // 2026-10-09 (kin-6da), the most of any set. Acceptance (c) bars it; rule 5 as
         // written renders it. Operator ruling owed (kin-y6e).
         CHECK(withoutFail == 0);
         CHECK(why[2] <= 82);
@@ -1228,6 +1228,29 @@ float worstJump(const std::vector<State>& s) {
 
 }  // namespace
 
+TEST_CASE("a rest end the piece reaches decelerating lands at rest on it: never a brake back past it (kin-6da)") {
+    Config cfg; cfg.limits = {4.0f, 60.0f, 2000.0f};
+    Engine<> e(cfg, 0.2f);
+    queueRamp(e);
+    const Solved end = e.solved(0, e.pending() - 1);
+    CHECK(end.v == 0.0f);
+    CHECK(end.a == 0.0f);
+    const auto s = sweep(e, 0, 600 * kMs);
+    float top = s[0].p, back = 0.0f;
+    for (const State& st : s) { top = std::max(top, st.p); back = std::max(back, top - st.p); }
+    MESSAGE("lands at " << s.back().p << ", runs back " << back);
+    CHECK(back <= 1e-6f);
+    CHECK(s.back().p == doctest::Approx(knotP(end)).epsilon(1e-5));
+    CHECK(s.back().v == 0.0f);
+    const Peaks pk = peaksOf(s);
+    CHECK(pk.v <= cfg.limits.vmax * 1.001f);
+    CHECK(pk.a <= cfg.limits.amax * 1.001f);
+    CHECK(pk.j <= cfg.limits.jmax * 1.10f);
+    const auto an = drain(e);
+    CHECK(countKind(an, AnomalyKind::SettleEngaged) == 0);
+    CHECK(countKind(an, AnomalyKind::PieceOverCeiling) == 0);
+}
+
 TEST_CASE("free segments streamed late in the span before them pass every through point moving") {
     // A knot with no successor is a rest end until its successor arrives; the
     // successor re-solves it however late in the span it comes (kin-y6e case 1).
@@ -1354,6 +1377,7 @@ TEST_CASE("reframe: the pending knots stay and re-solve from the restated curve,
         e.reframe(1.0f, -0.01f, now);
         CHECK(e.pending() == kept);
         CHECK(e.isBusy(now));
+        const Solved end = e.solved(0, kept - 1);
         std::vector<State> s{at};
         for (uint64_t t = now + kMs; t <= 600 * kMs; t += kMs) s.push_back(e.stateAt(0, t));
         CHECK(s[1].p == doctest::Approx(at.p + at.v * 1e-3f).epsilon(1e-3));
@@ -1363,9 +1387,10 @@ TEST_CASE("reframe: the pending knots stay and re-solve from the restated curve,
         CHECK(pk.v <= cfg.limits.vmax * 1.001f);
         CHECK(pk.a <= cfg.limits.amax * 1.001f);
         CHECK(pk.j <= cfg.limits.jmax * 1.10f);
-        // The last knot is passed at its authored share; the rest after it is
-        // the ramp's own (the same without the reseed).
-        CHECK(pk.hi == doctest::Approx(0.30f).epsilon(1e-4));
+        // The last knot is a rest end: the carriage lands on it, trimmed as the
+        // ceilings need, and never runs back (kin-6da).
+        CHECK(pk.hi == doctest::Approx(knotP(end)).epsilon(1e-4));
+        CHECK(s.back().p == pk.hi);
         CHECK(std::fabs(s.back().v) < 1e-4f);
         const auto an = drain(e);
         CHECK(countKind(an, AnomalyKind::KnotRefused) == 0);

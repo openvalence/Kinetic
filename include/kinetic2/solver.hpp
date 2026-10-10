@@ -686,6 +686,12 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
                     const float da1 = std::fabs(handles::aEndOf(pc.q) - o.ramp.s0.a);
                     const float jj = std::fmax(std::fabs(handles::evalPiece(pc.q, 1.0f).j), std::fabs(o.ramp.jerk[0]));
                     if (da1 > c.lim.jmax * kStepS) step_ratio = std::fmax(step_ratio, da1 / j1ms + jj / c.lim.jmax);
+                } else if (last && r + 1 == me && o.v == 0.0f) {
+                    // A rest end its corner ramp found no room for ends in the
+                    // piece's acceleration: a brake from v = 0 is a reversal past
+                    // the knot, so it is judged as the step to rest (kin-6da).
+                    const float da1 = std::fabs(o.a), jj = std::fabs(handles::evalPiece(pc.q, 1.0f).j);
+                    if (da1 > c.lim.jmax * kStepS) step_ratio = std::fmax(step_ratio, da1 / j1ms + jj / c.lim.jmax);
                 }
                 built[r] = std::fmax(w, step_ratio);
                 over = over || std::fmax(po.v, std::fmax(po.a, po.x)) > 1.0f + handles::kTol;
