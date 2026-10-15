@@ -14,7 +14,7 @@ Three rules a change must keep. A pull request that breaks one is not merged.
    ctest --test-dir build --output-on-failure
    ```
 
-   The wasm build (README.md "WebAssembly") compiles too.
+   The wasm build (README.md "Playground and WebAssembly") compiles too.
 3. **Every `Config` member is read.** A member the planner stops reading
    leaves `Config`, the wasm ABI and the playground in the same change.
 

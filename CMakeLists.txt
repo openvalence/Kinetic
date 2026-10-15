@@ -3,7 +3,7 @@
 # Consumers: add_subdirectory(<path to Kinetic>) and link kinetic::kinetic2.
 # Top level: the doctest suites under ctest; under emcmake, wasm/ instead.
 #
-# -ffp-contract=off is the determinism rule (README.md "Determinism"): it is
+# -ffp-contract=off is the determinism rule (README.md "Deterministic"): it is
 # an INTERFACE option so every consumer TU that compiles the planner gets it.
 # Never add -ffast-math to anything that links this target.
 

@@ -1,6 +1,6 @@
 // kinetic2_wasm -- the Kinetic² C ABI behind kinetic2_wasm.h. Plumbing only:
 // every planning decision is the engine's.
-// See: README.md "WebAssembly"
+// See: README.md "Playground and WebAssembly"
 #include "kinetic2_wasm.h"
 
 #include <cmath>

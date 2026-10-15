@@ -7,7 +7,7 @@
 //   resets: sampling retires knots the clock has passed.
 // - Positions are window units, 0..1 over the travel window.
 // - SINGLE-THREADED per handle.
-// See: README.md "WebAssembly"
+// See: README.md "Playground and WebAssembly"
 #pragma once
 
 #include <stdint.h>

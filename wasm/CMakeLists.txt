@@ -1,5 +1,5 @@
 # kinetic2.wasm -- Kinetic² behind the C ABI in kinetic2_wasm.h. Built from the
-# repo root under emcmake (README.md "WebAssembly"); output is gitignored.
+# repo root under emcmake (README.md "Playground and WebAssembly"); output is gitignored.
 #
 # Standalone wasm, no JS glue, no filesystem: instantiate with
 # WebAssembly.instantiate and call the exports.

@@ -10,7 +10,7 @@ Deployed at <https://openvalence.org/Kinetic/>.
 
 ## Run it locally
 
-Build the module (README.md "WebAssembly"):
+Build the module (README.md "Playground and WebAssembly"):
 
 ```sh
 emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release

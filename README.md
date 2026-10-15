@@ -1,32 +1,39 @@
 # Kinetic
 
-Kinetic is a header-only C++ library that plans jerk-limited trajectories. It
-has no hardware dependencies and its output is deterministic. It is the
-motion planner of the OpenValence Nucleus firmware (OSSM Flagship) and can be
-used outside Nucleus.
+Kinetic is a jerk-limited motion planner for linear machines. It is a
+header-only C++ library with no hardware dependencies, so it drops into any
+project that can compile C++20. It plans every stroke on the OSSM Flagship
+(through the Nucleus firmware), and you can use it on its own.
 
-The planner is Kinetic² (`include/kinetic2/`): one knot timeline per axis, a
-lookahead solver over the pending knots, three junction kinds. Its API is
-documented in its headers; `wasm/kinetic2_wasm.h` is its C ABI and
-`playground/` runs it in a browser. The design is RFC-105 in the Valence RFC
-queue.
+You give it knots: "be at this position at this time." It gives back a smooth
+trajectory you can sample at any moment, and it never exceeds the velocity,
+acceleration and jerk limits you set. So a script can ask for anything, and the
+motor still gets a curve it can follow.
 
-Kinetic 1 and the K2-vs-K1 oracle comparison live on branch `kinetic1` (tag `kinetic1-final`), off main since 2026-10-08 (operator ruling, kin-xfq).
+**[Try it in your browser](https://openvalence.org/Kinetic/)** | [Project page](https://openvalence.org/kinetic/) | [Docs](https://openvalence.org/Valence/)
 
-## The model
+## How it works
 
-- **Knots in, a sampled trajectory out.** Every source (a segment, a sample,
-  a stroke generator) becomes knots: the curve passes `p` at `t_us`, with an
-  optional authored end velocity. The engine never sees a wire format.
-- **Event-driven, never clocked.** The pending window is solved when it
-  changes, lazily at the next sample; a piece is built when the sampler first
-  needs it, from the state the previous piece ends in, so the curve is
-  continuous in position and velocity by construction.
-- **Time never gives, amplitude does.** A knot the ceilings cannot reach in
-  time is trimmed toward its predecessor and records an anomaly; it is never
-  dropped or placed late.
-- **Limits are ceilings.** The planner never exceeds them and does not plan
-  to reach them. Every trim, clamp and refusal records an anomaly.
+- **Knots in, a trajectory out.** Every source (a script segment, a live
+  sample, a stroke generator) becomes knots: the curve passes position `p` at
+  time `t_us`, optionally with an end velocity. The engine never sees a wire
+  format, so any source feeds the same planner.
+- **A composite cubic Bézier in the time-position plane.** Each knot has one
+  angle and two handle lengths, and the limits bound those lengths. The curve is
+  continuous in position and velocity by construction, so the motor never sees a
+  step in speed.
+- **Event-driven.** The pending knots are solved when they change, lazily at the
+  next sample. There is no fixed control clock inside the planner, so you sample
+  on whatever clock you have.
+- **Time never gives, amplitude does.** A knot the limits cannot reach in time
+  moves toward the knot before it. It is never dropped and never placed late. So
+  a script keeps its rhythm and gives up stroke length.
+- **Limits are ceilings.** The planner stays under them and does not plan to
+  reach them. Every trim, clamp and refusal is recorded as an anomaly you can
+  read, so you can see exactly where a pattern asked for too much.
+- **Two models on top.** The stream model handles live input one sample behind,
+  and the handle model renders authored scripts. Both end up as knots in the
+  same timeline.
 
 ## Example
 
@@ -51,76 +58,70 @@ while (engine.popAnomaly(an))                // anomalies the planner recorded
     report(an.kind, an.detail);
 ```
 
-The rest of the API: `truncateAfter()` replaces what is queued, `brake()`
-stops from the current state, `reframe()` restates the plan when the
-caller's frame moves, `solved()` and `peek()` expose the plan for telemetry or
-a renderer, `setConfig()` / `setLimits()` apply at the next submit or reset.
-`engine.hpp` documents each.
+The rest of the API:
 
-A knot with no end velocity and no successor renders at rest: nothing says
-the motion goes on. A stream owner that knows more is coming says so with
-`expect(axis, until_us)`, before its submits: a solve whose window changed
-before `until_us` renders the newest free knot through, toward a provisional
-successor at rest: its speed eases from the last chord's to 0 across the
-horizon left past the knot (at least that chord's span, never a deceleration
-over amax; held to the window and fit to the ceilings like any piece), so a
-stream passes same-direction knots near chord speed instead of slowing toward
-each one, and a reversal the stream did not declare finds the knot slower.
-The successor that arrives replaces it; a reversal re-plans as any knot does. When none arrives, the knot is
-reached moving and the starvation brake stops the axis. A knot with an end
-velocity is unchanged, `expect(axis, 0)` clears it, and without it the engine
-is bit for bit what it was.
+- `truncateAfter()` replaces what is queued.
+- `brake()` stops from the current state.
+- `reframe()` restates the plan when your window moves.
+- `solved()` and `peek()` expose the plan for telemetry or a renderer.
+- `setConfig()` and `setLimits()` apply at the next submit or reset.
+- `expect(axis, until_us)` tells the engine more knots are coming, so a stream
+  passes same-direction knots near chord speed instead of slowing toward each
+  one.
+
+`include/kinetic2/engine.hpp` documents each call.
 
 ## Planner options
 
-`kinetic2::Config` holds the ceilings and the options the renderer reads
-(Valence RFC-108); `types.hpp` documents each.
+`kinetic2::Config` holds the limits and the options the renderer reads.
+`include/kinetic2/types.hpp` documents each.
 
 | Member | Default | What it sets |
 |---|---|---|
 | `limits` | 3, 30, 500 | vmax, amax, jmax: ceilings, never targets |
-| `smoothness` | 0 | free knots: 0 crisp (PCHIP, no overshoot between monotone knots), 1 smooth (Makima's angle at through points, which may overshoot; crests and hold edges stay flat, continuous in acceleration by their handle lengths), the blend between |
-| `handle_floor` | 0.15 | the shortest handle a ceiling fit may leave, share of its span |
-| `trim_max` | 1 | the farthest a knot moves toward its predecessor to fit the ceilings, share of the window |
-| `react_us` | 4000 | how far ahead of now a knot arriving in motion re-plans from |
+| `smoothness` | 0 | free knots: 0 is crisp (no overshoot between monotone knots), 1 is smooth (continuous acceleration, may overshoot), values between blend the two |
+| `handle_floor` | 0.15 | the shortest handle a ceiling fit may leave, as a share of its span |
+| `trim_max` | 1 | the farthest a knot moves toward its predecessor to fit the ceilings, as a share of the window |
+| `react_us` | 4000 | how far ahead of now a knot arriving mid-motion re-plans from |
 | `solve_budget` | 96 | the machine's bound on one planner run; not read yet |
 
-## Units and frames
+## Units
 
 | Quantity | Unit |
 |---|---|
-| position | normalized 0..1 across the caller's stroke window |
+| position | normalized 0..1 across your stroke window |
 | velocity, acceleration, jerk | window units per second, per second², per second³ |
 | limits | the same; derive them as mm limits divided by the window span |
-| time | microseconds, `uint64_t`, supplied by the caller (never read from a clock) |
+| time | microseconds, `uint64_t`, supplied by you (never read from a clock) |
 
-Mapping the window to millimeters, steps or encoder counts is the caller's.
+Turning the window into millimeters, steps or encoder counts is your code's job,
+so the same plan works for any machine.
 
-## Determinism
+## Deterministic
 
-Every quantity is `float`; time is `uint64_t` microseconds. The same sequence
-of calls gives bit-identical results on every IEEE-754 target, provided every
-translation unit that compiles the planner is built with `-ffp-contract=off`
-and without `-ffast-math`. The CMake target carries the flag as an INTERFACE
-option; any other build must set it. `tests/test_kinetic2.cpp` pins a
-fingerprint of the rendered motion.
+Every quantity is `float` and time is integer microseconds. The same calls give
+bit-identical results on native, ESP32-P4 and WebAssembly builds, provided every
+translation unit that compiles the planner uses `-ffp-contract=off` and not
+`-ffast-math`. Without the flag, GCC fuses multiply-adds on targets such as the
+ESP32-P4 and results drift by a few ULPs.
 
-GCC's default FP contraction emits fused multiply-add on targets such as the
-ESP32-P4, and results then differ from native and wasm builds by a few ULPs.
+So the plan you preview in the browser is the plan the firmware runs. The CMake
+target carries the flag for you, and `tests/test_kinetic2.cpp` pins a
+fingerprint of the rendered motion. The engine is single-threaded: every call on
+one `Engine` comes from one task.
 
-The engine is single-threaded: every call on one `Engine` comes from one task.
+## Use it
 
-## Integration
+Kinetic needs C++20. Pick one:
 
-**Sibling checkout** (what Nucleus does): clone Kinetic beside your project,
-point the build at it with one of the forms below, and record the Kinetic
-commit sha in a pin file (Nucleus: `kinetic.pin`; its lint fails when the
-checkout's HEAD is not the pin). Changes are made in Kinetic first; the pin is then updated.
+**CMake**
 
-**Vendor it**: copy `include/`, `LICENSE` and `NOTICE.md` into your tree.
-Never edit the copy.
+```cmake
+add_subdirectory(Kinetic)
+target_link_libraries(app PRIVATE kinetic::kinetic2)
+```
 
-**PlatformIO**:
+**PlatformIO**
 
 ```ini
 build_flags = -std=gnu++2b -ffp-contract=off
@@ -128,16 +129,14 @@ lib_deps =
     symlink://../Kinetic
 ```
 
-**CMake**:
+**Vendor it.** Copy `include/`, `LICENSE` and `NOTICE.md` into your tree and
+never edit the copy.
 
-```cmake
-add_subdirectory(Kinetic)
-target_link_libraries(app PRIVATE kinetic::kinetic2)
-```
+Nucleus clones Kinetic beside it and records the commit in a pin file, so its
+lint fails if the checkout drifts. Changes land in Kinetic first, then the pin
+moves.
 
-Requires C++20 (`library.json` builds as gnu++2b).
-
-## Tests
+## Build and test
 
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -145,49 +144,42 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Every kinematic assertion samples the produced trajectory on a 1 ms grid
-and checks those samples against the ceilings. `bench_kinetic2` prints the
-solver's cost per submit and is not a test.
+Every kinematic assertion samples the produced trajectory on a 1 ms grid and
+checks those samples against the limits. `bench_kinetic2` prints the solver's
+cost per submit; it is not a test.
 
-## WebAssembly
+## Playground and WebAssembly
 
-`wasm/` builds Kinetic² behind a small C ABI (`wasm/kinetic2_wasm.h`).
+The [playground](https://openvalence.org/Kinetic/) runs the planner in your
+browser. Place knots on the position trace, change the planner options, and read
+the result: the curve, velocity, acceleration and jerk against the limits, the
+solved knots and every anomaly. So you can see what the planner does with a
+pattern before it reaches a motor. Its source is `playground/`.
+
+`wasm/` builds the same planner behind a small C interface
+(`wasm/kinetic2_wasm.h`), standalone with no imports and no JS glue:
 
 ```
 emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-wasm
 ```
 
-Output `build-wasm/wasm/kinetic2.wasm`: standalone, zero imports, no JS glue.
-Create a handle, configure the ceilings and planner options, reset at a
-position, submit knots in window units on your own clock, sample the state at
-a time, read the solved knots and the anomalies. Sampling retires knots the
-clock has passed, so sample with non-decreasing times between resets.
-`playground/` is a browser page over this module.
+The output is `build-wasm/wasm/kinetic2.wasm`. Sample with non-decreasing times
+between resets, because sampling retires knots the clock has passed.
 
-Nucleus builds a separate module for its offline renderer: this engine wrapped
-in the firmware's motion arbiter (Nucleus `tools/kinetic-wasm/`). That module
-stays in Nucleus.
+## What Kinetic does not do
 
-## Scope
+Kinetic plans motion inside a window you give it. Homing, rail limits, e-stop,
+arbitration, the wire protocol and step generation belong to the machine around
+it. In OpenValence that machine is Nucleus.
 
-Kinetic plans motion inside a window it is given. These belong to the
-machine around it, and in OpenValence they live in Nucleus:
+## Versions
 
-- window ownership: homing, the stroke window's physical limits, the clamp
-  that is the hard backstop downstream of the planner;
-- arbitration: which source owns motion, ESTOP, pause, power gates;
-- the wire protocol: decoding Valence segments into knots, pacing,
-  schedule horizons;
-- step generation and the emitter.
-
-## Versioning
-
-`kinetic2::kVersion` (in `include/kinetic2/types.hpp`) is the planner's
-version string; the wasm module reports it from `kinetic2_version()` as
-`"kinetic2 X.Y.Z"`. `library.json` carries the repository release, tagged
-`vX.Y.Z`.
+`kinetic2::kVersion` (in `include/kinetic2/types.hpp`) is the planner's version
+string, and the wasm module reports it from `kinetic2_version()`. `library.json`
+carries the repository release, tagged `vX.Y.Z`. Kinetic 1, the first planner,
+lives on the `kinetic1` branch as a test oracle and is not on `main`.
 
 ## License
 
-Apache-2.0, see `LICENSE` and `NOTICE.md`.
+Apache-2.0. See `LICENSE` and `NOTICE.md`.

@@ -2,7 +2,7 @@
 // renders with zero console errors and no sample over a ceiling, a knot can be
 // added and Shift-dragged, the share link round-trips.
 // Constraints:
-// - Needs build-wasm/wasm/kinetic2.wasm (README.md "WebAssembly") and
+// - Needs build-wasm/wasm/kinetic2.wasm (README.md "Playground and WebAssembly") and
 //   Playwright with chromium from ../../Phosphor/node_modules, or PLAYWRIGHT_DIR.
 // - KINETIC2_WASM overrides the module path.
 // - Screenshots land in SHOTS_DIR (default: the OS temp dir).
