@@ -7,6 +7,7 @@
 <meta name="description" content="A funscript as a composite cubic Bezier in the time-position plane: knot classes, handles, and the ceilings as bounds on the handle lengths.">
 <link rel="stylesheet" href="play.css">
 <link rel="stylesheet" href="site-nav.css">
+<script src="site-nav.js" defer></script>
 <script>if (top !== self) document.documentElement.classList.add('framed')</script>
 <style>
   #plotbox { height: clamp(300px, 46vh, 460px); }
@@ -32,7 +33,19 @@
   </a>
   <nav class="chips" aria-label="Site">
     <a class="chip" href="https://openvalence.org/valence/">Valence</a>
-    <a class="chip" href="https://openvalence.org/components/" aria-current="page">Components</a>
+    <div class="menu">
+      <a class="chip" href="https://openvalence.org/components/" aria-current="page">Components</a><button class="menu-btn" type="button" aria-expanded="false" aria-controls="menu-parts" aria-label="Components menu"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
+      <div class="menu-panel" id="menu-parts">
+        <ul>
+          <li><a class="item" href="https://openvalence.org/nucleus/"><b>Nucleus</b><span>Firmware for the OSSM Flagship PCB</span></a></li>
+          <li><a class="item" href="https://openvalence.org/neutrino/"><b>Neutrino</b><span>The hub firmware, emulated inside Phosphor</span></a></li>
+          <li><a class="item" href="https://openvalence.org/kinetic/"><b>Kinetic</b><span>The motion planner: knots in, smooth motion out</span></a></li>
+          <li><a class="item" href="https://openvalence.org/isotope/"><b>Isotope <i>WIP</i></b><span>Accessory firmware that joins over <span class="nb">ESP-NOW</span></span></a></li>
+          <li><a class="item" href="https://openvalence.org/hardware/"><b>OSSM Flagship PCB <i>WIP</i></b><span>The controller board, in KiCad</span></a></li>
+        </ul>
+        <a class="item all" href="https://openvalence.org/components/">All components</a>
+      </div>
+    </div>
     <a class="chip" href="https://openvalence.org/phosphor/">Phosphor</a>
     <a class="chip" href="https://openvalence.org/diagrams/">Diagrams</a>
     <a class="chip" href="https://openvalence.org/demos/">Demos</a>
@@ -41,11 +54,11 @@
   </nav>
   <a class="get" href="https://openvalence.org/downloads/"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></svg>Download</a>
 </header>
-<header class="top">
+<div class="top">
   <h1>Kinetic² handles</h1>
   <p class="tag">A funscript as a composite cubic Bézier in the time-position plane: the knots on the author's clock, one angle and two handle lengths per knot, and the ceilings as bounds on the lengths.</p>
   <p class="meta"><a href="index.html">the planner playground</a> · <a href="https://github.com/openvalence/Kinetic">github.com/openvalence/Kinetic</a></p>
-</header>
+</div>
 
 <main class="layout">
   <section class="stage">

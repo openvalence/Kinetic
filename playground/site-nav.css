@@ -7,9 +7,11 @@
   font-weight: 700 900; font-stretch: 100% 125%; font-display: swap;
 }
 .strip {
-  --ink: #F3F3EF; --ink-2: #BDBDB7; --rule: #2C2C30; --accent: #2E4BFF;
+  --bg: #0B0B0C; --bg-2: #161618; --ink: #F3F3EF; --ink-2: #BDBDB7; --ink-3: #92928C; --rule: #2C2C30; --accent: #2E4BFF; --accent-ink: #92A3FF;
+  --shadow: 0 30px 80px -30px rgba(0,0,0,.8); --gutter: 16px;
   --display: 'Archivo', 'Arial Black', system-ui, sans-serif;
   display: flex; align-items: center; gap: 10px 28px; padding: 14px 0;
+  position: relative; z-index: 10;
 }
 .framed .strip { display: none; }
 .brand { display: flex; align-items: center; gap: 10px; color: var(--ink); text-decoration: none; font: 900 1.15rem/1 var(--display); font-stretch: 115%; letter-spacing: -.01em; white-space: nowrap; }
@@ -25,7 +27,29 @@
 }
 .get svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .get:hover { color: #0B0B0C; background: var(--ink); }
-.strip a:focus-visible { outline: 2px solid #92A3FF; outline-offset: 3px; }
+.strip a:focus-visible, .strip button:focus-visible { outline: 2px solid #92A3FF; outline-offset: 3px; }
+/* the Components menu (site style.css "the Components menu"; behavior in site-nav.js) */
+.menu { position: relative; display: flex; align-items: center; gap: 2px; }
+.menu-btn { display: grid; place-items: center; width: 24px; height: 28px; margin-right: -6px; padding: 0; border: 0; border-radius: 4px; color: var(--ink-2); background: none; cursor: pointer; }
+.menu-btn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; transition: transform .15s; }
+.menu-btn:hover, .menu.open .menu-btn { color: var(--ink); }
+.menu.open .menu-btn svg { transform: rotate(180deg); }
+.menu-panel {
+  position: absolute; top: 100%; left: -18px; width: 360px; padding-top: 12px;
+  visibility: hidden; opacity: 0; transition: opacity .12s, visibility 0s .12s;
+}
+.menu.open .menu-panel, .menu:not(.live):hover .menu-panel, .menu:not(.live):focus-within .menu-panel { visibility: visible; opacity: 1; transition-delay: 0s; }
+.menu-panel ul { margin: 0; padding: 0; list-style: none; }
+.menu-panel ul, .menu-panel .all { background: var(--bg); }
+.menu-panel ul { border-top: 3px solid var(--ink); box-shadow: var(--shadow); }
+.menu-panel .item { display: block; padding: 11px 18px 12px; border-bottom: 1px solid var(--rule); color: var(--ink-2); text-decoration: none; font: 400 .9rem/1.35 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+.menu-panel .item b { display: block; margin-bottom: 2px; color: var(--ink); font: 800 1rem/1.15 var(--display); font-stretch: 108%; }
+.menu-panel .item i { margin-left: 6px; padding: 2px 5px 1px; font: 900 .58rem/1 var(--display); font-stretch: 110%; letter-spacing: .06em; vertical-align: .2em; font-style: normal; color: var(--bg); background: var(--ink-3); }
+.menu-panel .item:hover { color: var(--ink); background: var(--bg-2); }
+.menu-panel .item:hover b { color: var(--accent-ink); }
+.menu-panel .all { box-shadow: var(--shadow); font: 800 .78rem/1 var(--display); font-stretch: 108%; text-transform: uppercase; letter-spacing: .04em; color: var(--ink); padding-block: 14px; }
+.menu-panel :focus-visible { outline-offset: -3px; }
+.nb { white-space: nowrap; }
 
 /* the body's 16 px side padding is the gutter here */
 @media (max-width: 1100px) {
@@ -37,6 +61,11 @@
   }
   .chips::-webkit-scrollbar { display: none; }
   .chips > :last-child { padding-right: 16px; }
+  .menu { position: static; }
+  .chips:has(.menu.open) { mask-image: none; }
+  .menu-panel { left: -16px; right: -16px; width: auto; padding: 0; }
+  .menu-panel ul { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); border-top-width: 1px; border-top-color: var(--rule); box-shadow: none; }
+  .menu-panel .all { padding-inline: var(--gutter); border-bottom: 3px solid var(--ink); box-shadow: 0 24px 40px -24px rgba(0,0,0,.6); }
 }
 @media (max-width: 640px) {
   .strip { column-gap: 12px; }

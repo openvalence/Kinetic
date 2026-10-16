@@ -356,6 +356,7 @@ syncSmooth();
 $('#c-smooth').addEventListener('input', (ev) => { cfg.smoothness = Number(ev.target.value); syncSmooth(); update(); });
 document.addEventListener('keydown', (ev) => {
   if (ev.target.tagName === 'INPUT' || ev.target.tagName === 'SELECT') return;
+  if (ev.target.closest && ev.target.closest('.strip')) return;   // the site header's own keys
   if (ev.key === 'Escape') { sel = null; update(); }
   if (ev.key === ' ') { ev.preventDefault(); togglePlay(); }
   if (ev.key === 'ArrowLeft' && sel > 0) { sel--; update(); }

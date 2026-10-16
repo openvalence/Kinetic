@@ -454,6 +454,7 @@ addEventListener('keydown', (ev) => {
   const tag = ev.target.tagName;
   const typing = tag === 'INPUT' && ev.target.type !== 'range' || tag === 'SELECT' || tag === 'TEXTAREA';
   if (typing) return;
+  if (ev.target.closest && ev.target.closest('.strip')) return;   // the site header's own keys
   if (ev.code === 'Space') { ev.preventDefault(); togglePlay(); }
   else if ((ev.key === 'Delete' || ev.key === 'Backspace') && sel && sel !== 'start') { ev.preventDefault(); remove(sel); }
   else if (ev.key === 'Escape') { sel = null; changed(); }
