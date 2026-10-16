@@ -58,12 +58,15 @@
 // - Parity with the model (tests/test_kinetic2_handles.cpp): trims within
 //   1e-4 of the window; the engine's positions within 0.5% and its trims
 //   within 1e-4, both past the corner-ramp allowance.
+// - The K2T_* lines are trace hooks (trace.hpp), nothing unless a build
+//   defines them: a decision that moves takes its hook with it.
 // See: Valence RFC-106, Kinetic kin-y6e
 #pragma once
 
 #include <cmath>
 #include <cstdint>
 
+#include "trace.hpp"
 #include "types.hpp"
 
 namespace kinetic2::handles {
@@ -554,6 +557,7 @@ inline void solveStyle(HKnot* k, int n, const Cfg& c, bool withDp, bool smooth) 
         if (i > 0 && c.railStop && m.has_v) m.vel = railBound(m.vel, withDp ? rendered(m) : m.p, c, m.rail);
         m.lIn = m.lOut = kThird;
     }
+    K2T_STYLE(k, n, smooth, 0);
     auto pe = [&](const HKnot& m) { return withDp ? rendered(m) : m.p; };
     for (int s = 0; s < c.sweeps; ++s) {
         for (int i = 1; i + 1 < n; ++i) {
@@ -581,6 +585,7 @@ inline void solveStyle(HKnot* k, int n, const Cfg& c, bool withDp, bool smooth) 
             }
         }
     }
+    K2T_STYLE(k, n, smooth, 1);
 }
 
 // The solve at Cfg::smoothness. An authored angle is the same in both solves
@@ -746,6 +751,7 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
         const float ro = std::fmax(room ? roomOver(q, *room, cs.lim.jmax) : 0.0f, monoOver(q, cs));
         const float o = std::fmax(ro, ro > 1.0f + kTol && ro >= bound_ && !parts ? ro
                                       : overOf(q, pL, cs, parts ? INFINITY : bound_, parts));
+        K2T_JUDGE(f, q, pL, cs, ro, o);
         return Fit{f, q.i0, q.i1, o, o <= 1.0f + kTol};
     };
     // k = 1 first, with its parts: a speed or window excess wants shorter
@@ -867,6 +873,7 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
                                rm.aIn, float(rm.fromFlat) + 2.0f * float(intoFlat), rm.aEnd, rm.aEndTol, L.vcap};
         bool hit = R.memo;
         for (int q = 0; hit && q < kMemoKey; ++q) hit = key[q] == R.mk[q] || (std::isnan(key[q]) && std::isnan(R.mk[q]));
+        K2T_PIECE(i, hit, L, R, pL);
         if (hit) {
             L.effOut = R.mi0; R.effIn = R.mi1; R.dp = R.mdp; R.vel = R.mvel; R.aIn = R.maIn;
             R.infeasible = !R.mlegal;
@@ -884,6 +891,7 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
             r2.intoFlat = intoFlat && Rt.vel == 0.0f;
             Fit f = fitPiece(L, Rt, pL, pR, c, bound, c.railStop ? &r2 : nullptr, hinted ? &hint : nullptr);
             f.s1 = Rt.vel;
+            K2T_FIT(pR, f);
             return f;
         };
         const bool hold = holdChord(k, i, R.p - L.p, c);
@@ -893,14 +901,17 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
         auto search = [&]() {
             hint = 0;
             dp = hold ? L.dp : 0.0f;
+            K2T_PHASE(0);
             f = fitAt(R.p + dp, INFINITY);
             if (!f.legal && !hold && canTrim) {
                 const float dir = (pL > R.p) ? 1.0f : (pL < R.p) ? -1.0f : 0.0f;
                 float lo = 0.0f, hi = std::fmin(c.trim, std::fabs(R.p - pL));
+                K2T_PHASE(1);
                 Fit fh = fitAt(R.p + dir * hi, 1.0f + kTol, true);
                 if (fh.legal) {
                     for (int s = 0; s < 16; ++s) {
                         const float mid = 0.5f * (lo + hi);
+                        K2T_PHASE(10 + s);
                         const Fit fm = fitAt(R.p + dir * mid, 1.0f + kTol, true);
                         if (fm.legal) { hi = mid; fh = fm; } else { lo = mid; }
                     }
@@ -915,6 +926,7 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
                     // acceleration and the window over).
                     for (int q = 1; q <= 4; ++q) {
                         const float d = dir * 0.25f * static_cast<float>(q) * hi;
+                        K2T_PHASE(30 + q);
                         const Fit fq = fitAt(R.p + d, f.o);
                         if (fq.o < f.o) { f = fq; dp = d; }
                     }
@@ -926,6 +938,7 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
             // rest on a zero chord too: an authored angle kept there is a zero
             // stroke that no cap on L's angle makes legal (kin-jsw1).
             if (!f.legal && hold && canTrim) {
+                K2T_PHASE(40);
                 const Fit ff = fitAt(pL, f.o, false, true);
                 if (ff.o < f.o) { f = ff; dp = pL - R.p; }
             }
@@ -939,6 +952,7 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
             const float da = dp;
             cur.aEnd = NAN;
             cur.aEndTol = INFINITY;
+            K2T_RETRY();
             search();
             if (!f.legal) { f = fa; dp = da; }
         }
@@ -977,6 +991,7 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
             }
         }
         R.infeasible = !f.legal;
+        K2T_PIECE_END(i, L, R, f, dp, hold, canTrim);
         if (!f.legal) ++bad;
         R.memo = true;
         for (int q = 0; q < kMemoKey; ++q) R.mk[q] = key[q];
@@ -990,12 +1005,16 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
 inline int render(HKnot* k, int n, const Cfg& c) {
     if (n < 2) return 0;
     solve(k, n, c, false);
+    K2T_ROUND(k, n, 0, 0);
     int bad = nudge(k, n, c);
+    K2T_ROUND(k, n, 1, 0);
     // A last round that caps an angle earns one more (railStop only; at most four).
     for (int round = 0, extra = 0; round < 2 + extra; ++round) {
         bool capped = false;
         solve(k, n, c, true);
+        K2T_ROUND(k, n, 2, round + 1);
         bad = nudge(k, n, c, &capped);
+        K2T_ROUND(k, n, 3, round + 1);
         if (capped && round + 1 == 2 + extra && extra < 4) ++extra;
     }
     return bad;

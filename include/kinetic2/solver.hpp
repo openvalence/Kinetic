@@ -34,6 +34,8 @@
 //   flat span, starting on it out of one. Its Solved state is then the ramp's
 //   end, where the next piece starts.
 // - Float throughout (the P4 has no double FPU).
+// - The K2T_* lines are trace hooks (trace.hpp), nothing unless a build
+//   defines them.
 #pragma once
 
 #include <cmath>
@@ -638,9 +640,11 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
     }
     for (int r = 0; r < m; ++r)
         for (int x = 0; x < 3; ++x) { ws.last[r][x] = INFINITY; ws.ask[r][x] = 0.0f; }
+    K2T_RUN(k, te, m, me, base);
     bool capped = false, rescue = false;
     for (int pass = 0;; ++pass) {
         K2_STAT(judges, 1);
+        K2T_PASS(pass, rescue);
         handles::render(k, m, c);
         emitRun(k, te, m, me, kn, s, c, out, rescue);
         const bool final = pass >= kSlackCap;
@@ -746,6 +750,7 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
             st = State{o.p, o.v, o.a};
             st_us = o.t_us;
         }
+        K2T_PASS_END(k, built, me, again, over);
         for (int r = 0; r < m; ++r)
             for (int x = 0; x < 3; ++x)
                 if (ws.ask[r][x] > 0.0f) { ws.last[r][x] = ws.ask[r][x]; ws.ask[r][x] = 0.0f; }
@@ -764,6 +769,7 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
         Solved& o = out[r - 1];
         if (ws.built[r] > bar) { o.infeasible = true; o.worst = std::fmax(o.worst, ws.built[r]); }
     }
+    K2T_RUN_END(out, me);
     for (int r = 1; r < me; ++r) {
         const Knot& K = kn[r - 1];
         const Solved& o = out[r - 1];
@@ -879,6 +885,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
     c.smoothness = cfg.smoothness;
     c.trimLast = true;
     c.railStop = true;
+    K2T_SOLVE(origin, origin_us, n, c);
     State s = origin;
     uint64_t s_us = origin_us;
     size_t i = 0;
@@ -888,6 +895,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             size_t j = i + 1;
             while (j < n && j - i < kWindowKnots && knots[j].sample && !knots[j].has_v) ++j;
             if (chaseRun(s, s_us, knots + i, j - i, c, out + i, plan ? *plan : cfg.limits)) {
+                K2T_CHASE(i, j, out);
                 for (size_t r = i; r < j; ++r)
                     if (out[r].infeasible) report(AnomalyKind::PieceOverCeiling, r, out[r].t_us, knots[r].p, out[r].worst);
                 s = State{out[j - 1].p, 0.0f, 0.0f};
@@ -897,6 +905,7 @@ inline size_t solveWindow(const State& origin, uint64_t origin_us, const Knot* k
             }
         }
         if (junctionOf(knots[i]) == Junction::Hard && hardKnot(s, s_us, knots[i], c, out[i])) {
+            K2T_HARD(i, out[i]);
             if (out[i].infeasible) report(AnomalyKind::PieceOverCeiling, i, out[i].t_us, knots[i].p, out[i].worst);
             s = State{out[i].p, 0.0f, 0.0f};
             s_us = out[i].t_us;

@@ -154,7 +154,8 @@ The [playground](https://openvalence.org/Kinetic/) runs the planner in your
 browser. Place knots on the position trace, change the planner options, and read
 the result: the curve, velocity, acceleration and jerk against the limits, the
 solved knots and every anomaly. So you can see what the planner does with a
-pattern before it reaches a motor. Its source is `playground/`.
+pattern before it reaches a motor. Show planner steps plays through what the
+planner computed for those knots, one step at a time. Its source is `playground/`.
 
 `wasm/` builds the same planner behind a small C interface
 (`wasm/kinetic2_wasm.h`), standalone with no imports and no JS glue:
@@ -166,6 +167,9 @@ cmake --build build-wasm
 
 The output is `build-wasm/wasm/kinetic2.wasm`. Sample with non-decreasing times
 between resets, because sampling retires knots the clock has passed.
+`build-wasm/wasm/kinetic2-trace.wasm` is the same planner with the trace hooks
+in `include/kinetic2/trace.hpp` recording what it computes, for the planner
+steps. Undefined, every hook compiles to nothing.
 
 ## What Kinetic does not do
 
