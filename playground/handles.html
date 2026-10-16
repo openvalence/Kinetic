@@ -3,9 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kinetic² handles</title>
+<title>Kinetic handles: OpenValence</title>
 <meta name="description" content="A funscript as a composite cubic Bezier in the time-position plane: knot classes, handles, and the ceilings as bounds on the handle lengths.">
 <link rel="stylesheet" href="play.css">
+<link rel="stylesheet" href="site-nav.css">
+<script>if (top !== self) document.documentElement.classList.add('framed')</script>
 <style>
   #plotbox { height: clamp(300px, 46vh, 460px); }
   #stripbox { height: 250px; }
@@ -22,6 +24,23 @@
 <script src="handles.js" defer></script>
 </head>
 <body>
+<!-- the openvalence.org header (site repo tools/chrome.html); site-nav.css holds its look -->
+<header class="strip">
+  <a class="brand" href="https://openvalence.org/">
+    <svg viewBox="3 3 24 24" aria-hidden="true"><g fill="none" stroke="#A78BFA" stroke-width="2.75" stroke-linecap="round"><path d="M4.82 16.18A10.25 10.25 0 0 1 10.93 5.59"/><path d="M19.07 5.59A10.25 10.25 0 0 1 25.18 16.18"/><path d="M21.11 23.23A10.25 10.25 0 0 1 8.89 23.23"/></g><g fill="#4DA6FF"><circle cx="15" cy="15" r="4.65"/><circle cx="15" cy="4.75" r="1.85"/><circle cx="23.88" cy="20.12" r="1.85"/><circle cx="6.12" cy="20.12" r="1.85"/></g></svg>
+    <span>OpenValence</span>
+  </a>
+  <nav class="chips" aria-label="Site">
+    <a class="chip" href="https://openvalence.org/valence/">Valence</a>
+    <a class="chip" href="https://openvalence.org/components/" aria-current="page">Components</a>
+    <a class="chip" href="https://openvalence.org/phosphor/">Phosphor</a>
+    <a class="chip" href="https://openvalence.org/diagrams/">Diagrams</a>
+    <a class="chip" href="https://openvalence.org/demos/">Demos</a>
+    <a class="chip util" href="https://openvalence.org/Valence/">Docs</a>
+    <a class="chip" href="https://github.com/openvalence">GitHub</a>
+  </nav>
+  <a class="get" href="https://openvalence.org/downloads/"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></svg>Download</a>
+</header>
 <header class="top">
   <h1>Kinetic² handles</h1>
   <p class="tag">A funscript as a composite cubic Bézier in the time-position plane: the knots on the author's clock, one angle and two handle lengths per knot, and the ceilings as bounds on the lengths.</p>
