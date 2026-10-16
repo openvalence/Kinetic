@@ -18,7 +18,7 @@
   .pill { display: inline-block; padding: 0 6px; border-radius: var(--r); border: 1px solid var(--line-3); font-size: 11px; }
   input[type="file"] { display: none; }
   .kv dd.nudge { color: var(--intent); }
-  .kv dd.bad, .bad { color: var(--hi); }
+  .kv dd.bad, .bad { color: var(--bad); }
 </style>
 <script src="handles-model.js"></script>
 <script src="handles.js" defer></script>
@@ -55,12 +55,15 @@
       <button id="autoall" class="btn" title="Every knot back to auto: class from the chords, G2 where it can be">Auto all</button>
       <button id="fit" class="btn" title="Zoom to the whole script">Fit</button>
       <button id="play" class="btn" title="Play / pause (Space)">Play</button>
+      <button id="steps-toggle" class="btn" aria-pressed="false" title="Play through what the real planner computes for these knots">Show planner steps</button>
       <span id="name" class="muted small"></span>
     </div>
     <div class="plotwrap"><div class="plot" id="plotbox"><canvas id="plot"></canvas><canvas id="overlay"></canvas></div><canvas id="rail" aria-label="Carriage on the rail"></canvas></div>
     <div class="plot" id="stripbox"><canvas id="strips"></canvas><canvas id="soverlay"></canvas></div>
     <p id="readout" class="readout mono">&nbsp;</p>
     <ul class="legend" id="legend"></ul>
+    <section class="card stdiv" id="steps-div" hidden aria-label="Model and planner compared"></section>
+    <section class="card steps" id="steps" hidden aria-label="Planner steps"></section>
   </section>
 
   <aside class="side">

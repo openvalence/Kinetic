@@ -9,7 +9,7 @@
 const M = window.HandlesModel;
 const $ = (s) => document.querySelector(s);
 const C = { bg: '#08090B', l2: '#1D2026', l3: '#272B31', text: '#ECEFF4', t3: '#A8AEB9', muted: '#666C78',
-  blue: '#4DA6FF', violet: '#A78BFA', hi: '#FF5CB3', v: '#5BD48A', a: '#F2A94A', j: '#C9A2FF', red: '#FF5A5A' };
+  blue: '#4DA6FF', violet: '#A78BFA', hi: '#FF5CB3', v: '#5BD48A', a: '#F2A94A', j: '#C9A2FF', red: '#FF4D5E' };   // red: over a ceiling, as on the playground
 const MONO = 'ui-monospace, "SF Mono", Consolas, monospace';
 const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 const CLS = { end: C.muted, rest: C.t3, crest: C.text, through: C.blue };
@@ -30,6 +30,7 @@ function load(doc, label) {
 }
 function update() {
   R = M.render(knots, cfg);
+  showSteps();
   draw(); inspector(); stats(); drawCursor();
 }
 function fitView() {
@@ -122,6 +123,7 @@ function draw() {
     if (k.dp !== 0 || k.pm != null) { ctx.strokeStyle = C.muted; ctx.beginPath(); ctx.arc(x, Y(k.p, h), 3.5, 0, 7); ctx.stroke(); }
     ctx.fillStyle = k.infeasible ? C.red : CLS[k.cls]; ctx.beginPath(); ctx.arc(x, y, i === sel ? 5 : 3.5, 0, 7); ctx.fill();
     if (i === sel) { ctx.strokeStyle = C.text; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, 8, 0, 7); ctx.stroke(); }
+    if (stepsOn && diverged.has(i)) { ctx.strokeStyle = C.red; ctx.lineWidth = 1.5; ctx.setLineDash([2, 2]); ctx.beginPath(); ctx.arc(x, y, 11, 0, 7); ctx.stroke(); ctx.setLineDash([]); }
     if (k.type !== 'auto') { ctx.fillStyle = C.violet; ctx.font = `9px ${MONO}`; ctx.textAlign = 'center'; ctx.fillText(k.type, x, y - 11); }
   });
   ctx.restore();
@@ -363,9 +365,92 @@ new ResizeObserver(() => { draw(); drawCursor(); }).observe(plot);
 new ResizeObserver(() => { drawStrips(); drawCursor(); }).observe(strips);
 $('#legend').innerHTML = [['hold edge', CLS.rest], ['crest', CLS.crest], ['through point', CLS.through], ['nudged handle', C.violet], ['over a ceiling', C.red], ['infeasible knot', C.hi]]
   .map(([n, c]) => `<li><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="${c}"/></svg>${n}</li>`).join('');
+// ---- the planner steps ---------------------------------------------------------
+// The real planner (steps.js over kinetic2-trace.wasm, the playground's) on this
+// page's knots, ceilings and options, in window units (0..1 over the window).
+// Constraints:
+// - Loaded the first time the steps are shown, never on the page's load.
+// - The page draws handles-model.js, not the planner. Every knot where the
+//   planner's last pass ends elsewhere (class, angle, handle lengths, trim,
+//   verdict) is listed above the steps and ringed on the plot; hand-set types
+//   and lengths are not planner inputs and are listed as such. Tolerances: the
+//   parity test's (tests/test_kinetic2_handles.cpp), trims 1e-4 of the window.
+let stepper = null, stepsOn = false, stepsLoading = false, diverged = new Set();
+const SC = { ...C, t2: '#C3C8D1', l1: '#121419', l4: '#33373E', sunken: '#040507', bad: C.red };
+const winOf = () => { const W = cfg.hi - cfg.lo; return { W, w: (p) => (p - cfg.lo) / W }; };
+// The page's script through the planner: the first knot is the origin at rest,
+// every other knot submitted ahead at its time, a hand-set angle as the knot's angle.
+function replayPlanner(T) {
+  const { K, h, dv, sBuf } = T, { W, w } = winOf();
+  const ok = K.kinetic2_configure(h, cfg.vmax / W, cfg.amax / W, cfg.jmax / W, cfg.smoothness, Math.min(0.33, Math.max(0.05, cfg.lfloor)), Math.min(1, Math.max(0, cfg.trim / W)), 4000);
+  if (!ok) $('#status').textContent = 'The planner refused these ceilings or options; the steps show the last ones it took.';
+  const t0 = Math.round(knots[0].t * 1e6);
+  K.kinetic2_reset(h, w(M.pos(knots[0])), t0);
+  for (const k of knots.slice(1)) K.kinetic2_submit(h, Math.round(k.t * 1e6), w(M.pos(k)), k.man.v != null ? 1 : 0, (k.man.v ?? 0) / W, t0, 2);
+  K.kinetic2_solved(h, 0, T.kBuf);
+  const n = Math.round((knots[knots.length - 1].t + 0.3) * 1000) + 1, z = Math.floor(t0 / 1000);
+  const P = new Float32Array(n), V = new Float32Array(n), A = new Float32Array(n), J = new Float32Array(n);
+  let mv = 0, ma = 0, mj = 0, over = 0;
+  for (let i = 0; i < n; i++) {
+    if (i < z) { P[i] = w(M.pos(knots[0])); continue; }   // before the origin the axis rests on it
+    K.kinetic2_sample(h, i * 1000, sBuf);
+    P[i] = dv.getFloat32(sBuf + 8, true); V[i] = dv.getFloat32(sBuf + 12, true); A[i] = dv.getFloat32(sBuf + 16, true);
+    J[i] = i ? (A[i] - A[i - 1]) * 1000 : 0;
+    mv = Math.max(mv, Math.abs(V[i])); ma = Math.max(ma, Math.abs(A[i])); mj = Math.max(mj, Math.abs(J[i]));
+    if (Math.abs(V[i]) > cfg.vmax / W * 1.001 || Math.abs(A[i]) > cfg.amax / W * 1.001 || Math.abs(J[i]) > cfg.jmax / W * 1.001) over++;
+  }
+  return { n, P, V, A, J, max: { v: mv, a: ma, j: mj }, over };
+}
+// Where the model the page draws and the planner's render disagree.
+function diverge() {
+  const box = $('#steps-div'), f = stepper && stepper.final();
+  diverged = new Set();
+  if (!f) { box.hidden = true; return; }
+  const { W } = winOf(), s = f.snap, CL = ['end', 'rest', 'crest', 'through'], rows = [], notIn = [];
+  const n = Math.min(knots.length, s.cls.length);
+  for (let i = 0; i < n; i++) {
+    const k = knots[i], d = [], v = s.vel[i] * W, dp = s.dp[i] * W;
+    if (i > 0 && i < knots.length - 1 && k.cls !== CL[s.cls[i]]) d.push(`class ${k.cls} / ${CL[s.cls[i]]}`);
+    if (k.eff !== 'G0' && Math.abs(k.vIn - v) > 1e-3 * Math.max(1, Math.abs(k.vIn))) d.push(`angle ${k.vIn.toFixed(1)} / ${v.toFixed(1)} mm/s`);
+    if (i > 0 && Math.abs(k.effIn - s.ei[i]) > 1e-3) d.push(`length in ${k.effIn.toFixed(3)} / ${s.ei[i].toFixed(3)}`);
+    if (i < knots.length - 1 && Math.abs(k.effOut - s.eo[i]) > 1e-3) d.push(`length out ${k.effOut.toFixed(3)} / ${s.eo[i].toFixed(3)}`);
+    if (Math.abs(k.dp - dp) > 1e-4 * W) d.push(`trim ${k.dp.toFixed(2)} / ${dp.toFixed(2)} mm`);
+    if (!!k.infeasible !== !!s.inf[i]) d.push(k.infeasible ? 'over in the model only' : 'over in the planner only');
+    if (d.length) { diverged.add(i); rows.push(`<li><span class="mono">knot ${i} · ${(k.t * 1000).toFixed(0)} ms</span> ${d.join(', ')}</li>`); }
+    const hand = [k.type !== 'auto' && `${k.type} by hand`, (k.man.lIn != null || k.man.lOut != null) && 'hand-set lengths', (k.man.vIn != null || k.man.vOut != null) && 'two angles'].filter(Boolean);
+    if (hand.length) notIn.push(`knot ${i}: ${hand.join(', ')}`);
+  }
+  if (knots.length !== s.cls.length) rows.push(`<li>the planner rendered ${s.cls.length} knots, the model ${knots.length}</li>`);
+  const holdW = 0.005 * W;   // solver.hpp kHoldEps, of the window
+  const notes = [Math.abs(cfg.holdEps - holdW) > 1e-9 && `hold eps: the page ${cfg.holdEps} mm, the planner ${holdW.toFixed(2)} mm (0.005 of the window)`].filter(Boolean);
+  box.hidden = false;
+  box.innerHTML = '<h2>Model and planner <span class="muted small">the page draws handles-model.js; the steps are the planner\'s for the same knots</span></h2>'
+    + (rows.length ? `<p class="bad">They differ at ${diverged.size} knot${diverged.size === 1 ? '' : 's'} (model / planner), ringed on the plot:</p><ul class="divs">${rows.join('')}</ul>`
+      : '<p class="ok">They agree at every knot: classes, angles, handle lengths, trims and verdicts.</p>')
+    + (notIn.length ? `<p class="muted small">Not planner inputs, drawn by the model only: ${notIn.join('; ')}.</p>` : '')
+    + (notes.length ? `<p class="muted small">${notes.join('. ')}.</p>` : '')
+    + '<p class="muted small">The planner also keeps to the rail (railStop), trims the last knot and tightens over passes; the model does neither.</p>';
+}
+function showSteps() {
+  $('#steps').hidden = !stepsOn;
+  if (!stepsOn) { $('#steps-div').hidden = true; diverged = new Set(); if (stepper) stepper.pause(); return; }
+  if (stepper) { stepper.update(); diverge(); return; }
+  if (stepsLoading) return;
+  stepsLoading = true;
+  import('./steps.js').then((m) => m.init($('#steps'), {
+    replay: replayPlanner, fit: (cv) => { const d = dims(cv); return { g: d.ctx, w: d.w, h: d.h }; }, C: SC, MONO, SANS,
+    state: () => { const { W } = winOf(); return { o: { vmax: cfg.vmax / W, amax: cfg.amax / W, jmax: cfg.jmax / W } }; },
+    units: () => ({ k: cfg.hi - cfg.lo, off: cfg.lo, pd: 2, vd: 1, pu: ' mm', v: 'mm/s', a: 'mm/s²', j: 'mm/s³' }),
+  })).then((s) => { stepper = s; if (stepsOn) { s.update(); diverge(); draw(); } },
+    (e) => { stepsOn = false; $('#steps').hidden = true; syncStepsToggle(); $('#status').textContent = 'The planner steps did not load (' + e.message + '); they need the page served over http.'; })
+    .finally(() => { stepsLoading = false; });
+}
+function syncStepsToggle() { $('#steps-toggle').setAttribute('aria-pressed', String(stepsOn)); }
+$('#steps-toggle').addEventListener('click', () => { stepsOn = !stepsOn; syncStepsToggle(); update(); });
+
 // for handles.check.mjs
 window.__handles = {
-  state: () => ({ knots, R, sel, view, cfg, cursor, playing }),
+  state: () => ({ knots, R, sel, view, cfg, cursor, playing, diverged: [...diverged] }),
   setWindow,
   xy: (i) => { const r = plot.getBoundingClientRect(); return { x: r.left + X(knots[i].t, r.width), y: r.top + Y(M.pos(knots[i]) + knots[i].dp, r.height) }; },
   handleXY: (i, side) => { const r = plot.getBoundingClientRect(), e = handleEnds(i)[side]; return { x: r.left + X(e[0], r.width), y: r.top + Y(e[1], r.height) }; },

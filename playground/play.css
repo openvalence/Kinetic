@@ -119,3 +119,8 @@ kbd { font: 11px var(--mono); color: var(--text-3); border: 1px solid var(--line
 .strow .mark.bad { background: var(--bad); }
 #steps-toggle[aria-pressed="true"] { border-color: var(--reality); color: var(--text); background: var(--line-3); }
 @media (max-width: 700px) { .stgrid { grid-template-columns: minmax(0, 1fr); } .stpanel { height: 260px; } .stscope, .stlog { height: 236px; } }
+/* the handles page: the model and the planner compared (handles.js diverge) */
+.stdiv p { margin: 4px 0; }
+.stdiv p.ok { color: var(--reality); }
+.stdiv p.bad { color: var(--bad); }
+.stdiv .divs { margin: 4px 0; padding-left: 18px; font-size: 12px; max-height: 168px; overflow-y: auto; color: var(--text-3); }

@@ -115,6 +115,18 @@ Illegal values are red, legal ones blue.
 The trace keeps 131072 records; a window that needs more says so under the
 step list. A Kinetic change that moves a decision moves its hook with it.
 
+The handles page has the same steps, in mm. It draws `handles-model.js`, not the
+planner, so the steps run the planner on the page's knots (the first one the
+origin at rest, a hand-set angle as the knot's angle, the page's ceilings, handle
+floor, max trim and smoothness), and a box above them compares the planner's last
+pass with the model knot by knot: class, angle, handle lengths, trim and verdict,
+within the parity test's tolerances. Knots that differ are listed and ringed on
+the plot. Hand-set types (G0, G1, G2) and hand-set lengths are not planner
+inputs and are listed as such. The built-in script at the default ceilings
+agrees everywhere; the two part where the planner's rail rules, last-knot trim,
+slack passes or hold threshold (0.005 of the window) act, which the model leaves
+out.
+
 ## The handles page
 
 `handles.html` is a second page, pure JS, no wasm: a funscript as a composite

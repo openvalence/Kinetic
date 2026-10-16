@@ -19,6 +19,9 @@ const TWEEN = 420;     // ms from one step's picture to the next
 const DWELL = { 0: 1500, 1: 650 };   // ms a step holds while playing, by depth, at 1x
 
 let api, C, MONO, SANS, W, host, el = {};
+// Units shown: the trace is in window units; a page in mm passes api.units() (k mm
+// per window, off the window's low end), which only rescales what is printed.
+let U = { k: 1, off: 0, pd: 4, vd: 3, pu: '', v: 'u/s', a: 'u/s²', j: 'u/s³' };
 let solves = [], solveIx = 0, picked = -1, steps = [], idx = 0, everyJudge = false, R = null, cfg = null;
 let shown = null, from = null, to = null, t0 = 0, playing = false, lastTick = 0, held = 0, raf = 0, ride0 = 0;
 let curveBuf = 0;
@@ -36,12 +39,14 @@ export async function init(root, a) {
   W = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24) };
   curveBuf = K.malloc(CURVE_N * 4);
   build();
-  return { update, pause: () => setPlaying(false) };
+  // final(): the knots as the last pass of the shown solve left them (trace units), for a page that compares
+  return { update, pause: () => setPlaying(false), final: () => { const s = [...steps].reverse().find((x) => x.snap); return s ? { snap: s.snap, run: s.run } : null; } };
 }
 
 // ---- the trace ---------------------------------------------------------------
 function update() {
   const K = W.K;
+  if (api.units) U = { ...U, ...api.units() };
   K.kinetic2_trace_clear();
   R = api.replay(W);
   const n = K.kinetic2_trace_count(), base = K.kinetic2_trace_records() >> 2;
@@ -109,8 +114,8 @@ function stepsOf(rs) {
         const o = run.knots[0];
         push({ kind: 'knots', stage: 0, ri: r, title: `Knots in: ${me - 1} after the origin`, lines: [
           [`> ${me - 1} knot${me === 2 ? '' : 's'} to render, ${fx(run.knots[me - 1].t, 3)} s ahead`, 'head'],
-          [`  origin at p ${fx(o.p, 4)}, ${o.v ? 'moving ' + fx(o.v, 3) + ' u/s' : 'at rest'}`],
-          [`  ceilings v ${num(cfg.lim[0])}  a ${num(cfg.lim[1])}  j ${num(cfg.lim[2])}`],
+          [`  origin at p ${Pu(o.p)}${U.pu}, ${o.v ? 'moving ' + Vu(o.v) + ' ' + U.v : 'at rest'}`],
+          [`  ceilings v ${Nu(cfg.lim[0])}  a ${Nu(cfg.lim[1])}  j ${Nu(cfg.lim[2])}`],
           ...(m > me ? [['  + a provisional successor: the newest knot renders through', 'muted']] : []),
           ['  time and position only, every knot on its own time']] });
         r += m;
@@ -140,7 +145,7 @@ function stepsOf(rs) {
           const thru = cur.cls.findIndex((c, i) => c === 3 && !run.knots[i].hasV);
           if (ph === 0) push({ kind: 'angles', stage: 2, ri: r, knot: thru >= 0 ? thru : null, terms: terms[thru] || null, title: `Start angles: ${smooth ? 'Makima' : 'pchip'}`, lines: [
             [`> through points: ${smooth ? "Makima's angle" : "pchip's weighted harmonic mean"}`, 'head'],
-            ...(terms[thru] ? [[`  knot ${thru}: chords ${fx(terms[thru].dIn, 3)}, ${fx(terms[thru].dOut, 3)} → ${fx(terms[thru].r, 3)} u/s`]] : []),
+            ...(terms[thru] ? [[`  knot ${thru}: chords ${Vu(terms[thru].dIn)}, ${Vu(terms[thru].dOut)} → ${Vu(terms[thru].r)} ${U.v}`]] : []),
             ['  crests, hold edges and ends: zero slope'],
             ['  an authored angle is kept, each held to vmax']] });
           else if (!swept) push({ kind: 'sweeps', stage: 3, ri: r, title: `G2 sweeps (${smooth ? 'smooth' : 'pchip'})`, lines: [
@@ -163,8 +168,8 @@ function stepsOf(rs) {
         const moved = sweep.filter((q) => q.v !== q.v0), top = (moved.length ? moved : sweep).reduce((a, b) => (Math.abs(b.v - b.v0) > Math.abs(a.v - a.v0) ? b : a));
         if (detailed()) push({ kind: 'sweep', stage: 3, ri: r, knot: top.i, sweep: top, title: `G2 sweep ${e.s + 1} of 4: ${moved.length} angle${moved.length === 1 ? '' : 's'} moved`, lines: [
           ...(e.s === 0 ? [['> G2 sweeps: match the acceleration both sides', 'head']] : []),
-          ...moved.slice(0, 3).map((q) => [`  knot ${q.i}: ${fx(q.v0, 3)} → ${fx(q.v, 3)} u/s, a ${num(q.aL)} | ${num(q.aR)}`]),
-          [moved.length ? `  knot ${top.i}: left ${num(top.aL0)} → ${num(top.aL)}, right ${num(top.aR0)} → ${num(top.aR)}` : '  no angle moved: settled', moved.length ? '' : 'ok']] });
+          ...moved.slice(0, 3).map((q) => [`  knot ${q.i}: ${Vu(q.v0)} → ${Vu(q.v)} ${U.v}, a ${Nu(q.aL)} | ${Nu(q.aR)}`]),
+          [moved.length ? `  knot ${top.i}: left ${Nu(top.aL0)} → ${Nu(top.aL)}, right ${Nu(top.aR0)} → ${Nu(top.aR)}` : '  no angle moved: settled', moved.length ? '' : 'ok']] });
         sweep = [];
         break;
       }
@@ -208,7 +213,7 @@ function stepsOf(rs) {
         if (detailed()) {
           const n = piece.judges.length, why = overWhy(j);
           push({ kind: 'judge', stage: 4, depth: 1, ri: r, focus: piece.i, piece, judge: j, n, title: `Piece ${piece.i}→${piece.i + 1} · k ${fx(j.k, 2)} · ${j.legal ? 'legal' : 'over'}`, lines: [
-            ...(n === 1 ? [[`> piece ${piece.i}→${piece.i + 1}: ${fx(j.D, 4)} in ${ms(j.T)} ms${j.retry ? ', without the end ask' : ''}`, 'head'], ['  scale both handles by k, nearest 1 first']] : []),
+            ...(n === 1 ? [[`> piece ${piece.i}→${piece.i + 1}: ${Lu(j.D)}${U.pu} in ${ms(j.T)} ms${j.retry ? ', without the end ask' : ''}`, 'head'], ['  scale both handles by k, nearest 1 first']] : []),
             [`  k ${fx(j.k, 2)}: handles ${fx(j.i0, 3)}, ${fx(j.i1, 3)}`],
             [j.legal ? `  legal: v ×${fx(j.rv, 3)}, a ×${fx(j.ra, 3)}, j ×${fx(j.rj, 3)}` : `  over: ${why}`, j.legal ? 'ok' : 'bad']] });
         }
@@ -226,7 +231,7 @@ function stepsOf(rs) {
           const what = x.a === 1 ? 'the full move' : x.a < 30 ? `halving ${x.a - 9}` : x.a < 40 ? `quarter ${x.a - 30}` : 'flat at the previous knot';
           push({ kind: 'trial', stage: 4, depth: 1, ri: r, focus: piece.i, piece, fit: ft, bracket: piece.bracket && piece.bracket.slice(), title: `Piece ${piece.i}→${piece.i + 1} · trim, ${what} · ${ft.legal ? 'legal' : 'over'}`, lines: [
             ...(x.a === 1 ? [['> no factor is legal: trim toward the previous knot', 'head'], ['  the time stays; the position moves']] : []),
-            [`  ${what}: move ${fx(move, 4)}, keeps ${pc(keep)}`],
+            [`  ${what}: move ${Lu(move)}${U.pu}, keeps ${pc(keep)}`],
             [ft.legal ? `  legal at k ${fx(ft.k, 2)} (${ft.judged} judged)` : `  over ×${fx(ft.o, 3)} (${ft.judged} judged)`, ft.legal ? 'ok' : 'bad']] });
         }
         break;
@@ -238,7 +243,7 @@ function stepsOf(rs) {
         push({ kind: 'piece', stage: 4, ri: r, focus: i, piece, end: e, title: `Piece ${i}→${i + 1}: ${e.legal ? (e.dp ? `trimmed, keeps ${pc(keep)}` : `k ${fx(e.k, 2)}, legal`) : `over ×${fx(e.o, 3)}`}`, lines: [
           [`> piece ${i}→${i + 1}: ${piece.judges.length} factor${piece.judges.length === 1 ? '' : 's'} judged${piece.fits.length ? `, ${piece.fits.length} trim tests` : ''}`, 'head'],
           [`  handles ${fx(e.i0, 3)}, ${fx(e.i1, 3)} at k ${fx(e.k, 2)}`],
-          ...(e.dp ? [[`  knot ${i + 1} moved ${fx(Math.abs(e.dp), 4)} toward knot ${i}`]] : []),
+          ...(e.dp ? [[`  knot ${i + 1} moved ${Lu(Math.abs(e.dp))}${U.pu} toward knot ${i}`]] : []),
           [e.legal ? '  legal' : `  no trim keeps it inside: least over ×${fx(e.o, 3)}`, e.legal ? 'ok' : 'bad']] });
         break;
       }
@@ -268,12 +273,12 @@ function stepsOf(rs) {
           const n = x.c - x.b, last = rs[r + n - 1];
           push({ kind: 'chase', stage: 5, ri: r, title: `Chase: ${n} sample${n === 1 ? '' : 's'}, one move to rest`, lines: [
             ['> position-only samples: the chase', 'head'],
-            [`  one fastest legal move to rest on the newest, p ${fx(last.f[1], 4)}`],
+            [`  one fastest legal move to rest on the newest, p ${Pu(last.f[1])}${U.pu}`],
             [`  lands at ${fx(last.f[0], 3)} s${last.f[5] > 0 ? `, ${ms(last.f[5])} ms late` : ''}`, last.f[6] ? 'bad' : 'ok']] });
         }
         break;
       case KD.HARD:
-        push({ kind: 'hard', stage: 5, ri: r, title: `Live jog to ${fx(f[1], 4)}`, lines: [
+        push({ kind: 'hard', stage: 5, ri: r, title: `Live jog to ${Pu(f[1])}${U.pu}`, lines: [
           ['> a live jog: the fastest move to rest on it', 'head'],
           [`  lands at ${fx(f[0], 3)} s${f[3] > 0 ? `, ${ms(f[3])} ms past its time` : ''}`],
           [x.b ? `  over ×${fx(f[2], 3)}` : '  legal', x.b ? 'bad' : 'ok']] });
@@ -289,7 +294,7 @@ function changed(out, now, key, what) {
   if (!prev) return [];
   const moved = now.map((v, i) => [i, prev.snap[key][i], v]).filter(([, a, b]) => a !== b);
   if (!moved.length) return [[`  no ${what} moved`]];
-  return moved.slice(0, 4).map(([i, a, b]) => [`  knot ${i}: ${what} ${fx(a, 3)} → ${fx(b, 3)} u/s`]).concat(moved.length > 4 ? [[`  and ${moved.length - 4} more`]] : []);
+  return moved.slice(0, 4).map(([i, a, b]) => [`  knot ${i}: ${what} ${Vu(a)} → ${Vu(b)} ${U.v}`]).concat(moved.length > 4 ? [[`  and ${moved.length - 4} more`]] : []);
 }
 
 function overWhy(j) {
@@ -301,7 +306,7 @@ function overWhy(j) {
 function samplesStep() {
   return { kind: 'samples', stage: 6, depth: 0, ri: Infinity, snap: null, title: 'The 1 ms samples', lines: [
     ['> the engine samples the built pieces every 1 ms', 'head'],
-    [`  ${R.n} samples · peaks v ${num(R.max.v)} a ${num(R.max.a)} j ${num(R.max.j)}`],
+    [`  ${R.n} samples · peaks v ${Nu(R.max.v)} a ${Nu(R.max.a)} j ${Nu(R.max.j)}`],
     [R.over ? `  ${R.over} samples over a ceiling` : '  every sample within its ceilings', R.over ? 'bad' : 'ok']] };
 }
 
@@ -485,7 +490,8 @@ function setPlaying(on) {
 const fx = (x, d) => (Number.isFinite(x) ? x.toFixed(d) : String(x));
 const ms = (s) => Math.round(s * 1000);
 const pc = (x) => (x * 100).toFixed(x > 0.999 || x < 0.001 ? 0 : 1) + '%';
-const num = (v) => { const a = Math.abs(v); return a >= 1e4 ? (v / 1000).toFixed(0) + 'k' : a >= 1000 ? (v / 1000).toFixed(1) + 'k' : a >= 10 ? v.toFixed(0) : a >= 1 ? v.toFixed(1) : v.toFixed(2); };
+const Pu = (x) => fx(U.off + x * U.k, U.pd), Lu = (x) => fx(x * U.k, U.pd), Vu = (x) => fx(x * U.k, U.vd), Nu = (x) => num(x * U.k);
+const num = (v) => { const a = Math.abs(v); return a >= 1e6 ? (v / 1e6).toFixed(a >= 1e7 ? 0 : 1) + 'M' : a >= 1e4 ? (v / 1000).toFixed(0) + 'k' : a >= 1000 ? (v / 1000).toFixed(1) + 'k' : a >= 10 ? v.toFixed(0) : a >= 1 ? v.toFixed(1) : v.toFixed(2); };
 let BAD;   // play.js C.bad: over a ceiling
 const okc = (ok) => (ok ? C.blue : BAD);
 
@@ -519,7 +525,7 @@ function drawCurve(v, now) {
   for (const p of [lo, hi]) { g.beginPath(); g.moveTo(x0, Y(p) + 0.5); g.lineTo(x1, Y(p) + 0.5); g.stroke(); }
   g.setLineDash([]);
   g.fillStyle = C.muted; g.font = '10px ' + MONO; g.textAlign = 'right'; g.textBaseline = 'middle';
-  g.fillText(String(+lo.toFixed(2)), x0 - 6, Y(lo)); g.fillText(String(+hi.toFixed(2)), x0 - 6, Y(hi));
+  g.fillText(String(+(U.off + lo * U.k).toFixed(2)), x0 - 6, Y(lo)); g.fillText(String(+(U.off + hi * U.k).toFixed(2)), x0 - 6, Y(hi));
   g.textAlign = 'center'; g.textBaseline = 'top';
   for (const t of [0, tEnd / 2, tEnd]) g.fillText(fx(t + t0of(), 2) + ' s', Math.min(x1 - 14, Math.max(x0 + 14, X(t))), y1 + 6);
   const k = v.k;
@@ -588,7 +594,7 @@ function drawCurve(v, now) {
       g.globalAlpha = v.aAng * (1 - v.reveal); g.strokeStyle = k.cls[i] === 3 ? C.blue : C.text; g.lineWidth = 2.2; g.lineCap = 'round';
       g.beginPath(); g.moveTo(x - dx * L, yr - dy * L); g.lineTo(x + dx * L, yr + dy * L); g.stroke(); g.lineCap = 'butt'; g.globalAlpha = 1;
     }
-    if (v.aCls > 0 && k.cls[i] >= 0 && n <= 40) {
+    if (v.aCls > 0 && k.cls[i] >= 0 && n <= 40 && (x1 - x0) / n > 26) {
       g.globalAlpha = v.aCls * (1 - v.reveal); g.fillStyle = k.cls[i] === 3 ? C.blue : C.t3; g.font = '10px ' + MONO; g.textAlign = 'center';
       const up = i > 0 && i + 1 < n && P(i) > (P(i - 1) + P(i + 1)) / 2;
       g.textBaseline = up ? 'bottom' : 'top';
@@ -631,7 +637,7 @@ function detailPiece(g, w, hh, d, s) {
   const X = (t) => x0 + (t - ta) / (tb - ta) * (x1 - x0), Y = (p) => y1 - (p - pa) / (pb - pa) * (y1 - y0);
   const c = d.cp;
   g.fillStyle = C.muted; g.font = '10px ' + MONO; g.textAlign = 'right'; g.textBaseline = 'middle';
-  g.fillText(fx(pb, 3), x0 - 6, y0 + 4); g.fillText(fx(pa, 3), x0 - 6, y1 - 4);
+  g.fillText(Pu(pb), x0 - 6, y0 + 4); g.fillText(Pu(pa), x0 - 6, y1 - 4);
   // the knot's time stays
   g.strokeStyle = C.l3; g.setLineDash([2, 4]); g.lineWidth = 1;
   g.beginPath(); g.moveTo(X(c[6]), y0); g.lineTo(X(c[6]), y1); g.stroke(); g.setLineDash([]);
@@ -699,15 +705,15 @@ function detailAngle(g, w, hh, d, s) {
   const L = [];
   if (s.terms) {
     const q = s.terms;
-    L.push([`chords ${fx(q.dIn, 3)} and ${fx(q.dOut, 3)} u/s, spans ${ms(q.h1)} and ${ms(q.h2)} ms`, C.t3]);
-    L.push([`weights ${fx(q.w1, 3)}, ${fx(q.w2, 3)}: pchip ${fx(q.r, 3)} u/s`, C.blue]);
+    L.push([`chords ${Vu(q.dIn)} and ${Vu(q.dOut)} ${U.v}, spans ${ms(q.h1)} and ${ms(q.h2)} ms`, C.t3]);
+    L.push([`weights ${fx(q.w1, 3)}, ${fx(q.w2, 3)}: pchip ${Vu(q.r)} ${U.v}`, C.blue]);
   } else if (s.sweep) {
     const q = s.sweep, ok = Math.abs(q.aL - q.aR) <= 1e-3 * Math.max(1, Math.abs(q.aL));
-    L.push([`a from the left  ${num(q.aL0)} → ${num(q.aL)}`, ok ? C.blue : C.t3]);
-    L.push([`a from the right ${num(q.aR0)} → ${num(q.aR)}`, ok ? C.blue : C.t3]);
-    L.push([`angle ${fx(q.v0, 3)} → ${fx(q.v, 3)} u/s`, C.text]);
-    L.push([`band ${fx(q.lo, 2)} to ${fx(q.hi, 2)}${q.raw < q.lo || q.raw > q.hi ? `, held from ${fx(q.raw, 3)}` : ''}`, C.muted]);
-  } else L.push([`angle ${fx(d.v, 3)} u/s`, C.text]);
+    L.push([`a from the left  ${Nu(q.aL0)} → ${Nu(q.aL)}`, ok ? C.blue : C.t3]);
+    L.push([`a from the right ${Nu(q.aR0)} → ${Nu(q.aR)}`, ok ? C.blue : C.t3]);
+    L.push([`angle ${Vu(q.v0)} → ${Vu(q.v)} ${U.v}`, C.text]);
+    L.push([`band ${Vu(q.lo)} to ${Vu(q.hi)}${q.raw < q.lo || q.raw > q.hi ? `, held from ${Vu(q.raw)}` : ''}`, C.muted]);
+  } else L.push([`angle ${Vu(d.v)} ${U.v}`, C.text]);
   L.forEach(([t, c], j) => { g.fillStyle = c; g.fillText(t, 12, y1 + 12 + j * 17); });
 }
 
@@ -731,8 +737,8 @@ function detailTable(g, w, hh, v, s) {
   g.font = '12px ' + MONO;
   for (let r = 0; r < Math.min(rows, n); r++) {
     const i = start + r, y = 46 + r * 17;
-    const vals = [String(i), fx(k.t[i], 3), fx(k.p[i], 4), i === 0 ? 'origin' : k.cls[i] >= 0 ? CLS[k.cls[i]] : '', fx(k.vel[i], 3),
-      fx(k.ei[i], 3), fx(k.eo[i], 3), k.dp[i] ? fx(k.dp[i], 4) : ''];
+    const vals = [String(i), fx(k.t[i], 3), Pu(k.p[i]), i === 0 ? 'origin' : k.cls[i] >= 0 ? CLS[k.cls[i]] : '', Vu(k.vel[i]),
+      fx(k.ei[i], 3), fx(k.eo[i], 3), k.dp[i] ? Lu(k.dp[i]) : ''];
     cols.forEach(([, x], ci) => {
       const moved = prev && ((ci === 4 && prev.vel[i] !== k.vel[i]) || (ci === 7 && prev.dp[i] !== k.dp[i]));
       g.fillStyle = ci === 7 && k.inf[i] ? BAD : moved && hot.includes(ci) ? C.text : hot.includes(ci) ? C.blue : C.t3;
@@ -764,7 +770,7 @@ function detailResult(g, w, hh, v) {
   cols.forEach(([nm, x]) => { g.fillStyle = C.muted; g.fillText(nm, x, 28); });
   g.font = '12px ' + MONO;
   e.slice(0, rows).forEach((q, r) => {
-    const y = 46 + r * 17, vals = [String(q.r), fx(q.t, 3), fx(q.p, 4), fx(q.v, 3), fx(q.a, 1), pc(q.share), fx(q.worst, 3)];
+    const y = 46 + r * 17, vals = [String(q.r), fx(q.t, 3), Pu(q.p), Vu(q.v), Nu(q.a), pc(q.share), fx(q.worst, 3)];
     cols.forEach(([, x], ci) => { g.fillStyle = ci === 6 && q.fl & 2 ? BAD : ci === 5 && q.share < 0.999 ? C.text : C.t3; g.fillText(vals[ci], x, y); });
   });
   if (e.length > rows) { g.fillStyle = C.muted; g.font = '10px ' + MONO; g.textAlign = 'left'; g.fillText(`${rows} of ${e.length}`, 12, hh - 16); }
@@ -786,7 +792,7 @@ function detailStrip(g, w, hh, now) {
   g.strokeStyle = C.text; g.beginPath(); g.moveTo(x0 + 32 * pxms, y0); g.lineTo(x0 + 32 * pxms, y1); g.stroke();
   g.fillStyle = C.t2; g.font = '12px ' + MONO; g.textAlign = 'left'; g.textBaseline = 'top';
   const i = Math.max(0, Math.min(R.n - 1, ic));
-  g.fillText(`${i} ms   p ${fx(R.P[i], 4)}   v ${fx(R.V[i], 3)}   a ${fx(R.A[i], 1)}`, x0, y1 + 12);
+  g.fillText(`${i} ms   p ${Pu(R.P[i])}   v ${Vu(R.V[i])}   a ${Nu(R.A[i])}`, x0, y1 + 12);
 }
 
 function drawScope(v, now) {
@@ -828,7 +834,7 @@ function drawScope(v, now) {
     const over = ratio > 1 + TOL;
     g.textAlign = 'left'; g.fillStyle = over ? BAD : C.blue; g.font = (over ? '600 ' : '') + '14px ' + MONO;
     g.fillText('×' + fx(ratio, 3), x1 + 10, yc - 7);
-    g.fillStyle = C.muted; g.font = '10px ' + MONO; g.fillText(num(ratio * lims[r]) + ' / ' + num(lims[r]), x1 + 10, yc + 9);
+    g.fillStyle = C.muted; g.font = '10px ' + MONO; g.fillText(Nu(ratio * lims[r]) + ' / ' + Nu(lims[r]), x1 + 10, yc + 9);
   });
 }
 
@@ -914,7 +920,7 @@ function build() {
   host.addEventListener('keydown', (ev) => {
     if (ev.target.tagName === 'SELECT' || (ev.target.tagName === 'INPUT' && ev.target.type !== 'range' && ev.target.type !== 'checkbox')) return;
     const k = { ArrowLeft: -1, ArrowRight: 1, Home: -Infinity, End: Infinity }[ev.key];
-    if (k != null) { ev.preventDefault(); setPlaying(false); go(k === -Infinity ? 0 : k === Infinity ? steps.length - 1 : idx + k); }
+    if (k != null) { ev.preventDefault(); ev.stopPropagation(); setPlaying(false); go(k === -Infinity ? 0 : k === Infinity ? steps.length - 1 : idx + k); }
     else if (ev.code === 'Space') { ev.preventDefault(); ev.stopPropagation(); setPlaying(!playing); }
   });
   new ResizeObserver(() => { if (shown) { draw(shown, performance.now()); list(false); } }).observe(host);

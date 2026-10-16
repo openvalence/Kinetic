@@ -3,7 +3,7 @@
 // Run: node playground/handles.check.mjs
 //   PLAYWRIGHT_DIR: a node_modules holding playwright (default ../Phosphor/node_modules)
 //   SHOTS_DIR: where the screenshots go (default the OS temp dir)
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -71,7 +71,10 @@ try { chromium = createRequire(join(pwDir, 'noop.js'))('playwright').chromium; }
 if (chromium) {
   const shots = process.env.SHOTS_DIR || join(tmpdir(), 'kinetic2-playground');
   mkdirSync(shots, { recursive: true });
-  const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
+  const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm' };
+  // the planner steps need the trace build (README.md "Playground and WebAssembly")
+  const traceWasm = process.env.KINETIC2_TRACE_WASM || resolve(here, '../build-wasm/wasm/kinetic2-trace.wasm');
+  if (existsSync(traceWasm)) copyFileSync(traceWasm, join(here, 'kinetic2-trace.wasm'));
   const server = createServer((req, res) => {
     const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
     const file = resolve(here, '.' + path);
@@ -83,9 +86,10 @@ if (chromium) {
   const url = `http://127.0.0.1:${server.address().port}/handles.html`;
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-  const errors = [];
+  const errors = [], requested = [];
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   page.on('pageerror', (e) => errors.push(String(e)));
+  page.on('request', (r) => requested.push(new URL(r.url()).pathname));
   await page.goto(url);
   await page.waitForFunction(() => window.__handles && window.__handles.state().R);
   const st = () => page.evaluate(() => { const s = window.__handles.state(); return { n: s.knots.length, sel: s.sel, type: s.sel == null ? null : s.knots[s.sel].type, man: s.sel == null ? null : s.knots[s.sel].man, report: s.report, over: s.R.report.overPieces, infeasible: s.R.report.infeasible, trimmed: s.knots.filter((k) => k.dp !== 0).length, nudged: s.knots.filter((k) => Math.abs(k.effIn - k.lIn) > 1e-6 || Math.abs(k.effOut - k.lOut) > 1e-6).length }; });
@@ -118,6 +122,43 @@ if (chromium) {
   check(play.playing && play.cursor > 0.2, `page: playback runs (cursor at ${(play.cursor * 1000).toFixed(0)} ms after 400 ms)`);
   await page.click('#play');
   await page.screenshot({ path: join(shots, 'handles-1280.png') });
+
+  // the planner steps: never fetched while off; on, the real planner's trace of
+  // these knots, and every knot where the model the page draws differs, flagged
+  check(!requested.some((p) => /steps\.js|kinetic2-trace\.wasm/.test(p)), 'page: the planner steps are not fetched while off');
+  if (existsSync(join(here, 'kinetic2-trace.wasm'))) {
+    const dv = () => page.evaluate(() => ({ n: window.__k2steps.steps.length, idx: window.__k2steps.idx, kinds: [...new Set(window.__k2steps.steps.map((s) => s.kind))], div: window.__handles.state().diverged, box: document.querySelector('#steps-div').innerText }));
+    await page.click('#sample');
+    await page.evaluate(() => window.__handles.setWindow(0, 100));
+    await page.fill('#c-trim', '100'); await page.dispatchEvent('#c-trim', 'change');
+    await page.click('#steps-toggle');
+    await page.waitForFunction(() => window.__k2steps);
+    let d = await dv();
+    check(d.n > 20 && ['classify', 'sweep', 'judge', 'piece', 'result', 'samples'].every((k) => d.kinds.includes(k)) && d.div.length === 0 && /agree at every knot/.test(d.box),
+      `page steps: the built-in script, ${d.n} steps; the model and the planner agree at every knot`);
+    await page.click('#st-next'); await page.click('#st-next');
+    d = await dv(); check(d.idx === 2, `page steps: Next walks the steps (step ${d.idx + 1})`);
+    await page.fill('#c-vmax', '400'); await page.dispatchEvent('#c-vmax', 'change');
+    d = await dv();
+    check(d.div.length > 0 && /differ at \d+ knot/.test(d.box) && d.kinds.includes('trial'), `page steps: at 400 mm/s the planner trims elsewhere than the model at ${d.div.length} knots, listed and ringed (${d.div.join(', ')})`);
+    await page.click('#k-auto').catch(() => {});
+    const k3 = await page.evaluate(() => window.__handles.xy(3));
+    await page.mouse.click(k3.x, k3.y);
+    await page.selectOption('#k-type', 'G0');
+    d = await dv(); check(/Not planner inputs.*knot 3: G0 by hand/s.test(d.box), 'page steps: a G0 knot is listed as no input of the planner');
+    await page.click('#autoall');
+    await page.fill('#c-vmax', '1000'); await page.dispatchEvent('#c-vmax', 'change');
+    for (const [w, h] of [[1280, 720], [1920, 1080], [390, 844]]) {
+      await page.setViewportSize({ width: w, height: h });
+      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+      const sc = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
+      check(sc, `page steps at ${w}x${h}: no horizontal scroll`);
+      await page.screenshot({ path: join(shots, `handles-steps-${w}.png`), fullPage: true });
+    }
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.click('#steps-toggle');
+    check(await page.evaluate(() => document.querySelector('#steps').hidden && document.querySelector('#steps-div').hidden), 'page steps: toggled off, both panels hide');
+  } else console.log('skip  page steps: no kinetic2-trace.wasm (build the kinetic2_trace_wasm target)');
   await page.setViewportSize({ width: 400, height: 900 });
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
   const wide = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
