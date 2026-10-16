@@ -13,6 +13,8 @@
 #include <cstdint>
 
 namespace k2t {
+template <class K> void pchip(int i, const K& m, float h1, float h2, float w1, float w2, float r);
+void sweep(int s, int i, float AL, float BL, float AR, float BR, float lo, float hi, float v);
 template <class K> void style(const K* k, int n, bool smooth, int phase);
 template <class K> void round(const K* k, int n, int tag, int r);
 template <class K> void piece(int i, bool hit, const K& L, const K& R, float pL);
@@ -29,6 +31,8 @@ template <class O> void hard(std::size_t i, const O& o);
 inline int phase = 0, retry = 0, judged = 0;
 }  // namespace k2t
 
+#define K2T_PCHIP(i, m, h1, h2, w1, w2, r) k2t::pchip(i, m, h1, h2, w1, w2, r)
+#define K2T_SWEEP(s, i, AL, BL, AR, BR, lo, hi, v) k2t::sweep(s, i, AL, BL, AR, BR, lo, hi, v)
 #define K2T_STYLE(k, n, smooth, ph) k2t::style(k, n, smooth, ph)
 #define K2T_ROUND(k, n, tag, r) k2t::round(k, n, tag, r)
 #define K2T_PIECE(i, hit, L, R, pL) k2t::piece(i, hit, L, R, pL)
@@ -59,6 +63,7 @@ namespace h = kinetic2::handles;
 enum : int32_t {
     K_SOLVE = 1, K_RUN = 2, K_RKNOT = 3, K_PASS = 4, K_STYLE = 5, K_KNOT = 6, K_ROUND = 7, K_PIECE = 8,
     K_JUDGE = 9, K_FIT = 10, K_PIECE_END = 11, K_PASS_END = 12, K_BUILT = 13, K_EMIT = 14, K_CHASE = 15, K_HARD = 16,
+    K_PCHIP = 17, K_SWEEP = 18,
 };
 inline constexpr uint32_t kCap = 131072;
 static kinetic2_trace_rec g_rec[kCap];
@@ -88,7 +93,26 @@ void knots(const K* k, int n) {
              m.slack[0], m.slack[1], m.slack[2], m.rail, m.v);
     }
 }
-template <class K> void style(const K* k, int n, bool smooth, int ph) { put(K_STYLE, ph, smooth, n); knots(k, n); }
+template <class K> void pchip(int i, const K& m, float h1, float h2, float w1, float w2, float r) {
+    fill(put(K_PCHIP, i), h1, h2, w1, w2, m.dIn, m.dOut, r);
+}
+// Each knot's angle as the last hook saw it: a sweep's angle before is the
+// start angle (style, phase 0) or the sweep before it (solveStyle changes a
+// through point's angle only there).
+static float g_vel[kinetic2::kWindowKnots + 2];
+// One sweep at a through point: the closed form (the planner's own operands),
+// the band, the angle before and after, and the acceleration each side of the
+// knot reaches at each (AL + BL v from the left piece, AR + BR v from the right).
+void sweep(int s, int i, float AL, float BL, float AR, float BR, float lo, float hi, float v) {
+    const float v0 = g_vel[i];
+    g_vel[i] = v;
+    fill(put(K_SWEEP, s, i), (AR - AL) / (BL - BR), lo, hi, v0, v, AL + BL * v0, AR + BR * v0, AL + BL * v, AR + BR * v);
+}
+template <class K> void style(const K* k, int n, bool smooth, int ph) {
+    put(K_STYLE, ph, smooth, n);
+    knots(k, n);
+    for (int i = 0; i < n && i < int(kinetic2::kWindowKnots + 2); ++i) g_vel[i] = k[i].vel;
+}
 template <class K> void round(const K* k, int n, int tag, int r) { put(K_ROUND, tag, r, n); knots(k, n); }
 template <class K> void piece(int i, bool hit, const K& L, const K& R, float pL) {
     phase = 0; retry = 0; judged = 0;

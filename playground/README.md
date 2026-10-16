@@ -89,7 +89,8 @@ The steps, in the planner's order (`handles.hpp` render, `solver.hpp` renderRun)
 | --- | --- |
 | Knots in | the run's knots, the origin's state, the ceilings |
 | Classify | end, hold edge, crest or through point, from the chords |
-| Start angles, G2 sweeps | pchip or Makima angles, then the sweeps; a mid smoothness shows both solves and the blend |
+| Start angles | pchip or Makima angles; a through point up close with pchip's spans, weights and result |
+| G2 sweep n of 4 | the angles each sweep moves, the acceleration from each side meeting, the monotone band; a mid smoothness shows both solves and the blend |
 | Every handle a third | the solved lengths, before any ceiling |
 | Piece, k | one length factor judged: v, a and j over u with the judge's 11 samples and turning points, the factor grid |
 | Piece, trim | one trim test: the full move, a halving, a quarter, or flat; the bracket of the bisection |

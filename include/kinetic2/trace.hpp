@@ -3,7 +3,7 @@
 // Constraints:
 // - Undefined, a hook is ((void)0) and its arguments are never evaluated:
 //   firmware compiles to the same code with or without these lines.
-// - A build that defines one defines all fifteen, before any kinetic2 header
+// - A build that defines one defines all seventeen, before any kinetic2 header
 //   (wasm/kinetic2_trace.cpp, the playground's planner steps). A hook only
 //   reads: it never writes planner state, never moves a decision.
 // - No thread_local, no heap, no static locals behind a hook here; a tracing
@@ -13,6 +13,8 @@
 
 #ifndef K2T_SOLVE
 // handles.hpp
+#define K2T_PCHIP(i, m, h1, h2, w1, w2, r) ((void)0)           // pchipAngle: its spans, weights and result
+#define K2T_SWEEP(s, i, AL, BL, AR, BR, lo, hi, v) ((void)0)   // solveStyle: one G2 sweep at a through point, v the new angle
 #define K2T_STYLE(k, n, smooth, phase) ((void)0)              // solveStyle: 0 the start angles, 1 after the G2 sweeps
 #define K2T_ROUND(k, n, tag, round) ((void)0)                 // render: 0/2 after a solve, 1/3 after a nudge
 #define K2T_PIECE(i, hit, L, R, pL) ((void)0)                 // nudge: piece i, memo hit or fit

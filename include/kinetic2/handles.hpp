@@ -513,7 +513,9 @@ inline float pchipAngle(const HKnot* k, int i) {
     if (m.dIn * m.dOut <= 0.0f) return 0.0f;
     const float h1 = m.t - k[i - 1].t, h2 = k[i + 1].t - m.t;
     const float w1 = 2.0f * h2 + h1, w2 = h2 + 2.0f * h1;
-    return (w1 + w2) / (w1 / m.dIn + w2 / m.dOut);
+    const float r = (w1 + w2) / (w1 / m.dIn + w2 / m.dOut);
+    K2T_PCHIP(i, m, h1, h2, w1, w2, r);
+    return r;
 }
 
 // Makima's angle (Akima with the modified weights), chords padded at the ends.
@@ -574,6 +576,7 @@ inline void solveStyle(HKnot* k, int n, const Cfg& c, bool withDp, bool smooth) 
                 float lo, hi;
                 band(m, lo, hi);
                 m.vel = capV(m, clampV(std::fmin(hi, std::fmax(lo, (AR - AL) / (BL - BR))), c));
+                K2T_SWEEP(s, i, AL, BL, AR, BR, lo, hi, m.vel);
             } else if (m.cls != KnotClass::Through) {
                 const float XL = 2.0f / (3.0f * TL * TL) * (-DL + m.vel * TL * (1.0f - L.lOut) + L.vel * L.lOut * TL);
                 const float XR = 2.0f / (3.0f * TR * TR) * (DR - m.vel * TR * (1.0f - R.lIn) - R.vel * R.lIn * TR);

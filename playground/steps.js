@@ -10,7 +10,7 @@
 // See: playground/README.md "Planner steps"
 
 const REC = 24;   // int32 words per record
-const KD = { SOLVE: 1, RUN: 2, RKNOT: 3, PASS: 4, STYLE: 5, KNOT: 6, ROUND: 7, PIECE: 8, JUDGE: 9, FIT: 10, PIECE_END: 11, PASS_END: 12, BUILT: 13, EMIT: 14, CHASE: 15, HARD: 16 };
+const KD = { SOLVE: 1, RUN: 2, RKNOT: 3, PASS: 4, STYLE: 5, KNOT: 6, ROUND: 7, PIECE: 8, JUDGE: 9, FIT: 10, PIECE_END: 11, PASS_END: 12, BUILT: 13, EMIT: 14, CHASE: 15, HARD: 16, PCHIP: 17, SWEEP: 18 };
 const TOL = 1e-3;
 const CLS = ['end', 'rest', 'crest', 'thru'];
 const KGRID = Array.from({ length: 37 }, (_, i) => +(0.2 + 0.05 * i).toFixed(2));   // the length factors, 0.2 to 2 (handles.hpp ksAt)
@@ -85,6 +85,7 @@ function stepsOf(rs) {
   const S0 = rs[0];
   cfg = { t0: S0.f[0], p: S0.f[1], v: S0.f[2], a: S0.f[3], lim: [S0.f[4], S0.f[5], S0.f[6]], smooth: S0.f[7], floor: S0.f[8], trim: S0.f[9], lo: S0.f[10], hi: S0.f[11], holdEps: S0.f[12] };
   let cur = null, snap = null, dirty = true, run = null, pass = 0, round = 0, styleN = 0, piece = null, built = null;
+  let terms = {}, swept = false, sweep = [];
   const detailed = () => everyJudge || (pass === 0 && round === 0);
   const snapNow = () => { if (dirty) { snap = Object.fromEntries(Object.entries(cur).map(([k, v]) => [k, v.slice()])); dirty = false; } return snap; };
   const push = (s) => { out.push({ depth: 0, ...s, snap: cur ? snapNow() : null, run }); };
@@ -136,16 +137,35 @@ function stepsOf(rs) {
               [`  ${cnt[3]} through · ${cnt[2]} crest · ${cnt[1]} hold edge · ${cnt[0]} end`],
               ['  a crest or hold edge is flat; a through point takes an angle']] });
           }
-          if (ph === 0) push({ kind: 'angles', stage: 2, ri: r, title: `Start angles: ${smooth ? 'Makima' : 'pchip'}`, lines: [
+          const thru = cur.cls.findIndex((c, i) => c === 3 && !run.knots[i].hasV);
+          if (ph === 0) push({ kind: 'angles', stage: 2, ri: r, knot: thru >= 0 ? thru : null, terms: terms[thru] || null, title: `Start angles: ${smooth ? 'Makima' : 'pchip'}`, lines: [
             [`> through points: ${smooth ? "Makima's angle" : "pchip's weighted harmonic mean"}`, 'head'],
+            ...(terms[thru] ? [[`  knot ${thru}: chords ${fx(terms[thru].dIn, 3)}, ${fx(terms[thru].dOut, 3)} → ${fx(terms[thru].r, 3)} u/s`]] : []),
             ['  crests, hold edges and ends: zero slope'],
             ['  an authored angle is kept, each held to vmax']] });
-          else push({ kind: 'sweeps', stage: 3, ri: r, title: `G2 sweeps (${smooth ? 'smooth' : 'pchip'})`, lines: [
+          else if (!swept) push({ kind: 'sweeps', stage: 3, ri: r, title: `G2 sweeps (${smooth ? 'smooth' : 'pchip'})`, lines: [
             ['> four G2 sweeps: acceleration matched both sides', 'head'],
             ...changed(out, cur.vel, 'vel', 'angle')] });
         }
         styleN++;
+        terms = {}; swept = false;
         r += x.c;
+        break;
+      }
+      case KD.PCHIP:
+        terms[x.a] = { h1: f[0], h2: f[1], w1: f[2], w2: f[3], dIn: f[4], dOut: f[5], r: f[6] };
+        break;
+      case KD.SWEEP: {
+        const e = { s: x.a, i: x.b, raw: f[0], lo: f[1], hi: f[2], v0: f[3], v: f[4], aL0: f[5], aR0: f[6], aL: f[7], aR: f[8] };
+        cur.vel[e.i] = e.v; dirty = true; sweep.push(e); swept = true;
+        const nx = rs[r + 1];
+        if (nx && nx.kind === KD.SWEEP && nx.a === x.a) break;
+        const moved = sweep.filter((q) => q.v !== q.v0), top = (moved.length ? moved : sweep).reduce((a, b) => (Math.abs(b.v - b.v0) > Math.abs(a.v - a.v0) ? b : a));
+        if (detailed()) push({ kind: 'sweep', stage: 3, ri: r, knot: top.i, sweep: top, title: `G2 sweep ${e.s + 1} of 4: ${moved.length} angle${moved.length === 1 ? '' : 's'} moved`, lines: [
+          ...(e.s === 0 ? [['> G2 sweeps: match the acceleration both sides', 'head']] : []),
+          ...moved.slice(0, 3).map((q) => [`  knot ${q.i}: ${fx(q.v0, 3)} → ${fx(q.v, 3)} u/s, a ${num(q.aL)} | ${num(q.aR)}`]),
+          [moved.length ? `  knot ${top.i}: left ${num(top.aL0)} → ${num(top.aL)}, right ${num(top.aR0)} → ${num(top.aR)}` : '  no angle moved: settled', moved.length ? '' : 'ok']] });
+        sweep = [];
         break;
       }
       case KD.ROUND: {
@@ -307,6 +327,7 @@ function viewOf(i) {
       v.k.eo[i0] = pc.i0; v.k.ei[i0 + 1] = pc.i1; v.k.dp[i0 + 1] = pc.pR - k.p[i0 + 1]; v.k.vel[i0 + 1] = pc.s1;
     }
     if (s.focus != null && s.focus + 1 < k.t.length) v.focus = [k.t[s.focus], k.t[s.focus + 1], 1];
+    if (s.knot != null) v.ring = [k.t[s.knot], k.p[s.knot] + k.dp[s.knot]];
     if (s.kind === 'result') v.emit = run.emit;
   } else if (steps[i].kind === 'samples' || !k) {
     v.reveal = s.kind === 'samples' ? 1 : 0;
@@ -323,6 +344,12 @@ function pieceCp(s, v) {
 }
 
 function detailOf(s, v) {
+  if (s.knot != null && v.k && (s.kind === 'angles' || s.kind === 'sweep')) {
+    const i = s.knot, k = v.k, P = (j) => k.p[j] + k.dp[j];
+    const ts = [k.t[i - 1], k.t[i], k.t[i + 1]], ps = [P(i - 1), P(i), P(i + 1)], pad = (ts[2] - ts[0]) * 0.08;
+    const pa = Math.min(...ps), pb = Math.max(...ps), pp = Math.max(0.02, (pb - pa) * 0.12);
+    return { kind: 'angle', i, ts, ps, v: k.vel[i], band: s.sweep ? [s.sweep.lo, s.sweep.hi] : null, win: [ts[0] - pad, ts[2] + pad, pa - pp, pb + pp] };
+  }
   if (['judge', 'trial', 'piece', 'memo'].includes(s.kind) && v.k) {
     const cp = pieceCp(s, v), i = s.focus, T = v.k.t[i + 1] - v.k.t[i];
     const Rp = v.k.p[i + 1];
@@ -437,7 +464,7 @@ function frame(now) {
 }
 function mixView(a, b, u) {
   const v = { ...b };
-  for (const key of ['k', 'focus', 'aCls', 'aAng', 'aHnd', 'aRes', 'reveal', 'tEnd']) if (a[key] != null && b[key] != null) v[key] = mix(a[key], b[key], u);
+  for (const key of ['k', 'focus', 'ring', 'aCls', 'aAng', 'aHnd', 'aRes', 'reveal', 'tEnd']) if (a[key] != null && b[key] != null) v[key] = mix(a[key], b[key], u);
   if (a.k && b.k && a.k.t.length !== b.k.t.length) v.k = b.k;
   else if (v.k) v.k = { ...v.k, t: b.k.t, cls: b.k.cls, inf: b.k.inf };   // classes and verdicts switch, never blend
   if (a.detail && b.detail && a.detail.kind === b.detail.kind) v.detail = mix(a.detail, b.detail, u);
@@ -521,6 +548,7 @@ function drawCurve(v, now) {
     g.strokeStyle = C.blue; g.setLineDash([3, 3]); g.lineWidth = 1.2;
     g.strokeRect(X(ta) - 8, y0 - 2, X(tb) - X(ta) + 16, y1 - y0 + 4); g.setLineDash([]);
   }
+  if (v.ring) { g.strokeStyle = C.blue; g.lineWidth = 1.5; g.setLineDash([3, 3]); g.beginPath(); g.arc(X(v.ring[0]), Y(v.ring[1]), 12, 0, Math.PI * 2); g.stroke(); g.setLineDash([]); }
   // chords
   g.strokeStyle = C.l4; g.lineWidth = 1.2; g.setLineDash([4, 4]);
   g.globalAlpha = 1 - 0.6 * (v.aHnd || 0);
@@ -584,10 +612,11 @@ function dot(g, x, y, r, fill) { g.fillStyle = fill; g.beginPath(); g.arc(x, y, 
 function drawDetail(v, now) {
   const { g, w, h: hh } = api.fit(el.detail);
   const s = steps[idx], d = v.detail;
-  const title = d.kind === 'piece' ? `DETAIL · PIECE ${s.focus}→${s.focus + 1}` : d.kind === 'built' ? 'DETAIL · BUILT, WORST RATIO PER PIECE' : d.kind === 'result' ? 'DETAIL · SOLVED KNOTS' : d.kind === 'samples' ? 'DETAIL · 1 MS GRID, 128 MS AHEAD' : 'DETAIL · KNOTS';
+  const title = d.kind === 'piece' ? `DETAIL · PIECE ${s.focus}→${s.focus + 1}` : d.kind === 'angle' ? `DETAIL · KNOT ${s.knot}, ITS ANGLE` : d.kind === 'built' ? 'DETAIL · BUILT, WORST RATIO PER PIECE' : d.kind === 'result' ? 'DETAIL · SOLVED KNOTS' : d.kind === 'samples' ? 'DETAIL · 1 MS GRID, 128 MS AHEAD' : 'DETAIL · KNOTS';
   frameBox(g, w, hh, title);
   g.globalAlpha = v.fade ?? 1;
   if (d.kind === 'piece') detailPiece(g, w, hh, d, s);
+  else if (d.kind === 'angle') detailAngle(g, w, hh, d, s);
   else if (d.kind === 'table') detailTable(g, w, hh, v, s);
   else if (d.kind === 'built') detailBuilt(g, w, hh, d);
   else if (d.kind === 'result') detailResult(g, w, hh, v);
@@ -645,6 +674,41 @@ function detailPiece(g, w, hh, d, s) {
   g.textAlign = 'center'; g.textBaseline = 'top'; g.fillStyle = C.muted;
   for (const k of [0.2, 0.5, 1, 1.5, 2]) g.fillText(String(k), rx(k), ry0 + 50);
   g.textAlign = 'left'; g.fillText('k, the length factor · grey: not judged', x0, ry0 + 64);
+}
+
+// A through point up close: its chords, the monotone band, the angle.
+function detailAngle(g, w, hh, d, s) {
+  const x0 = 46, x1 = w - 14, y0 = 30, y1 = hh - 86, [ta, tb, pa, pb] = d.win;
+  const X = (t) => x0 + (t - ta) / (tb - ta) * (x1 - x0), Y = (p) => y1 - (p - pa) / (pb - pa) * (y1 - y0);
+  const [tL, tm, tR] = d.ts, [pL, pm, pR] = d.ps, dt = Math.min(tm - tL, tR - tm) * 0.9;
+  g.save(); g.beginPath(); g.rect(x0 - 30, y0 - 4, x1 - x0 + 40, y1 - y0 + 8); g.clip();
+  if (d.band) {
+    g.fillStyle = 'rgba(77,166,255,0.14)';
+    for (const sg of [-1, 1]) {
+      g.beginPath(); g.moveTo(X(tm), Y(pm));
+      g.lineTo(X(tm + sg * dt), Y(pm + sg * dt * d.band[0])); g.lineTo(X(tm + sg * dt), Y(pm + sg * dt * d.band[1])); g.closePath(); g.fill();
+    }
+  }
+  g.strokeStyle = C.l4; g.setLineDash([5, 4]); g.lineWidth = 1.5;
+  g.beginPath(); g.moveTo(X(tL), Y(pL)); g.lineTo(X(tm), Y(pm)); g.lineTo(X(tR), Y(pR)); g.stroke(); g.setLineDash([]);
+  g.strokeStyle = C.blue; g.lineWidth = 3; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(X(tm - dt * 0.7), Y(pm - d.v * dt * 0.7)); g.lineTo(X(tm + dt * 0.7), Y(pm + d.v * dt * 0.7)); g.stroke(); g.lineCap = 'butt';
+  for (const [t, p, r] of [[tL, pL, 5], [tm, pm, 7], [tR, pR, 5]]) { g.fillStyle = C.sunken; g.strokeStyle = C.text; g.lineWidth = 2.2; g.beginPath(); g.arc(X(t), Y(p), r, 0, Math.PI * 2); g.fill(); g.stroke(); }
+  g.restore();
+  g.font = '12px ' + MONO; g.textAlign = 'left'; g.textBaseline = 'top';
+  const L = [];
+  if (s.terms) {
+    const q = s.terms;
+    L.push([`chords ${fx(q.dIn, 3)} and ${fx(q.dOut, 3)} u/s, spans ${ms(q.h1)} and ${ms(q.h2)} ms`, C.t3]);
+    L.push([`weights ${fx(q.w1, 3)}, ${fx(q.w2, 3)}: pchip ${fx(q.r, 3)} u/s`, C.blue]);
+  } else if (s.sweep) {
+    const q = s.sweep, ok = Math.abs(q.aL - q.aR) <= 1e-3 * Math.max(1, Math.abs(q.aL));
+    L.push([`a from the left  ${num(q.aL0)} → ${num(q.aL)}`, ok ? C.blue : C.t3]);
+    L.push([`a from the right ${num(q.aR0)} → ${num(q.aR)}`, ok ? C.blue : C.t3]);
+    L.push([`angle ${fx(q.v0, 3)} → ${fx(q.v, 3)} u/s`, C.text]);
+    L.push([`band ${fx(q.lo, 2)} to ${fx(q.hi, 2)}${q.raw < q.lo || q.raw > q.hi ? `, held from ${fx(q.raw, 3)}` : ''}`, C.muted]);
+  } else L.push([`angle ${fx(d.v, 3)} u/s`, C.text]);
+  L.forEach(([t, c], j) => { g.fillStyle = c; g.fillText(t, 12, y1 + 12 + j * 17); });
 }
 
 function pill(g, xr, y, text, ok) {
