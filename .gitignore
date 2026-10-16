@@ -9,3 +9,4 @@ build-*/
 .beads/proxieddb/
 .beads.gate.lock
 playground/kinetic2.wasm
+playground/kinetic2-trace.wasm

@@ -34,7 +34,8 @@ let playing = false, playT0 = 0;
 const reduced = matchMedia('(prefers-reduced-motion: reduce)');
 
 // ---- wasm ------------------------------------------------------------------
-let K, h, dv, sBuf, kBuf, aBuf;
+let K, h, dv, sBuf, kBuf, aBuf, W0;
+let stepper = null;      // steps.js, loaded when the planner steps are shown
 
 async function boot() {
   let bytes;
@@ -59,6 +60,7 @@ async function boot() {
   h = K.kinetic2_create();
   dv = new DataView(K.memory.buffer);   // fixed memory: ALLOW_MEMORY_GROWTH=0
   sBuf = K.malloc(24); kBuf = K.malloc(40); aBuf = K.malloc(24);
+  W0 = { K, h, dv, sBuf, kBuf, aBuf };
   $('#version').textContent = cstr(K.kinetic2_version());
   buildUi();
   if (!loadHash()) preset('stroke', false);
@@ -75,8 +77,10 @@ function cstr(ptr) {
 
 // ---- replay ------------------------------------------------------------------
 // Retirements from the front. PieceOverCeiling is a knot that renders,
-// never a drop.
-function replay() {
+// never a drop. W: a module instance and its buffers (steps.js passes the
+// trace build's).
+function replay(W = W0) {
+  const { K, h, dv, sBuf, kBuf, aBuf } = W;
   const o = S.o;
   const cfgOk = K.kinetic2_configure(h, o.vmax, o.amax, o.jmax, o.smooth, o.floor, o.trim, Math.round(o.react * 1000));
   K.kinetic2_reset(h, S.p0, 0);
@@ -508,7 +512,7 @@ function saveHash() {
   clearTimeout(hashTimer);
   hashTimer = setTimeout(() => {
     const o = S.o;
-    const j = JSON.stringify({ v: 2, T: S.T, m: S.mode, l: S.lat, p0: S.p0,
+    const j = JSON.stringify({ v: 2, T: S.T, m: S.mode, l: S.lat, p0: S.p0, ...(stepsOn ? { d: 1 } : {}),
       o: [o.vmax, o.amax, o.jmax, o.smooth, o.floor, o.trim, o.react],
       k: S.knots.map((k) => (k.jog ? [k.t, k.p, k.v, 1] : [k.t, k.p, k.v])) });
     const b = btoa(j).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -523,6 +527,7 @@ function loadHash() {
     const num = (v, lo, hi, d) => (Number.isFinite(v) ? clamp(v, lo, hi) : d);
     if (j.v !== 2) throw new Error('link version');
     const o = Array.isArray(j.o) ? j.o : [];
+    stepsOn = j.d === 1;
     S = {
       T: SPANS.includes(j.T) ? j.T : 2,
       mode: j.m === 'stream' ? 'stream' : 'ahead',
@@ -621,6 +626,8 @@ function buildUi() {
   $('#defaults').addEventListener('click', () => { S.o = { ...DEF }; syncUi(); changed(); });
 
   $('#play').addEventListener('click', togglePlay);
+  $('#steps-toggle').addEventListener('click', () => { stepsOn = !stepsOn; syncUi(); changed(); });
+  syncers.push(() => $('#steps-toggle').setAttribute('aria-pressed', String(stepsOn)));
   $('#copy').addEventListener('click', async () => {
     clearTimeout(hashTimer); saveHash();
     setTimeout(async () => {
@@ -719,12 +726,28 @@ function render() {
   draw();
   inspector();
   anomalies();
+  showSteps();
   window.__k2 = {
-    replays, samples: R.n, max: { ...R.max }, ceil: { v: S.o.vmax, a: S.o.amax, j: S.o.jmax }, over: R.over,
+    replays, samples: R.n, P: R.P, max: { ...R.max }, ceil: { v: S.o.vmax, a: S.o.amax, j: S.o.jmax }, over: R.over,
     p: { min: R.pmin, max: R.pmax }, steps: R.steps, firstStep: R.firstStep, refused: R.refused.size, anomalies: R.anomalies.map((a) => ({ ...a, name: KIND[a.kind] })),
     knots: S.knots.map((k) => ({ ...k, solved: R.solved.get(k) || null, refused: R.refused.has(k) })),
     start: S.p0, mode: S.mode, T: S.T, layout: L && { x0: L.x0, x1: L.x1, y0: L.panels[0].y0, y1: L.panels[0].y1, lo: L.panels[0].lo, hi: L.panels[0].hi },
   };
+}
+
+// The planner steps: steps.js and kinetic2-trace.wasm load the first time
+// they are shown, never before.
+let stepsOn = false, stepsLoading = false;
+function showSteps() {
+  $('#steps').hidden = !stepsOn;
+  if (!stepsOn) { stepper?.pause(); return; }
+  if (stepper) { stepper.update(); return; }
+  if (stepsLoading) return;
+  stepsLoading = true;
+  import('./steps.js').then((m) => m.init($('#steps'), { replay, state: () => S, fit, C, MONO, SANS }))
+    .then((s) => { stepper = s; if (stepsOn) s.update(); },
+      (e) => { stepsOn = false; syncUi(); $('#steps').hidden = true; status('The planner steps did not load (' + e.message + ').'); })
+    .finally(() => { stepsLoading = false; });
 }
 
 function changed() { if (!K) return; saveHash(); schedule(); }

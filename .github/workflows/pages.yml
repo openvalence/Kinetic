@@ -1,5 +1,5 @@
-# The Kinetic² playground on GitHub Pages: builds kinetic2.wasm and publishes
-# playground/ beside it. The repo's Pages source must be GitHub Actions.
+# The Kinetic² playground on GitHub Pages: builds kinetic2.wasm and
+# kinetic2-trace.wasm (the planner steps) and publishes playground/ beside them. The repo's Pages source must be GitHub Actions.
 name: pages
 
 on:
@@ -26,13 +26,13 @@ jobs:
           version: 6.0.11   # the emsdk that built the local module: same compiler, same numbers
       - run: sudo apt-get update && sudo apt-get install -y ninja-build
       - run: emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release
-      - run: cmake --build build-wasm --target kinetic2_wasm
+      - run: cmake --build build-wasm --target kinetic2_wasm kinetic2_trace_wasm
       - name: Assemble site
         run: |
           mkdir site
           cp -r playground/. site/
           rm site/check.mjs site/handles.check.mjs site/README.md
-          cp build-wasm/wasm/kinetic2.wasm site/
+          cp build-wasm/wasm/kinetic2.wasm build-wasm/wasm/kinetic2-trace.wasm site/
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

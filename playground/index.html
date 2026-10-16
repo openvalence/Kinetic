@@ -22,6 +22,7 @@
       <div class="seg" id="span" role="group" aria-label="Timeline span"></div>
       <div class="seg" id="mode" role="group" aria-label="Submission model"></div>
       <label id="latwrap" class="inline">latency <input id="lat" type="range" min="0" max="500" step="1"><output id="latout" class="mono"></output></label>
+      <button id="steps-toggle" class="btn" aria-pressed="false" title="Play through what the planner computed for these knots">Show planner steps</button>
       <button id="copy" class="btn" title="Copy a link to this setup">Copy link</button>
     </div>
     <div class="bar presets" id="presets" aria-label="Presets"></div>
@@ -34,6 +35,7 @@
     </div>
     <p id="readout" class="readout mono">&nbsp;</p>
     <ul class="legend" id="legend"></ul>
+    <section class="card steps" id="steps" hidden aria-label="Planner steps"></section>
     <section class="card">
       <h2>Anomalies <span id="ancount" class="muted"></span></h2>
       <div class="tablewrap"><table id="anoms"><thead><tr><th>time</th><th>kind</th><th>target</th><th>meaning</th></tr></thead><tbody></tbody></table></div>

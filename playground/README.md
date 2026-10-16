@@ -17,18 +17,20 @@ emcmake cmake -S . -B build-wasm -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build-wasm --target kinetic2_wasm
 ```
 
-Then either:
+`cmake --build build-wasm` builds both modules, `kinetic2.wasm` and
+`kinetic2-trace.wasm` (the planner steps). Then either:
 
-- `node playground/check.mjs`: copies `build-wasm/wasm/kinetic2.wasm` into
+- `node playground/check.mjs`: copies both modules from `build-wasm/wasm/` into
   `playground/`, serves the folder on a free localhost port, and drives it
   headless with Playwright (see below). Set `PLAYWRIGHT_DIR` to a
   `node_modules` holding `playwright` (default: `../Phosphor/node_modules`)
   and `SHOTS_DIR` for the screenshots (default: the OS temp dir).
-- or copy the wasm next to `index.html` and serve `playground/` with any
+- or copy both modules next to `index.html` and serve `playground/` with any
   static server (`python -m http.server -d playground`). Opening the file
   directly does not work: browsers refuse `fetch` over `file://`.
 
-`playground/kinetic2.wasm` is a build product and is gitignored.
+`playground/kinetic2.wasm` and `playground/kinetic2-trace.wasm` are build
+products and are gitignored.
 
 ## What check.mjs asserts
 
@@ -40,6 +42,13 @@ the run so the list gets pruned. It also adds a knot by clicking, Shift-drags
 it (fine mode, a tenth of the pointer), checks the share link round-trips,
 and checks the phone layout has no horizontal scroll. One screenshot per
 preset at 1280x900 and one at 400x900.
+
+For the planner steps: neither `steps.js` nor `kinetic2-trace.wasm` is fetched
+while they are off; on, the trace build's 1 ms samples equal `kinetic2.wasm`'s
+bit for bit; Overreach yields length-walk, trim and result steps; Next, Play and
+every judge work; an added knot re-traces; a link with a piece no trim keeps
+inside opens with the steps on and shows that piece over; no horizontal scroll
+at phone width with the steps shown.
 
 ## How a render works
 
@@ -63,6 +72,47 @@ Jerk is the difference of the sampled acceleration over 1 ms.
 | right-click | remove the knot under the pointer |
 | Space | play / pause |
 | Esc | deselect |
+
+## Planner steps
+
+Show planner steps plays through what the planner computed for the knots on the
+page, like a debugger: Prev, Play, Next, the scrubber, a speed, and the step
+list. Each step animates from the last. Every number comes from the planner:
+`kinetic2-trace.wasm` is the same planner with the hooks in
+`include/kinetic2/trace.hpp` defined to record (`wasm/kinetic2_trace.cpp`), and
+`kinetic2_trace_curve` evaluates a piece with the planner's own functions.
+`steps.js` and the trace module load the first time the steps are shown.
+
+The steps, in the planner's order (`handles.hpp` render, `solver.hpp` renderRun):
+
+| Step | What it shows |
+| --- | --- |
+| Knots in | the run's knots, the origin's state, the ceilings |
+| Classify | end, hold edge, crest or through point, from the chords |
+| Start angles, G2 sweeps | pchip or Makima angles, then the sweeps; a mid smoothness shows both solves and the blend |
+| Every handle a third | the solved lengths, before any ceiling |
+| Piece, k | one length factor judged: v, a and j over u with the judge's 11 samples and turning points, the factor grid |
+| Piece, trim | one trim test: the full move, a halving, a quarter, or flat; the bracket of the bisection |
+| Piece | what the piece keeps: its factor, its trim, legal or over |
+| Pieces unchanged | a memo hit: inputs equal to the last round's, fit reused |
+| Round fitted, Round n | each round's count of trims and pieces over; the solve on the trimmed chords |
+| Built, Pass n | each piece built as the engine builds it; the ceilings tightened for the next pass |
+| Solved | the knots as the engine gets them, corner ramps included |
+| Chase, Live jog | a run of samples, or a jog, as one move to rest |
+| The 1 ms samples | the engine's samples, with a cursor riding them |
+
+By default the length walk and the trim tests are shown for the first round of
+the first pass; every judge shows them in every round and pass. Streamed knots
+are solved once per submit: the solve picker chooses one, and a streamed
+window is samples, so it is one chase step.
+
+The panels: the render (knots, angles, handles, the trimmed knots, the piece
+in focus), the piece or knots up close, the scope (v, a, j over u against the
+ceilings the piece is judged under, or over time for the samples), and the log.
+Illegal values are red, legal ones blue.
+
+The trace keeps 131072 records; a window that needs more says so under the
+step list. A Kinetic change that moves a decision moves its hook with it.
 
 ## The handles page
 
@@ -101,6 +151,6 @@ scroll at phone width, two screenshots.
 
 `.github/workflows/pages.yml` builds the module on every push to main and
 publishes the folder (the handles page included) without the check scripts
-and this README, plus `kinetic2.wasm`. The repo's
+and this README, plus `kinetic2.wasm` and `kinetic2-trace.wasm`. The repo's
 Pages source must be set to GitHub Actions (Settings, Pages, Source), once,
 by a maintainer.

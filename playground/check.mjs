@@ -1,10 +1,12 @@
 // check.mjs -- serves the playground and drives it headless: every preset
 // renders with zero console errors and no sample over a ceiling, a knot can be
-// added and Shift-dragged, the share link round-trips.
+// added and Shift-dragged, the share link round-trips, and the planner steps
+// load only when shown and trace the same samples.
 // Constraints:
-// - Needs build-wasm/wasm/kinetic2.wasm (README.md "Playground and WebAssembly") and
+// - Needs build-wasm/wasm/kinetic2.wasm and kinetic2-trace.wasm (README.md
+//   "Playground and WebAssembly") and
 //   Playwright with chromium from ../../Phosphor/node_modules, or PLAYWRIGHT_DIR.
-// - KINETIC2_WASM overrides the module path.
+// - KINETIC2_WASM and KINETIC2_TRACE_WASM override the module paths.
 // - Screenshots land in SHOTS_DIR (default: the OS temp dir).
 // Usage: node playground/check.mjs
 import { copyFileSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
@@ -19,6 +21,9 @@ const root = resolve(here, '..');
 const wasm = process.env.KINETIC2_WASM || join(root, 'build-wasm/wasm/kinetic2.wasm');
 if (!existsSync(wasm)) { console.error('missing ' + wasm + ': build the kinetic2_wasm target first'); process.exit(2); }
 copyFileSync(wasm, join(here, 'kinetic2.wasm'));
+const traceWasm = process.env.KINETIC2_TRACE_WASM || join(root, 'build-wasm/wasm/kinetic2-trace.wasm');
+if (!existsSync(traceWasm)) { console.error('missing ' + traceWasm + ': build the kinetic2_trace_wasm target first'); process.exit(2); }
+copyFileSync(traceWasm, join(here, 'kinetic2-trace.wasm'));
 
 const pwDir = process.env.PLAYWRIGHT_DIR || resolve(root, '../Phosphor/node_modules');
 const { chromium } = createRequire(join(pwDir, 'noop.js'))('playwright');
@@ -53,6 +58,8 @@ const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
 const errors = [];
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('pageerror', (e) => errors.push(String(e)));
+const requested = [];
+page.on('request', (r) => requested.push(new URL(r.url()).pathname));
 
 const k2 = () => page.evaluate(() => window.__k2);
 async function settle(prev) {
@@ -147,13 +154,78 @@ const s2 = await p2.evaluate(() => window.__k2);
 check(s2.knots.length === s.knots.length && Math.abs(s2.knots.at(-1).t - s.knots.at(-1).t) < 1e-6, `share link round-trips ${s2.knots.length} knots`);
 await p2.close();
 
+// The planner steps: never fetched while off; on, the trace build's samples
+// are the page's bit for bit, and the steps cover the walk, the trim and the result.
+check(!requested.some((p) => /steps\.js|kinetic2-trace\.wasm/.test(p)), 'planner steps not fetched while off');
+const stepsOf = async () => {
+  await page.waitForFunction(() => window.__k2steps && window.__k2steps.P.length === window.__k2.P.length);
+  return page.evaluate(() => {
+    const a = window.__k2.P, b = window.__k2steps.P;
+    let same = a.length === b.length;
+    for (let i = 0; same && i < a.length; i++) same = a[i] === b[i];
+    const by = {};
+    for (const s of window.__k2steps.steps) by[s.kind] = (by[s.kind] || 0) + 1;
+    return { same, by, n: window.__k2steps.steps.length, idx: window.__k2steps.idx, steps: window.__k2steps.steps, lost: window.__k2steps.lost };
+  });
+};
+await page.click('#presets button[data-preset="overreach"]');
+s = await settle(s.replays);
+await page.click('#steps-toggle');
+let st = await stepsOf();
+check(st.same && st.lost === 0, `overreach steps: the trace build's ${s.samples} samples match kinetic2.wasm bit for bit`);
+check(st.by.judge > 1 && st.by.trial > 1 && st.by.piece >= 1 && st.by.result === 1 && st.by.samples === 1
+  && st.steps.some((x) => x.kind === 'trial' && / legal$/.test(x.title)) && st.steps.some((x) => x.kind === 'trial' && / over$/.test(x.title)),
+  `overreach steps: ${st.n} (${Object.entries(st.by).map(([k, v]) => k + ' ' + v).join(', ')})`);
+await page.click('#st-next');
+await page.click('#st-next');
+st = await stepsOf();
+check(st.idx === 2, `Next steps forward: at step ${st.idx + 1}`);
+await page.selectOption('#st-speed', '4');
+await page.click('#st-play');
+await page.waitForTimeout(1500);
+st = await stepsOf();
+await page.click('#st-play');
+check(st.idx > 2, `Play walks the steps: at step ${st.idx + 1}`);
+await (await page.$('#steps')).screenshot({ path: join(shots, 'steps-overreach.png') });
+const n1 = st.n;
+await page.check('#st-all');
+st = await stepsOf();
+check(st.n >= n1, `every judge: ${st.n} steps (${n1} without)`);
+await page.uncheck('#st-all');
+// A user-built script: a click adds a knot and the steps follow it.
+await page.click('#presets button[data-preset="stroke"]');
+s = await settle(s.replays);
+st = await stepsOf();
+const n2 = st.n, b2 = await page.locator('#overlay').boundingBox();
+await page.mouse.click(b2.x + s.layout.x0 + (1.5 / s.T) * (s.layout.x1 - s.layout.x0), b2.y + s.layout.y1 - (0.9 - s.layout.lo) / (s.layout.hi - s.layout.lo) * (s.layout.y1 - s.layout.y0));
+s = await settle(s.replays);
+st = await stepsOf();
+check(st.same && st.n > n2 && s.knots.length === 3, `an added knot re-traces: ${n2} -> ${st.n} steps, samples match`);
+// A piece no trim keeps inside: rendered over a ceiling, its steps red.
+const over = { v: 2, T: 1, m: 'ahead', l: 100, p0: 0.5, o: [3, 30, 2000, 0, 0.15, 1, 4], d: 1, k: [[0.137, 0.33, null], [0.337, 0.78, 3.6], [0.356, 0.84, null]] };
+const p3 = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+const e3 = [];
+p3.on('console', (m) => { if (m.type() === 'error') e3.push(m.text()); });
+p3.on('pageerror', (e) => e3.push(String(e)));
+await p3.goto(url + '#' + Buffer.from(JSON.stringify(over)).toString('base64url'));
+await p3.waitForFunction(() => window.__k2 && window.__k2steps);
+const s3 = await p3.evaluate(() => ({ an: window.__k2.anomalies.map((a) => a.name), steps: window.__k2steps.steps }));
+check(s3.an.includes('PieceOverCeiling') && s3.an.includes('KnotTrimmed') && s3.steps.some((x) => x.kind === 'piece' && /over ×/.test(x.title)) && e3.length === 0,
+  `over a ceiling, from a link with the steps on: ${s3.steps.length} steps, anomalies ${[...new Set(s3.an)].join(', ')}`);
+await p3.evaluate((i) => { const r = document.querySelector('#st-scrub'); r.value = i; r.dispatchEvent(new Event('input')); }, s3.steps.findIndex((x) => x.kind === 'piece' && /over ×/.test(x.title)));
+await p3.waitForTimeout(600);
+await (await p3.$('#steps')).screenshot({ path: join(shots, 'steps-over.png') });
+await p3.close();
+
 // Phone width: stacked, no horizontal scroll.
 await page.setViewportSize({ width: 400, height: 900 });
 await page.click('#presets button[data-preset="stroke"]');
 s = await settle(s.replays);
 const sw = await page.evaluate(() => [document.documentElement.scrollWidth, innerWidth]);
-check(sw[0] <= sw[1], `phone: scrollWidth ${sw[0]} <= ${sw[1]}`);
-await page.screenshot({ path: join(shots, 'phone.png') });
+check(sw[0] <= sw[1], `phone: scrollWidth ${sw[0]} <= ${sw[1]} (planner steps shown)`);
+await page.screenshot({ path: join(shots, 'phone.png'), fullPage: true });
+await page.click('#steps-toggle');
+check(await page.waitForFunction(() => document.querySelector('#steps').hidden, null, { timeout: 3000 }).then(() => true, () => false), 'planner steps hide when toggled off');
 
 check(errors.length === 0, 'no console errors overall' + (errors.length ? ': ' + errors.join(' | ') : ''));
 console.log('screenshots: ' + shots);
