@@ -26,7 +26,7 @@ const curveCache = new Map();
 const reduced = matchMedia('(prefers-reduced-motion: reduce)');
 
 export async function init(root, a) {
-  api = a; ({ C, MONO, SANS } = a); host = root;
+  api = a; ({ C, MONO, SANS } = a); host = root; BAD = C.bad;
   const res = await fetch('./kinetic2-trace.wasm');
   if (!res.ok) throw new Error('kinetic2-trace.wasm ' + res.status);
   const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
@@ -486,7 +486,7 @@ const fx = (x, d) => (Number.isFinite(x) ? x.toFixed(d) : String(x));
 const ms = (s) => Math.round(s * 1000);
 const pc = (x) => (x * 100).toFixed(x > 0.999 || x < 0.001 ? 0 : 1) + '%';
 const num = (v) => { const a = Math.abs(v); return a >= 1e4 ? (v / 1000).toFixed(0) + 'k' : a >= 1000 ? (v / 1000).toFixed(1) + 'k' : a >= 10 ? v.toFixed(0) : a >= 1 ? v.toFixed(1) : v.toFixed(2); };
-const BAD = '#FF4D5E';
+let BAD;   // play.js C.bad: over a ceiling
 const okc = (ok) => (ok ? C.blue : BAD);
 
 function draw(v, now) {

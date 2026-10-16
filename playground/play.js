@@ -9,7 +9,7 @@
 
 const $ = (s) => document.querySelector(s);
 const C = { bg: '#08090B', sunken: '#040507', l1: '#121419', l2: '#1D2026', l3: '#272B31', l4: '#33373E',
-  text: '#ECEFF4', t2: '#C3C8D1', t3: '#A8AEB9', muted: '#666C78', blue: '#4DA6FF', violet: '#A78BFA', hi: '#FF5CB3' };
+  text: '#ECEFF4', t2: '#C3C8D1', t3: '#A8AEB9', muted: '#666C78', blue: '#4DA6FF', violet: '#A78BFA', hi: '#FF5CB3', bad: '#FF4D5E' };   // bad: over a ceiling, here and in steps.js
 const MONO = 'ui-monospace, "SF Mono", Consolas, monospace';
 const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 const TOL = 1e-3;
@@ -228,7 +228,7 @@ function draw() {
       g.fillText(pn.key === 'P' ? String(v) : (v > 0 ? '+' : '') + fmt(v), pn.x0 - 6, y);
     }
     if (pn.ceil && pn.hi > pn.ceil * 1.6) {
-      g.fillStyle = C.hi;
+      g.fillStyle = C.bad;
       g.fillText('+' + fmt(pn.hi), pn.x0 - 6, pn.y0 + 7);
       g.fillText('-' + fmt(pn.hi), pn.x0 - 6, pn.y1 - 7);
     }
@@ -267,7 +267,7 @@ function trace(g, pn) {
     i ? g.lineTo(x, y) : g.moveTo(x, y);
   }
   g.stroke();
-  g.strokeStyle = C.hi; g.lineWidth = 2.5;
+  g.strokeStyle = C.bad; g.lineWidth = 2.5;
   g.beginPath();
   for (let i = 1; i < n; i++) {
     if (!bad(arr[i]) && !bad(arr[i - 1]) && !(step && step[i])) continue;
@@ -371,7 +371,7 @@ function drawRail(s) {
   g.fillStyle = C.sunken; g.fillRect(cx - 12, yc - 0.5, 24, 1);
   const bx = cx + 18, vlen = Math.max(-1, Math.min(1, v / S.o.vmax)) * 0.25 * (bot - top);
   g.fillStyle = C.l2; g.fillRect(bx - 1, y(0.5) - 0.25 * (bot - top), 2, 0.5 * (bot - top));
-  g.fillStyle = Math.abs(v) > S.o.vmax * (1 + TOL) ? C.hi : C.violet;
+  g.fillStyle = Math.abs(v) > S.o.vmax * (1 + TOL) ? C.bad : C.violet;
   g.fillRect(bx - 2, Math.min(y(0.5), y(0.5) - vlen), 4, Math.abs(vlen));
 }
 
@@ -655,7 +655,7 @@ function buildUi() {
     ['<circle cx="7" cy="7" r="5.5" fill="none" stroke="#FF5CB3" stroke-width="1.5"/><path d="M4 4 10 10M10 4 4 10" stroke="#FF5CB3" stroke-width="1.5"/>', 'dropped or refused'],
     ['<rect x="2" y="2" width="10" height="10" fill="#FF5CB3"/><text x="7" y="10.5" font-size="9" text-anchor="middle" font-family="monospace" fill="#040507" font-weight="bold">v</text>', 'end velocity clamped'],
     ['<path d="M1 7H13" stroke="#33373E" stroke-dasharray="3 2" stroke-width="1.5"/>', 'ceiling'],
-    ['<path d="M1 7H13" stroke="#FF5CB3" stroke-width="2.5"/>', 'over a ceiling by more than 0.1%, or a step between two 1 ms samples'],
+    ['<path d="M1 7H13" stroke="#FF4D5E" stroke-width="2.5"/>', 'over a ceiling by more than 0.1%, or a step between two 1 ms samples'],
   ].map(([svg, text]) => `<li><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">${svg}</svg>${text}</li>`).join('');
 
   new ResizeObserver(() => { if (R) draw(); }).observe($('#plotbox'));
