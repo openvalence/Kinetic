@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Kinetic handles: OpenValence</title>
-<meta name="description" content="A funscript as a composite cubic Bezier in the time-position plane: knot classes, handles, and the ceilings as bounds on the handle lengths.">
+<meta name="description" content="A funscript through the Kinetic² planner, drawn as it renders: knot classes, handles, trims and the ceilings.">
 <link rel="stylesheet" href="play.css">
 <link rel="stylesheet" href="site-nav.css">
 <script src="site-nav.js" defer></script>
 <script>if (top !== self) document.documentElement.classList.add('framed')</script>
 <style>
   #plotbox { height: clamp(300px, 46vh, 460px); }
-  #stripbox { height: 250px; }
+  #stripbox { height: 250px; flex: none; }   /* flex: none: .plot's flex: 1 sizes it to 0 in the phone column */
   #rail { width: 56px; flex: none; height: clamp(300px, 46vh, 460px); }
   #overlay, #soverlay { pointer-events: none; }
   .inline input[type="range"] { width: 140px; }
@@ -21,7 +21,6 @@
   .kv dd.nudge { color: var(--intent); }
   .kv dd.bad, .bad { color: var(--bad); }
 </style>
-<script src="handles-model.js"></script>
 <script src="handles.js" defer></script>
 </head>
 <body>
@@ -56,7 +55,7 @@
 </header>
 <div class="top">
   <h1>Kinetic² handles</h1>
-  <p class="tag">A funscript as a composite cubic Bézier in the time-position plane: the knots on the author's clock, one angle and two handle lengths per knot, and the ceilings as bounds on the lengths.</p>
+  <p class="tag">A funscript through the Kinetic² planner, drawn as it renders: a composite cubic Bézier in the time-position plane, one angle and two handle lengths per knot, and the ceilings as bounds on the lengths.</p>
   <p class="meta"><a href="index.html">the planner playground</a> · <a href="https://github.com/openvalence/Kinetic">github.com/openvalence/Kinetic</a></p>
 </div>
 
@@ -65,7 +64,7 @@
     <div class="bar">
       <label class="btn primary" for="file">Open .funscript</label><input id="file" type="file" accept=".funscript,.json,application/json">
       <button id="sample" class="btn">Built-in script</button>
-      <button id="autoall" class="btn" title="Every knot back to auto: class from the chords, G2 where it can be">Auto all</button>
+      <button id="autoall" class="btn" title="Every angle back to the planner, every knot to its authored position">Free all</button>
       <button id="fit" class="btn" title="Zoom to the whole script">Fit</button>
       <button id="play" class="btn" title="Play / pause (Space)">Play</button>
       <button id="steps-toggle" class="btn" aria-pressed="false" title="Play through what the real planner computes for these knots">Show planner steps</button>
@@ -75,25 +74,19 @@
     <div class="plot" id="stripbox"><canvas id="strips"></canvas><canvas id="soverlay"></canvas></div>
     <p id="readout" class="readout mono">&nbsp;</p>
     <ul class="legend" id="legend"></ul>
-    <section class="card stdiv" id="steps-div" hidden aria-label="Model and planner compared"></section>
     <section class="card steps" id="steps" hidden aria-label="Planner steps"></section>
   </section>
 
   <aside class="side">
     <section class="card">
       <h2>Knot <span id="k-idx" class="muted"></span></h2>
-      <p id="k-none" class="muted">Click a knot. Drag a handle to set its angle and length, Shift-drag for the length only, drag the knot to move it.</p>
+      <p id="k-none" class="muted">Click a knot. Drag a handle to set its angle, drag the knot to move it.</p>
       <div id="k-box" hidden>
         <dl class="kv mono" id="k-info"></dl>
-        <label class="row">type <select id="k-type"><option value="auto">auto</option><option value="G0">G0 corner</option><option value="G1">G1 angle</option><option value="G2">G2 curvature</option></select></label>
-        <label class="row" id="k-vrow">angle mm/s <input id="k-v" type="number" step="10"></label>
-        <label class="row" id="k-vinrow" hidden>in mm/s <input id="k-vin" type="number" step="10"></label>
-        <label class="row" id="k-voutrow" hidden>out mm/s <input id="k-vout" type="number" step="10"></label>
-        <label class="row">length in <input id="k-lin" type="number" min="0.05" max="0.95" step="0.01"></label>
-        <label class="row">length out <input id="k-lout" type="number" min="0.05" max="0.95" step="0.01"></label>
+        <label class="row" id="k-vrow">angle mm/s <input id="k-v" type="number" step="10" title="Sets the angle by hand"></label>
         <label class="row">position mm <input id="k-p" type="number" step="1"></label>
         <p id="k-note" class="muted small"></p>
-        <div class="bar"><button id="k-auto" class="btn">Auto this knot</button><button id="k-prev" class="btn" title="Previous knot">←</button><button id="k-next" class="btn" title="Next knot">→</button></div>
+        <div class="bar"><button id="k-auto" class="btn" title="Angle back to the planner, position as authored">Free this knot</button><button id="k-prev" class="btn" title="Previous knot">←</button><button id="k-next" class="btn" title="Next knot">→</button></div>
       </div>
     </section>
     <section class="card">
@@ -107,9 +100,8 @@
       <label class="row">window mm <span class="inline"><input id="c-size" type="range" min="5" step="1"><output id="c-sizeout" class="mono"></output></span></label>
       <label class="row">offset mm <span class="inline"><input id="c-off" type="range" min="0" step="1"><output id="c-offout" class="mono"></output></span></label>
       <p class="muted small">The script's 0 to 100 maps onto the window; the window sits on the rail. A bigger window asks more speed of the same script.</p>
-      <label class="row">hold eps mm <input id="c-hold" type="number" min="0" step="0.1" title="A chord smaller than this is a hold"></label>
       <label class="row">smoothness <span class="inline"><input id="c-smooth" type="range" min="0" max="1" step="0.05" title="Free knots: 0 crisp, 1 smooth"><output id="c-smoothout" class="mono"></output></span></label>
-      <p class="muted small">0 is PCHIP: crests and hold edges G1 as drawn, the corner ramp takes their acceleration step, through points G2 by their angle. 1 takes Makima's angles and makes crests and hold edges G2 by their lengths. Between, the free angles and lengths of the two blend.</p>
+      <p class="muted small">0 is PCHIP: crests and hold edges G1, a corner ramp takes their acceleration step, through points G2 by their angle. 1 takes Makima's angles and makes crests and hold edges G2 by their lengths. Between, the free angles and lengths of the two blend.</p>
     </section>
     <section class="card">
       <h2>Script</h2>
@@ -119,7 +111,7 @@
 </main>
 
 <footer class="keys">
-  <span><kbd>drag handle</kbd> angle and length</span> <span><kbd>Shift</kbd> length only</span> <span><kbd>drag knot</kbd> position</span>
+  <span><kbd>drag handle</kbd> angle</span> <span><kbd>drag knot</kbd> position</span>
   <span><kbd>wheel</kbd> zoom</span> <span><kbd>drag empty</kbd> pan</span> <span><kbd>← →</kbd> walk knots</span> <span><kbd>Space</kbd> play / pause</span> <span><kbd>Esc</kbd> deselect</span>
 </footer>
 <p id="status" class="status" role="status"></p>

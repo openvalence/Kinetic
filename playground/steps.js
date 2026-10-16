@@ -5,8 +5,9 @@
 //   functions' (kinetic2_trace_curve); the plan is never recomputed here. The
 //   bisection's bracket is the tested moves labeled by their verdicts.
 // - Records are wasm/kinetic2_trace.cpp's: 96 bytes, kind, a, b, c, f[20].
-// - Loaded only when the steps are shown (play.js showSteps); the normal page
-//   never fetches this file or the trace build.
+// - Loaded only when the steps are shown (play.js showSteps); the playground
+//   never fetches this file or the trace build before. The handles page draws
+//   from the trace build and passes its instance in.
 // See: playground/README.md "Planner steps"
 
 const REC = 24;   // int32 words per record
@@ -30,12 +31,16 @@ const reduced = matchMedia('(prefers-reduced-motion: reduce)');
 
 export async function init(root, a) {
   api = a; ({ C, MONO, SANS } = a); host = root; BAD = C.bad;
-  const res = await fetch('./kinetic2-trace.wasm');
-  if (!res.ok) throw new Error('kinetic2-trace.wasm ' + res.status);
-  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
-  const K = instance.exports;
+  // a.K: a page's own trace instance, already initialized (the handles page)
+  let K = a.K;
+  if (!K) {
+    const res = await fetch('./kinetic2-trace.wasm');
+    if (!res.ok) throw new Error('kinetic2-trace.wasm ' + res.status);
+    const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+    K = instance.exports;
+    if (K.kinetic2_trace_curve) K._initialize();
+  }
   if (!K.kinetic2_trace_curve || K.kinetic2_submit.length !== 7) throw new Error('kinetic2-trace.wasm does not match this page; rebuild it');
-  K._initialize();
   W = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24) };
   curveBuf = K.malloc(CURVE_N * 4);
   build();

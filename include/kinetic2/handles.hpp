@@ -2,8 +2,6 @@
 // time-position plane, one angle and two handle lengths per knot, the ceilings
 // as bounds on the lengths, amplitude trimmed toward the previous knot
 // Constraints:
-// - The reference is playground/handles-model.js; a change here changes it
-//   first, and the parity test (step C of kin-y6e) holds the two together.
 // - u is the curve parameter, never time: v = (dp/du)/(dt/du).
 // - Knot times are float seconds from the caller's origin (the caller rebases
 //   its uint64_t clock); positions and ceilings share the caller's units.
@@ -11,25 +9,24 @@
 //   on the motion tick.
 // - A judge reads each of v, a, j at 11 u samples and at its exact turning
 //   points (the roots of the next derivative's numerator, bracketed and
-//   bisected), about 150 polynomial evaluations against the model's 161 full
+//   bisected), about 150 polynomial evaluations against overSampled's 161
 //   samples; a legality test stops at the first sample over the bar, the
 //   length walk skips the side of 1 that cannot help (lengths of a third
 //   only), and a piece whose inputs did not change is not judged again
 //   (HKnot memo). A bound on the render's work belongs in the solver, never
 //   this file.
-// - The model carries Cfg::trimLast and Cfg::railStop (kin-88m): under
-//   railStop both hold a trimmed knot's angle to its trimmed chord, cap an
-//   angle its span cannot stop, fit the corner ramps' room (Room, aTarget),
-//   rank a window excursion below every ceiling ratio, read a hold by rate as
-//   well as by distance, and lay an illegal hold flat. HKnot::slack,
+// - Cfg::trimLast and Cfg::railStop are the kernel's rules (kin-88m), off by
+//   default: under railStop the render holds a trimmed knot's angle to its
+//   trimmed chord, caps an angle its span cannot stop, fits the corner ramps'
+//   room (Room, aTarget), ranks a window excursion below every ceiling ratio
+//   and reads a hold by rate as well as by distance. An illegal hold lies flat
+//   and smoothness 0 judges monotonicity with railStop off too. HKnot::slack,
 //   HKnot::rail, the last knot's brake cap on HKnot::vcap, a moving origin's
 //   HKnot::aIn and Piece::da are the engine's (solver.hpp renderRun,
-//   engine_piece.hpp); the model has none of them. At their defaults the
-//   render is the model's, except that an illegal hold lies flat with
-//   railStop off too, smoothness 0 judges monotonicity with railStop off too
-//   (the model under railStop only), and overOf judges each peak at its exact
-//   turning points where the model samples: the two agree within kTol, which
-//   can move a trim that sits on a legality boundary.
+//   engine_piece.hpp); at their defaults they change nothing. overOf judges
+//   each peak at its exact turning points and agrees with a full sampling
+//   (overSampled) within kTol, which can move a trim that sits on a legality
+//   boundary.
 // - At smoothness 0 a band-legal piece stays monotone at its scaled lengths
 //   (monoOver, kin-ay9): the band guarantees it only at a third. Above 0 only
 //   the window judges overshoot.
@@ -55,9 +52,9 @@
 //   kSlackCap). Angles are solved at a third, so a G2 knot whose piece scales
 //   loses the match and is G1: the solver rounds its acceleration step with a
 //   corner ramp at jmax.
-// - Parity with the model (tests/test_kinetic2_handles.cpp): trims within
-//   1e-4 of the window; the engine's positions within 0.5% and its trims
-//   within 1e-4, both past the corner-ramp allowance.
+// - tests/test_kinetic2_handles.cpp renders the fixture scripts: sampled
+//   ceilings and flat holds, the two styles bit for bit, the handle_floor and
+//   trim_max bounds.
 // - The K2T_* lines are trace hooks (trace.hpp), nothing unless a build
 //   defines them: a decision that moves takes its hook with it.
 // See: Valence RFC-106, Kinetic kin-y6e
@@ -75,7 +72,7 @@ inline constexpr float kLMin   = 0.05f;   // shortest handle, share of its span
 inline constexpr float kLMax   = 0.95f;   // longest handle
 inline constexpr float kThird  = 1.0f / 3.0f;  // the polynomial cubic (the cubic Hermite)
 inline constexpr float kTol    = 1e-3f;   // a peak within 0.1% of its ceiling is legal
-inline constexpr int   kJudgeN = 160;     // u samples per judged piece; the model's NS
+inline constexpr int   kJudgeN = 160;     // u samples per fully sampled piece (overSampled)
 inline constexpr float kTick   = 1e-3f;   // the engine's tick, s: a corner ramp's clearance from a span's end
 inline constexpr int   kMemoKey = 16;     // nudge's memo inputs per piece; every input of a fit is in it
 
@@ -97,7 +94,7 @@ struct Cfg {
     // way, else G1); the lerp between.
     float  smoothness = 0.0f;
     int    sweeps  = 4;        // G2 sweeps per solve
-    // The last knot trims too. The model keeps it (a script's end); the kernel's
+    // The last knot trims too. Off, it is kept (a script's end); the kernel's
     // last knot is the newest of a window and must never render over a ceiling.
     bool   trimLast = false;
     // An authored angle is also held to what the fastest legal brake stops
@@ -121,7 +118,7 @@ struct HKnot {
     float dp = 0.0f;                 // trim; nonzero = this knot moved
     bool  infeasible = false;        // the piece ending here is over a ceiling
     // The share of each ceiling (v, a, j) the piece ending here is judged
-    // against. 1 in the model; the kernel tightens the one the piece it builds
+    // against. 1 until the kernel tightens the one the piece it builds
     // (an acceleration step rounded under jmax at an end) goes over.
     float slack[3] = {1.0f, 1.0f, 1.0f};
     // The share of the railStop speed bound an authored angle is held to; the
@@ -153,7 +150,7 @@ struct Piece {
     float T = 0.0f, D = 0.0f, s0 = 0.0f, s1 = 0.0f, i0 = kThird, i1 = kThird;
     // The kernel's start correction: da * t^2/2 * (1 - t/T)^3 added in time,
     // so the start acceleration is the Bezier's plus da while p, v at both
-    // ends and the end acceleration stay the Bezier's. 0 in the model.
+    // ends and the end acceleration stay the Bezier's. 0 outside the engine.
     float da = 0.0f;
 };
 
@@ -213,8 +210,8 @@ inline float solveU(const Piece& q, float t) {
     return u;
 }
 
-// The worst ceiling ratio of a piece starting at pStart, sampled in u like the
-// model; leaving the window counts as 1 + the excursion over the window span.
+// The worst ceiling ratio of a piece starting at pStart, judged in u;
+// leaving the window counts as 1 + the excursion over the window span.
 // With a finite stop, returns a ratio over stop as soon as one sample is (a
 // legality test needs no more).
 // Each ceiling's ratio apart (x: 1 + the window excursion over its span).
@@ -298,9 +295,9 @@ inline float overSampled(const Piece& q, float pStart, const Cfg& c, float stop,
 
 // The worst ceiling ratio of a piece: each of v, a, j at its exact turning
 // points (the roots of the next derivative's numerator) and at 11 samples, so
-// a sampled model and this judge agree within the tolerance at a fraction of
-// the cost; the window from the position's exact turning points. A piece with
-// a start correction (da) is sampled like the model.
+// it agrees with a full sampling (overSampled) within the tolerance at a
+// fraction of the cost; the window from the position's exact turning points.
+// A piece with a start correction (da) is sampled in full.
 inline float overOf(const Piece& q, float pStart, const Cfg& c, float stop = INFINITY, Over* parts = nullptr) {
     if (q.da != 0.0f) return overSampled(q, pStart, c, stop, parts);
     const float sv = c.lim.vmax * stop, sa = c.lim.amax * stop, sj = c.lim.jmax * stop;
@@ -364,7 +361,7 @@ inline float overOf(const Piece& q, float pStart, const Cfg& c, float stop = INF
     return std::fmax(o, wall + out / (c.hi - c.lo));
 }
 
-// The model's judge: every u sample of the piece. Kept for a piece with a
+// The full judge: every u sample of the piece. Kept for a piece with a
 // start correction, whose turning points are not the polynomials'.
 inline float overSampled(const Piece& q, float pStart, const Cfg& c, float stop, Over* parts) {
     const float sv = c.lim.vmax * stop, sa = c.lim.amax * stop, sj = c.lim.jmax * stop;
@@ -483,10 +480,10 @@ inline float railBound(float v, float p, const Cfg& c, float share) {
 // chord within holdEps on a side (a hold edge). Crest: the chords change sign.
 // Through: the same sign both sides. withDp classifies the trimmed chords.
 // A chord within holdEps is a hold, except the one leaving a moving first
-// knot (a re-plan's origin in flight; the model's first knot is at rest).
+// knot (a re-plan's origin in flight).
 // Under railStop a hold is also slower than holdEps per kHoldSpan: a 60 Hz
 // stream's chords are shorter than holdEps while it moves.
-inline constexpr float kHoldSpan = 0.1f;   // s; the model's scripts have no shorter span
+inline constexpr float kHoldSpan = 0.1f;   // s; no fixture script has a shorter span
 inline bool holdChord(const HKnot* k, int from, float d, const Cfg& c) {
     const bool slow = !c.railStop || std::fabs(d) * kHoldSpan <= c.holdEps * (k[from + 1].t - k[from].t);
     return std::fabs(d) <= c.holdEps && slow && !(from == 0 && k[0].has_v && k[0].v != 0.0f);
@@ -613,7 +610,7 @@ inline void solve(HKnot* k, int n, const Cfg& c, bool withDp) {
 
 // ---- the ceilings: bound the lengths, then trim the amplitude -------------------
 // The length factors nearest 1 first: 1, 0.95, 1.05, 0.90, ... 0.2, then 1.85..2.0
-// (the model's KS order, the lower side first on a tie).
+// (the lower side first on a tie).
 inline constexpr int kKs = 37;
 inline float ksAt(int idx) {
     if (idx == 0) return 1.0f;
@@ -741,8 +738,8 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     best.o = INFINITY;
     // Which side of 1 can help, read at k = 1: a speed or window excess wants
     // shorter handles, an acceleration or jerk excess longer ones; the room
-    // (a corner ramp's fit) and both at once keep the model's full walk. The
-    // walk's order is the model's, so the first legal factor is the same.
+    // (a corner ramp's fit) and both at once keep the full walk. The order is
+    // the full walk's, so the first legal factor is the same.
     auto judge = [&](float f, float bound_, Over* parts) {
         Piece q;
         q.T = R.t - L.t;
@@ -760,7 +757,7 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     // k = 1 first, with its parts: a speed or window excess wants shorter
     // handles, an acceleration or jerk excess longer ones, so the other side
     // of the grid is skipped; both at once, or a room or reversal that is
-    // over, keep the model's full walk. The order is the model's (nearest 1
+    // over, keep the full walk. The order is the full walk's (nearest 1
     // first), so the first legal factor is the same.
     Over parts;
     // With a hint the side is known from the last fit: k = 1 is judged with
@@ -775,7 +772,7 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     // solve, trimmed knots included: a fit scales the solved lengths, never
     // the fitted ones). A smooth or mid solve's lengths are not a third and
     // can sum past 1, where longer handles raise the jerk: those walk both
-    // sides, as the model does (kin-rfw7, kin-9od3).
+    // sides (kin-rfw7, kin-9od3).
     if (L.lOut != kThird || R.lIn != kThird) {
         overV = overAJ = roomOver_ = true;
     } else if (hinted) {
@@ -789,7 +786,7 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     // A legality test (bound at the tolerance) with no factor able to recover
     // the excess at k = 1 skips the walk: a factor of at most 2 cuts the jerk
     // by at most 2^3 on a third-length handle (the floor and the cap bound the
-    // lengths tighter), the acceleration by 2^2; the model walks and finds the
+    // lengths tighter), the acceleration by 2^2; the full walk finds the
     // same, every factor over. The least-over search (a wider bound) walks.
     if (!hinted && bound <= 1.0f + kTol && !roomOver_ && overAJ && !overV && (parts.j > 9.0f || parts.a > 5.0f)) return best;
     auto onSide = [&](int idx) { const float f = ksAt(idx); return (f < 1.0f && tryDown) || (f > 1.0f && tryUp); };
@@ -801,8 +798,8 @@ inline Fit fitPiece(const HKnot& L, const HKnot& R, float pL, float pR, const Cf
     };
     // A trim's bisection fits the same piece at nearby moves, so the legal
     // factor moves little between steps: start at the last one (hint), walk
-    // toward 1 while legal, and the last legal factor is the model's first
-    // legal in its order whenever the side's legal factors are one run.
+    // toward 1 while legal, and the last legal factor is the full walk's
+    // first legal in its order whenever the side's legal factors are one run.
     if (hint && *hint > 0 && *hint < kKs && onSide(*hint) && tryDown != tryUp) {
         int h = *hint;
         Fit fh = at(h);
@@ -936,8 +933,7 @@ inline int nudge(HKnot* k, int n, const Cfg& c, bool* capped = nullptr) {
                 }
             }
             // An illegal hold (a chord within holdEps rendered too fast) lies flat
-            // at its predecessor instead when that is less over. The model has no
-            // such piece; its hold chords are long enough to be legal. Flat is at
+            // at its predecessor instead when that is less over. Flat is at
             // rest on a zero chord too: an authored angle kept there is a zero
             // stroke that no cap on L's angle makes legal (kin-jsw1).
             if (!f.legal && hold && canTrim) {
@@ -1037,7 +1033,8 @@ inline Piece pieceOf(const HKnot* k, int i) {
 
 }  // namespace kinetic2::handles
 
-// Renders the model's SAMPLE with the model's DEF ceilings (mm, window 0..100)
+// Renders the handles page's built-in script (playground/handles.js) at
+// 1000 mm/s, 50000 mm/s^2, 5e6 mm/s^3 (mm, window 0..100)
 // and prints every knot's solve and trim. Build:
 //   g++ -std=c++20 -DKINETIC2_HANDLES_SELFTEST -x c++ include/kinetic2/handles.hpp -o handles_selftest
 #ifdef KINETIC2_HANDLES_SELFTEST

@@ -1,8 +1,11 @@
-// handles.check.mjs -- checks handles-model.js in node, then (when Playwright is
-// reachable) serves the playground and drives handles.html headless.
+// handles.check.mjs -- serves the playground and drives handles.html headless:
+// the page draws the planner's result (its samples equal kinetic2.wasm's bit for
+// bit, each knot on the curve), edits reach the planner, the planner steps work,
+// no console errors, no horizontal scroll at three viewports.
 // Run: node playground/handles.check.mjs
 //   PLAYWRIGHT_DIR: a node_modules holding playwright (default ../Phosphor/node_modules)
 //   SHOTS_DIR: where the screenshots go (default the OS temp dir)
+//   KINETIC2_WASM, KINETIC2_TRACE_WASM: the modules (default build-wasm/wasm/)
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
@@ -11,162 +14,152 @@ import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const require = createRequire(import.meta.url);
-const M = require(join(here, 'handles-model.js'));
-
 let failures = 0;
 const check = (ok, what) => { console.log((ok ? 'ok   ' : 'FAIL ') + what); if (!ok) failures++; };
-const within = (r, c) => r.peakV <= c.vmax * 1.001 && r.peakA <= c.amax * 1.001 && r.peakJ <= c.jmax * 1.001;
 
-// ---- the model ---------------------------------------------------------------
-{ // the figure: 150 mm strokes between crests at 200 ms fit at a length of 0.25
-  const c = { vmax: 1000, amax: 50000, jmax: 5e6, box: 0, lo: 0, hi: 150 };
-  const knots = M.fromFunscript({ actions: [{ at: 0, pos: 0 }, { at: 200, pos: 100 }, { at: 400, pos: 0 }, { at: 600, pos: 100 }, { at: 800, pos: 0 }] }, c);
-  const R = M.render(knots, c);
-  check(R.pieces.every((p) => Math.abs(p.peakV - 1000) < 2 && within(p, c)), `figure strokes: every piece peaks at the speed ceiling and inside the others (${R.pieces.map((p) => p.peakV.toFixed(0)).join(', ')})`);
-  check(knots.slice(1, -1).every((k) => Math.abs(k.effIn - 0.25) < 0.011 && Math.abs(k.effOut - 0.25) < 0.011), `figure strokes: the crests' handles are nudged to 0.25 (${knots.slice(1, -1).map((k) => k.effIn.toFixed(2)).join(', ')})`);
-  check(R.steps.every((s) => Math.abs(s.da) < 50), 'figure strokes: symmetric crests stay G2 after the nudge');
-}
-{ // the mid-travel point of the figure: G2 picks the angle 850 and the sides agree
-  const c = { vmax: 5000, amax: 5e5, jmax: 5e8, box: 0, lo: 0, hi: 200 };
-  const knots = M.fromFunscript({ actions: [{ at: 0, pos: 0 }, { at: 150, pos: 50 }, { at: 400, pos: 100 }] }, c);
-  const R = M.render(knots, c);
-  check(knots[1].cls === 'through' && Math.abs(knots[1].vIn - 850) < 1, `through point: G2 angle ${knots[1].vIn.toFixed(0)} mm/s (850)`);
-  check(Math.abs(R.steps[0].da) < 50, `through point: acceleration step ${R.steps[0].da.toFixed(0)} (none)`);
-  knots[1].type = 'G1'; M.render(knots, c);
-  check(Math.abs(knots[1].vIn - 511) < 1, `the same knot as G1: PCHIP angle ${knots[1].vIn.toFixed(0)} mm/s (511)`);
-  knots[1].type = 'G0'; M.render(knots, c);
-  check(Math.abs(knots[1].vIn - 667) < 1 && Math.abs(knots[1].vOut - 400) < 1, `the same knot as G0: the chords ${knots[1].vIn.toFixed(0)} in, ${knots[1].vOut.toFixed(0)} out`);
-}
-{ // the built-in script: classes, no NaN, the ceilings after the nudge, the box
-  const knots = M.fromFunscript(M.SAMPLE, {});
-  const R = M.render(knots, {});
-  const c = R.report.counts;
-  check(c.end === 2 && c.rest === 8 && c.crest === 12 && c.through === 1, `built-in: classes end ${c.end}, holds ${c.rest}, crests ${c.crest}, through ${c.through}`);
-  check(R.pieces.every((p) => [...p.p, ...p.v, ...p.a, ...p.j].every(Number.isFinite)), 'built-in: every sample finite');
-  check(R.pieces.every((p, i) => knots[i + 1].infeasible || within(p, M.DEF)), 'built-in: every piece not marked infeasible is inside the ceilings');
-  const noTrim = M.render(M.fromFunscript(M.SAMPLE, {}), { vmax: 800, trim: 0 }), trimmed = M.fromFunscript(M.SAMPLE, {}), withTrim = M.render(trimmed, { vmax: 800 });
-  const towardPrev = trimmed.every((k, i) => k.dp === 0 || Math.sign(k.dp) === Math.sign(trimmed[i - 1].p + trimmed[i - 1].dp - k.p));
-  check(noTrim.report.infeasible > 0 && withTrim.report.infeasible === 0 && towardPrev, `built-in at 800 mm/s: ${noTrim.report.infeasible} infeasible untrimmed, ${withTrim.report.infeasible} trimmed (${trimmed.filter((k) => k.dp !== 0).length} knots moved toward the previous knot, ${trimmed.reduce((m, k) => m + Math.abs(k.dp), 0).toFixed(1)} mm)`);
-  { // a run of strokes beyond the machine: every top trims to the reachable height, the bottoms stay where the run started
-    const fast = M.fromFunscript({ actions: [{ at: 0, pos: 0 }, { at: 150, pos: 100 }, { at: 300, pos: 0 }, { at: 450, pos: 100 }, { at: 600, pos: 0 }, { at: 750, pos: 100 }, { at: 900, pos: 0 }] }, {});
-    const RF = M.render(fast, { vmax: 400 });
-    const tops = fast.filter((k, i) => i % 2 === 1).map((k) => (k.p + k.dp).toFixed(1)), bottoms = fast.filter((k, i) => i % 2 === 0 && i > 0 && i < 6).map((k) => (k.p + k.dp).toFixed(1));
-    check(RF.report.infeasible === 0 && new Set(tops).size === 1 && bottoms.every((b) => b === '0.0') && Number(tops[0]) < 60, `fast run at 400 mm/s: tops trimmed to ${tops[0]} mm, bottoms stay at 0, nothing infeasible`);
-  }
-  const smooth = M.fromFunscript(M.SAMPLE, {}), RS = M.render(smooth, { smoothness: 1 });
-  check(smooth.filter((k) => k.eff === 'G2').length === smooth.length - 2 && RS.report.overPieces === 0 && smooth.filter((k) => k.cls === 'rest' || k.cls === 'crest').every((k) => k.vIn === 0), `built-in, smooth style: every inner knot G2, crests and hold edges flat, nothing over (longest ramp ${Math.max(...RS.steps.map((s) => s.rampMs)).toFixed(1)} ms where the window bound it)`);
-  const tight = M.render(M.fromFunscript(M.SAMPLE, {}), { vmax: 300, trim: 0 });
-  check(tight.report.infeasible > 0 && tight.report.overPieces === tight.report.infeasible, `built-in at 300 mm/s with no trim: ${tight.report.infeasible} infeasible pieces, each marked`);
-}
-{ // duplicate times collapse, pos clamps to the window
-  const knots = M.fromFunscript({ actions: [{ at: 0, pos: 0 }, { at: 100, pos: 120 }, { at: 100, pos: 50 }, { at: 300, pos: -5 }] }, { lo: 0, hi: 100 });
-  check(knots.length === 3 && knots[1].p === 50 && knots[2].p === 0, 'funscript: duplicate times collapse to the last, positions clamp to the window');
-}
-
-// ---- the page ----------------------------------------------------------------
 const pwDir = process.env.PLAYWRIGHT_DIR || resolve(here, '../../Phosphor/node_modules');
 let chromium = null;
-try { chromium = createRequire(join(pwDir, 'noop.js'))('playwright').chromium; } catch { console.log('skip  Playwright not found under ' + pwDir + '; set PLAYWRIGHT_DIR for the page checks'); }
-if (chromium) {
-  const shots = process.env.SHOTS_DIR || join(tmpdir(), 'kinetic2-playground');
-  mkdirSync(shots, { recursive: true });
-  const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm' };
-  // the planner steps need the trace build (README.md "Playground and WebAssembly")
-  const traceWasm = process.env.KINETIC2_TRACE_WASM || resolve(here, '../build-wasm/wasm/kinetic2-trace.wasm');
-  if (existsSync(traceWasm)) copyFileSync(traceWasm, join(here, 'kinetic2-trace.wasm'));
-  const server = createServer((req, res) => {
-    const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
-    const file = resolve(here, '.' + path);
-    if (!file.startsWith(here) || !existsSync(file)) { res.writeHead(404); res.end(); return; }
-    res.writeHead(200, { 'content-type': MIME[extname(file)] || 'application/octet-stream' });
-    res.end(readFileSync(file));
-  });
-  await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
-  const url = `http://127.0.0.1:${server.address().port}/handles.html`;
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-  const errors = [], requested = [];
-  page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
-  page.on('pageerror', (e) => errors.push(String(e)));
-  page.on('request', (r) => requested.push(new URL(r.url()).pathname));
-  await page.goto(url);
-  await page.waitForFunction(() => window.__handles && window.__handles.state().R);
-  const st = () => page.evaluate(() => { const s = window.__handles.state(); return { n: s.knots.length, sel: s.sel, type: s.sel == null ? null : s.knots[s.sel].type, man: s.sel == null ? null : s.knots[s.sel].man, report: s.report, over: s.R.report.overPieces, infeasible: s.R.report.infeasible, trimmed: s.knots.filter((k) => k.dp !== 0).length, nudged: s.knots.filter((k) => Math.abs(k.effIn - k.lIn) > 1e-6 || Math.abs(k.effOut - k.lOut) > 1e-6).length }; });
-  let s = await st();
-  check(s.n === M.SAMPLE.actions.length, `page: the built-in script loaded, ${s.n} knots`);
-  // select a crest and drag its out handle: the angle is hand-set and the knot becomes G1
-  const i = 2;
-  const k = await page.evaluate((i) => window.__handles.xy(i), i);
-  await page.mouse.click(k.x, k.y);
-  s = await st(); check(s.sel === i, `page: clicking a knot selects it (${s.sel})`);
-  const hnd = await page.evaluate((i) => window.__handles.handleXY(i, 'out'), i);
-  await page.mouse.move(hnd.x, hnd.y); await page.mouse.down(); await page.mouse.move(hnd.x + 15, hnd.y - 25, { steps: 5 }); await page.mouse.up();
-  s = await st(); check(s.type === 'G1' && s.man.v != null && s.man.lOut != null, `page: dragging a handle sets the angle and length by hand and the knot renders G1 (${JSON.stringify(s.man)})`);
-  await page.click('#k-auto');
-  s = await st(); check(s.type === 'auto' && Object.keys(s.man).length === 0, 'page: Auto this knot clears the hand-set values');
-  await page.selectOption('#k-type', 'G0');
-  s = await st(); check(s.type === 'G0', 'page: the type select sets G0');
-  // a tight speed ceiling nudges handles and marks what cannot be met
-  await page.fill('#c-vmax', '400'); await page.press('#c-vmax', 'Enter'); await page.dispatchEvent('#c-vmax', 'change');
-  s = await st(); check(s.nudged > 0, `page: a 400 mm/s ceiling nudges ${s.nudged} handles`);
-  // the window: a bigger window asks more of the same script, the carriage follows the render
-  await page.fill('#c-vmax', '1000'); await page.dispatchEvent('#c-vmax', 'change');
-  await page.evaluate(() => window.__handles.setWindow(100, 400));
-  s = await st(); check(s.over === 0 && s.infeasible === 0 && s.trimmed > 0, `page: a 300 mm window at 1000 mm/s renders inside the ceilings by trimming ${s.trimmed} knots (${s.nudged} handles nudged)`);
-  const win = await page.evaluate(() => { const st = window.__handles.state(); return { lo: st.cfg.lo, hi: st.cfg.hi, p0: st.knots[0].p, pmax: Math.max(...st.knots.map((k) => k.p)) }; });
-  check(win.lo === 100 && win.hi === 400 && win.p0 === 130 && win.pmax === 400, `page: the script rescaled into the window (first knot ${win.p0} mm, highest ${win.pmax} mm)`);
-  await page.click('#play');
-  await page.waitForTimeout(400);
-  const play = await page.evaluate(() => { const st = window.__handles.state(); return { playing: st.playing, cursor: st.cursor }; });
-  check(play.playing && play.cursor > 0.2, `page: playback runs (cursor at ${(play.cursor * 1000).toFixed(0)} ms after 400 ms)`);
-  await page.click('#play');
-  await page.screenshot({ path: join(shots, 'handles-1280.png') });
-
-  // the planner steps: never fetched while off; on, the real planner's trace of
-  // these knots, and every knot where the model the page draws differs, flagged
-  check(!requested.some((p) => /steps\.js|kinetic2-trace\.wasm/.test(p)), 'page: the planner steps are not fetched while off');
-  if (existsSync(join(here, 'kinetic2-trace.wasm'))) {
-    const dv = () => page.evaluate(() => ({ n: window.__k2steps.steps.length, idx: window.__k2steps.idx, kinds: [...new Set(window.__k2steps.steps.map((s) => s.kind))], div: window.__handles.state().diverged, box: document.querySelector('#steps-div').innerText }));
-    await page.click('#sample');
-    await page.evaluate(() => window.__handles.setWindow(0, 100));
-    await page.fill('#c-trim', '100'); await page.dispatchEvent('#c-trim', 'change');
-    await page.click('#steps-toggle');
-    await page.waitForFunction(() => window.__k2steps);
-    let d = await dv();
-    check(d.n > 20 && ['classify', 'sweep', 'judge', 'piece', 'result', 'samples'].every((k) => d.kinds.includes(k)) && d.div.length === 0 && /agree at every knot/.test(d.box),
-      `page steps: the built-in script, ${d.n} steps; the model and the planner agree at every knot`);
-    await page.click('#st-next'); await page.click('#st-next');
-    d = await dv(); check(d.idx === 2, `page steps: Next walks the steps (step ${d.idx + 1})`);
-    await page.fill('#c-vmax', '400'); await page.dispatchEvent('#c-vmax', 'change');
-    d = await dv();
-    check(d.div.length > 0 && /differ at \d+ knot/.test(d.box) && d.kinds.includes('trial'), `page steps: at 400 mm/s the planner trims elsewhere than the model at ${d.div.length} knots, listed and ringed (${d.div.join(', ')})`);
-    await page.click('#k-auto').catch(() => {});
-    const k3 = await page.evaluate(() => window.__handles.xy(3));
-    await page.mouse.click(k3.x, k3.y);
-    await page.selectOption('#k-type', 'G0');
-    d = await dv(); check(/Not planner inputs.*knot 3: G0 by hand/s.test(d.box), 'page steps: a G0 knot is listed as no input of the planner');
-    await page.click('#autoall');
-    await page.fill('#c-vmax', '1000'); await page.dispatchEvent('#c-vmax', 'change');
-    for (const [w, h] of [[1280, 720], [1920, 1080], [390, 844]]) {
-      await page.setViewportSize({ width: w, height: h });
-      await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-      const sc = await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth);
-      check(sc, `page steps at ${w}x${h}: no horizontal scroll`);
-      await page.screenshot({ path: join(shots, `handles-steps-${w}.png`), fullPage: true });
-    }
-    await page.setViewportSize({ width: 1280, height: 900 });
-    await page.click('#steps-toggle');
-    check(await page.evaluate(() => document.querySelector('#steps').hidden && document.querySelector('#steps-div').hidden), 'page steps: toggled off, both panels hide');
-  } else console.log('skip  page steps: no kinetic2-trace.wasm (build the kinetic2_trace_wasm target)');
-  await page.setViewportSize({ width: 400, height: 900 });
-  await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-  const wide = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
-  check(!wide, 'page: no horizontal scroll at phone width');
-  await page.screenshot({ path: join(shots, 'handles-400.png') });
-  check(errors.length === 0, `page: zero console errors${errors.length ? ': ' + errors.join(' | ') : ''}`);
-  console.log('screenshots in ' + shots);
-  await browser.close(); server.close();
+try { chromium = createRequire(join(pwDir, 'noop.js'))('playwright').chromium; } catch { console.log('FAIL Playwright not found under ' + pwDir + '; set PLAYWRIGHT_DIR'); process.exit(1); }
+for (const [env, name] of [['KINETIC2_WASM', 'kinetic2.wasm'], ['KINETIC2_TRACE_WASM', 'kinetic2-trace.wasm']]) {
+  const src = process.env[env] || resolve(here, '../build-wasm/wasm/' + name);
+  if (existsSync(src)) copyFileSync(src, join(here, name));
+  if (!existsSync(join(here, name))) { console.log(`FAIL no ${name}: build the kinetic2_wasm and kinetic2_trace_wasm targets`); process.exit(1); }
 }
+const shots = process.env.SHOTS_DIR || join(tmpdir(), 'kinetic2-playground');
+mkdirSync(shots, { recursive: true });
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm' };
+const server = createServer((req, res) => {
+  const path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  const file = resolve(here, '.' + path);
+  if (!file.startsWith(here) || !existsSync(file)) { res.writeHead(404); res.end(); return; }
+  res.writeHead(200, { 'content-type': MIME[extname(file)] || 'application/octet-stream' });
+  res.end(readFileSync(file));
+});
+await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
+const url = `http://127.0.0.1:${server.address().port}/handles.html`;
+const browser = await chromium.launch({ headless: true });
+const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+const errors = [], requested = [];
+page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
+page.on('pageerror', (e) => errors.push(String(e)));
+page.on('request', (r) => requested.push(new URL(r.url()).pathname));
+await page.goto(url);
+await page.waitForFunction(() => window.__handles && window.__handles.state().R);
+
+const st = () => page.evaluate(() => {
+  const s = window.__handles.state(), D = s.R.D, cls = [0, 0, 0, 0];
+  for (const d of D) if (d) cls[d.cls]++;
+  const k = s.sel == null ? null : s.knots[s.sel], d = s.sel == null ? null : D[s.sel];
+  return { n: s.knots.length, have: D.filter(Boolean).length, cls, sel: s.sel, v: k ? k.v : null, pm: k ? k.pm : null,
+    vel: d ? d.vel * (s.cfg.hi - s.cfg.lo) : null, clamped: d ? d.clamped : 0, over: s.R.over,
+    inf: D.filter((x) => x && x.inf).length, trimmed: D.filter((x) => x && x.dp !== 0).length,
+    nudged: D.filter((x) => x && (Math.abs(x.ei - x.lIn) > 1e-6 || Math.abs(x.eo - x.lOut) > 1e-6)).length };
+});
+// The page's drawing against kinetic2.wasm, the main playground's build, on the
+// same knots: every 1 ms sample equal bit for bit; every knot drawn on the curve
+// at its time within kKnotTol (solver.hpp, 1e-3 of the window).
+const drawsPlanner = () => page.evaluate(async () => {
+  if (!window.__k2) {
+    const { instance } = await WebAssembly.instantiate(await (await fetch('./kinetic2.wasm')).arrayBuffer(), {});
+    const K = instance.exports; K._initialize();
+    window.__k2 = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24) };
+  }
+  const s = window.__handles.state(), R = s.R, r = window.__handles.replay(window.__k2);
+  let diff = r.n !== R.n ? 1 : 0;
+  for (let i = 0; i < R.n && !diff; i++) if (!Object.is(r.P[i], R.P[i]) || !Object.is(r.V[i], R.V[i]) || !Object.is(r.A[i], R.A[i])) diff = i + 1;
+  let off = 0, missing = 0;
+  s.knots.forEach((k, i) => { const d = R.D[i]; if (!d) { missing++; return; } off = Math.max(off, Math.abs(R.P[Math.round(k.t * 1000)] - d.p)); });
+  return { diff, off, missing, n: R.n, over: R.over };
+});
+const exact = async (what) => {
+  const r = await drawsPlanner();
+  check(r.diff === 0 && r.missing === 0 && r.off <= 1e-3, `${what}: ${r.n} samples equal kinetic2.wasm's bit for bit${r.diff ? ` (first difference at ${r.diff - 1} ms)` : ''}; every knot on the curve within ${r.off.toExponential(1)} of the window${r.missing ? `, ${r.missing} knots without planner data` : ''}`);
+};
+const setNum = async (id, v) => { await page.fill(id, String(v)); await page.dispatchEvent(id, 'change'); };
+
+let s = await st();
+check(s.n === 23 && s.have === 23, `page: the built-in script, ${s.n} knots, every one with the planner's data`);
+check(s.cls.join() === '2,8,12,1', `page: the planner's classes, end ${s.cls[0]}, holds ${s.cls[1]}, crests ${s.cls[2]}, through ${s.cls[3]}`);
+check(await page.evaluate(() => !document.querySelector('#k-type, #k-lin, #k-lout, #k-vin, #k-vout, #c-hold, #steps-div')), 'page: no control the planner takes no input for');
+await exact('built-in at the defaults');
+
+// select a crest and drag its out handle: the angle is set by hand and the planner takes it
+const i = 2;
+const k = await page.evaluate((i) => window.__handles.xy(i), i);
+await page.mouse.click(k.x, k.y);
+s = await st(); check(s.sel === i, `page: clicking a knot selects it (${s.sel})`);
+const hnd = await page.evaluate((i) => window.__handles.handleXY(i, 'out'), i);
+await page.mouse.move(hnd.x, hnd.y); await page.mouse.down(); await page.mouse.move(hnd.x + 15, hnd.y - 25, { steps: 5 }); await page.mouse.up();
+await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+s = await st(); check(s.v != null && (s.clamped || Math.abs(s.vel - s.v) <= 1e-3 * Math.max(1, Math.abs(s.v))), `page: dragging a handle sets the angle by hand and the planner renders it (${s.v && s.v.toFixed(1)} set, ${s.vel && s.vel.toFixed(1)} drawn)`);
+const k7 = await page.evaluate(() => window.__handles.xy(7));
+await page.mouse.move(k7.x, k7.y); await page.mouse.down(); await page.mouse.move(k7.x, k7.y + 30, { steps: 4 }); await page.mouse.up();
+await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+await exact('an edited script (an angle set, a knot moved)');
+await page.mouse.click(k.x, k.y);
+await page.click('#k-auto');
+s = await st(); check(s.v == null && s.pm == null, 'page: Free this knot clears the angle and the move');
+await page.click('#autoall');
+
+// tight ceilings: the planner nudges and trims, and the page draws exactly that
+await setNum('#c-vmax', 400);
+s = await st(); check(s.nudged + s.trimmed > 0, `page: a 400 mm/s ceiling, ${s.nudged} handles nudged, ${s.trimmed} knots trimmed`);
+await exact('speed 400 mm/s');
+await setNum('#c-vmax', 1000); await setNum('#c-jmax', 1e6);
+await exact('jerk 1e6 mm/s³');
+await setNum('#c-jmax', 5e6);
+await page.evaluate(() => window.__handles.setWindow(100, 400));
+const win = await page.evaluate(() => { const st = window.__handles.state(); return { lo: st.cfg.lo, hi: st.cfg.hi, p0: st.knots[0].p, pmax: Math.max(...st.knots.map((k) => k.p)) }; });
+check(win.lo === 100 && win.hi === 400 && win.p0 === 130 && win.pmax === 400, `page: the script rescaled into a 300 mm window (first knot ${win.p0} mm, highest ${win.pmax} mm)`);
+await exact('a 300 mm window at 1000 mm/s');
+await page.evaluate(() => { document.querySelector('#c-smooth').value = '1'; document.querySelector('#c-smooth').dispatchEvent(new Event('input')); });
+await exact('the 300 mm window at smoothness 1');
+await page.evaluate(() => { document.querySelector('#c-smooth').value = '0'; document.querySelector('#c-smooth').dispatchEvent(new Event('input')); window.__handles.setWindow(0, 100); });
+
+// a script longer than the planner's 64 pending knots: submitted as they retire
+await page.evaluate(() => { const a = []; let t = 0; for (let i = 0; i < 300; i++) { a.push({ at: t, pos: i % 2 ? 90 : 10 + (i % 7) * 5 }); t += 150 + (i % 5) * 60; } window.__handles.load({ actions: a }, 'long'); });
+s = await st(); check(s.n === 300 && s.have === 300, `page: a 300-knot script, every knot with the planner's data`);
+await exact('the 300-knot script');
+await page.click('#sample');
+
+await page.click('#play');
+await page.waitForTimeout(400);
+const play = await page.evaluate(() => { const st = window.__handles.state(); return { playing: st.playing, cursor: st.cursor }; });
+check(play.playing && play.cursor > 0.2, `page: playback runs (cursor at ${(play.cursor * 1000).toFixed(0)} ms after 400 ms)`);
+await page.click('#play');
+
+// the viewports, with and without the planner steps
+const fits = async (label) => {
+  for (const [w, h] of [[1280, 720], [1920, 1080], [390, 844]]) {
+    await page.setViewportSize({ width: w, height: h });
+    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
+    check(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth && document.querySelector('#stripbox').getBoundingClientRect().height > 100),
+      `page${label} at ${w}x${h}: no horizontal scroll, the strips shown`);
+    await page.screenshot({ path: join(shots, `handles${label ? '-steps' : ''}-${w}.png`), fullPage: true });
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+};
+await fits('');
+
+// the planner steps: never fetched while off; on, steps.js on the page's planner
+check(!requested.some((p) => /steps\.js/.test(p)), 'page steps: steps.js is not fetched while off');
+const dv = () => page.evaluate(() => ({ n: window.__k2steps.steps.length, idx: window.__k2steps.idx, kinds: [...new Set(window.__k2steps.steps.map((s) => s.kind))] }));
+await page.click('#steps-toggle');
+await page.waitForFunction(() => window.__k2steps);
+let d = await dv();
+check(d.n > 20 && ['classify', 'sweep', 'judge', 'piece', 'result', 'samples'].every((k) => d.kinds.includes(k)), `page steps: the built-in script, ${d.n} steps`);
+check(requested.filter((p) => /kinetic2-trace\.wasm/.test(p)).length === 1, 'page steps: the steps reuse the page\'s planner (one trace module fetched)');
+await page.click('#st-next'); await page.click('#st-next');
+d = await dv(); check(d.idx === 2, `page steps: Next walks the steps (step ${d.idx + 1})`);
+await setNum('#c-vmax', 400);
+d = await dv(); check(d.kinds.includes('trial'), 'page steps: at 400 mm/s the trim tests show');
+await exact('speed 400 mm/s with the steps shown');
+await setNum('#c-vmax', 1000);
+await fits(' steps');
+await page.click('#steps-toggle');
+check(await page.evaluate(() => document.querySelector('#steps').hidden), 'page steps: toggled off, the panel hides');
+check(errors.length === 0, `page: zero console errors${errors.length ? ': ' + errors.join(' | ') : ''}`);
+console.log('screenshots in ' + shots);
+await browser.close(); server.close();
 console.log(failures ? `${failures} FAILED` : 'PASS');
 process.exit(failures ? 1 : 0);

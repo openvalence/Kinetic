@@ -1,35 +1,166 @@
-// handles.js -- the handles page (kin-d0o): draws the composite Bezier of
-// handles-model.js, lets the operator set each knot's class, drag its handles
-// (aligned, as in Blender) and move it, and shows velocity, acceleration and
-// jerk against the ceilings with every nudge visible.
+// handles.js -- the handles page (kin-d0o): a funscript through the real
+// Kinetic² planner (kinetic2-trace.wasm), drawn as the planner rendered it: the
+// curve and its velocity, acceleration and jerk against the ceilings, each
+// knot's class, angle, handles, trim and verdict.
 // Constraints:
-// - Every change is a full render of the model; nothing is cached across edits.
-// - Plain script, no module: the page must open from file://.
+// - Every drawn value is the planner's: the 1 ms samples, and per knot the last
+//   render round of the last solve that rendered it with both neighbors (its
+//   trace records, wasm/kinetic2_trace.cpp). Nothing is recomputed here.
+// - Inputs are the planner's only: knot times and positions, an authored angle
+//   per knot, the ceilings, smoothness, handle floor and max trim.
+// - Every change is a full replay from reset; nothing is cached across edits.
+// - Plain script, no module; the wasm needs the page served over http.
+// See: playground/README.md "The handles page"
 'use strict';
-const M = window.HandlesModel;
 const $ = (s) => document.querySelector(s);
 const C = { bg: '#08090B', l2: '#1D2026', l3: '#272B31', text: '#ECEFF4', t3: '#A8AEB9', muted: '#666C78',
   blue: '#4DA6FF', violet: '#A78BFA', hi: '#FF5CB3', v: '#5BD48A', a: '#F2A94A', j: '#C9A2FF', red: '#FF4D5E' };   // red: over a ceiling, as on the playground
 const MONO = 'ui-monospace, "SF Mono", Consolas, monospace';
 const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+const CLSN = ['end', 'rest', 'crest', 'through'];
 const CLS = { end: C.muted, rest: C.t3, crest: C.text, through: C.blue };
+const SLOTS = 64;   // the engine's pending knots (kinetic2_wasm.cpp Engine<1, 64>)
+// the built-in script: holds, a fast stroke, a mid-travel point, a sawtooth
+const SAMPLE = { actions: [
+  { at: 0, pos: 10 }, { at: 500, pos: 10 }, { at: 700, pos: 90 }, { at: 900, pos: 10 }, { at: 1100, pos: 90 }, { at: 1300, pos: 10 },
+  { at: 1800, pos: 10 }, { at: 1950, pos: 60 }, { at: 2200, pos: 100 }, { at: 2600, pos: 0 }, { at: 3100, pos: 0 },
+  { at: 3300, pos: 70 }, { at: 3400, pos: 50 }, { at: 3600, pos: 100 }, { at: 3800, pos: 20 }, { at: 4300, pos: 20 },
+  { at: 4400, pos: 80 }, { at: 4700, pos: 30 }, { at: 4800, pos: 90 }, { at: 5100, pos: 40 }, { at: 5200, pos: 95 }, { at: 5700, pos: 10 }, { at: 6200, pos: 10 },
+] };
 
-let cfg = { ...M.DEF, rail: 500 };
-let knots = [], R = null, sel = null, scriptName = '';
+let cfg = { vmax: 1000, amax: 50000, jmax: 5e6, lfloor: 0.15, trim: 100, lo: 0, hi: 100, smoothness: 0, rail: 500 };
+// knot: { t s, p mm (authored), pm mm | null (moved by hand), v mm/s | null (angle set by hand) }
+let knots = [], R = null, sel = null, T = null;
 let view = { t0: 0, t1: 6 };
-let drag = null;
+let drag = null, dragRaf = 0;
 let cursor = null, playing = false, playT0 = 0, raf = 0;
 const plot = $('#plot'), strips = $('#strips'), overlay = $('#overlay'), soverlay = $('#soverlay'), rail = $('#rail');
 const PAD = { l: 44, r: 12, t: 10, b: 20 };
+const pos = (k) => (k.pm == null ? k.p : k.pm);
+const winW = () => cfg.hi - cfg.lo;
+const mm = (x) => cfg.lo + x * winW();   // window units to mm
 
-// ---- model ----------------------------------------------------------------
+// ---- the planner ----------------------------------------------------------------
+async function boot() {
+  try {
+    const res = await fetch('./kinetic2-trace.wasm');
+    if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+    const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+    const K = instance.exports;
+    if (!K.kinetic2_trace_records || K.kinetic2_submit.length !== 7) throw new Error('kinetic2-trace.wasm does not match this page; rebuild it');
+    K._initialize();
+    T = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24) };
+  } catch (e) {
+    $('#name').textContent = 'the planner did not load';
+    $('#status').textContent = 'kinetic2-trace.wasm did not load (' + e.message + '). Build it and serve this folder: see playground/README.md.';
+    return;
+  }
+  load(SAMPLE, 'built-in');
+}
+
+// One replay: configure, reset at the first knot, submit the rest on its time
+// (64 ahead, the next as each retires), sample every 1 ms. With D, each solve's
+// trace is read into D (per knot) and cleared; without, the records accumulate
+// for steps.js.
+function replay(W, D) {
+  const { K, h, dv, sBuf, kBuf } = W, Wmm = winW(), w = (p) => (p - cfg.lo) / Wmm;
+  const ok = K.kinetic2_configure(h, cfg.vmax / Wmm, cfg.amax / Wmm, cfg.jmax / Wmm, cfg.smoothness,
+    Math.min(0.33, Math.max(0.05, cfg.lfloor)), Math.min(1, Math.max(0, cfg.trim / Wmm)), 4000);
+  const t0 = Math.round(knots[0].t * 1e6), z = Math.floor(t0 / 1000);
+  K.kinetic2_reset(h, w(pos(knots[0])), t0);
+  if (D) K.kinetic2_trace_clear();
+  const n = Math.round((knots[knots.length - 1].t + 0.3) * 1000) + 1;
+  const P = new Float32Array(n), V = new Float32Array(n), A = new Float32Array(n), J = new Float32Array(n);
+  const live = [];
+  let next = 1, solves = 0, refused = 0, mv = 0, ma = 0, mj = 0, over = 0;
+  for (let i = 0; i < n; i++) {
+    if (i < z) { P[i] = w(pos(knots[0])); continue; }   // before the origin the axis rests on it
+    const now = Math.max(i * 1000, t0);
+    let sub = false;
+    while (next < knots.length && K.kinetic2_pending(h) < SLOTS) {
+      const k = knots[next];
+      if (K.kinetic2_submit(h, Math.round(k.t * 1e6), w(pos(k)), k.v == null ? 0 : 1, (k.v ?? 0) / Wmm, now, 2)) live.push(next); else refused++;
+      next++; sub = true;
+    }
+    if (sub) {
+      K.kinetic2_solved(h, 0, kBuf);   // solves the window
+      if (D) { readSolve(K, live, solves === 0, D); K.kinetic2_trace_clear(); }
+      solves++;
+    }
+    K.kinetic2_sample(h, now, sBuf);
+    P[i] = dv.getFloat32(sBuf + 8, true); V[i] = dv.getFloat32(sBuf + 12, true); A[i] = dv.getFloat32(sBuf + 16, true);
+    J[i] = i > z ? (A[i] - A[i - 1]) * 1000 : 0;
+    mv = Math.max(mv, Math.abs(V[i])); ma = Math.max(ma, Math.abs(A[i])); mj = Math.max(mj, Math.abs(J[i]));
+    if (Math.abs(V[i]) > cfg.vmax / Wmm * 1.001 || Math.abs(A[i]) > cfg.amax / Wmm * 1.001 || Math.abs(J[i]) > cfg.jmax / Wmm * 1.001) over++;
+    while (live.length > K.kinetic2_pending(h)) live.shift();
+  }
+  return { n, P, V, A, J, max: { v: mv, a: ma, j: mj }, over, ok, refused };
+}
+
+// The knots of one solve, from its trace: per run, the last render round
+// (K_ROUND tag 1 or 3, its K_KNOT block) and the solved knots (K_EMIT). A knot
+// is written from a run where it has a knot on both sides (run index 2 on), or
+// from the first solve, whose origin is the first knot at rest.
+const REC = 24, K_RUN = 2, K_ROUND = 7, K_EMIT = 14;
+function readSolve(K, live, first, D) {
+  const n = K.kinetic2_trace_count(), b0 = K.kinetic2_trace_records() >> 2;
+  const i32 = new Int32Array(K.memory.buffer), f32 = new Float32Array(K.memory.buffer);
+  let run = null;
+  const flush = () => {
+    if (!run || run.fin < 0) return;
+    for (let r = first ? 0 : 2; r < run.me; r++) {
+      const ix = r === 0 ? 0 : live[run.base + r - 1];
+      if (ix == null) continue;
+      const o = b0 + (run.fin + 1 + r) * REC, fl = i32[o + 2], f = (x) => f32[o + 4 + x];
+      const d = { cls: fl & 3, g2: (fl >> 2) & 1, hasV: (fl >> 3) & 1, p: f(1) + f(2), dp: f(2), vel: f(3), lIn: f(4), lOut: f(5), ei: f(6), eo: f(7),
+        TL: r > 0 ? f(0) - f32[o - REC + 4] : 0, TR: r + 1 < run.m ? f32[o + REC + 4] - f(0) : 0,
+        corner: 0, inf: 0, clamped: 0, share: 1, worst: 0, rampT: 0 };
+      const e = run.emit[r];
+      if (e != null) {
+        const q = b0 + e * REC, ef = i32[q + 2];
+        Object.assign(d, { corner: ef & 1, inf: (ef >> 1) & 1, clamped: (ef >> 4) & 1, share: f32[q + 8], worst: f32[q + 9], rampT: f32[q + 12] });
+      }
+      D[ix] = d;
+    }
+  };
+  for (let r = 0; r < n; r++) {
+    const o = b0 + r * REC, kind = i32[o];
+    if (kind === K_RUN) { flush(); run = { m: i32[o + 1], me: i32[o + 2], base: i32[o + 3], fin: -1, emit: [] }; }
+    else if (kind === K_ROUND && (i32[o + 1] & 1)) run.fin = r;
+    else if (kind === K_EMIT) run.emit[i32[o + 1]] = r;
+  }
+  flush();
+}
+
+// ---- the script -------------------------------------------------------------------
+function fromFunscript(doc) {
+  const acts = (doc.actions || []).slice().sort((x, y) => x.at - y.at), out = [];
+  for (const a of acts) {
+    const t = a.at / 1000, p = cfg.lo + winW() * Math.min(100, Math.max(0, a.pos)) / 100;
+    if (out.length && t - out[out.length - 1].t < 1e-6) { out[out.length - 1].p = p; continue; }
+    out.push({ t, p, pm: null, v: null });
+  }
+  return out;
+}
 function load(doc, label) {
-  knots = M.fromFunscript(doc, cfg); scriptName = label; sel = null;
+  knots = fromFunscript(doc); sel = null;
   $('#name').textContent = `${label}: ${knots.length} knots`;
   fitView(); update();
 }
 function update() {
-  R = M.render(knots, cfg);
+  if (!T) return;
+  if (knots.length < 2) { R = null; draw(); return; }
+  const D = new Array(knots.length).fill(null);
+  R = replay(T, D);
+  R.D = D;
+  // per sample: 1 v, 2 a, 4 j over its ceiling, 8 in a piece no trim keeps inside
+  const Wmm = winW(), fl = new Uint8Array(R.n);
+  for (let i = 0; i < R.n; i++)
+    fl[i] = (Math.abs(R.V[i]) > cfg.vmax / Wmm * 1.001 ? 1 : 0) | (Math.abs(R.A[i]) > cfg.amax / Wmm * 1.001 ? 2 : 0) | (Math.abs(R.J[i]) > cfg.jmax / Wmm * 1.001 ? 4 : 0);
+  for (let i = 1; i < knots.length; i++) if (D[i] && D[i].inf) for (let s = Math.round(knots[i - 1].t * 1000); s <= Math.round(knots[i].t * 1000); s++) fl[s] |= 8;
+  R.fl = fl;
+  const msg = [!R.ok && 'The planner refused these ceilings or options; it kept the last ones it took.', R.refused && `The planner refused ${R.refused} knots.`].filter(Boolean);
+  $('#status').textContent = msg.join(' ');
   showSteps();
   draw(); inspector(); stats(); drawCursor();
 }
@@ -39,7 +170,7 @@ function fitView() {
   view = { t0: knots[0].t - pad, t1: t1 + pad };
 }
 
-// ---- geometry ---------------------------------------------------------------
+// ---- geometry -----------------------------------------------------------------------
 function dims(cv) {
   const r = cv.getBoundingClientRect(), dpr = devicePixelRatio || 1;
   if (cv.width !== Math.round(r.width * dpr) || cv.height !== Math.round(r.height * dpr)) { cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr); }
@@ -47,15 +178,19 @@ function dims(cv) {
   return { ctx, w: r.width, h: r.height };
 }
 const X = (t, w) => PAD.l + (t - view.t0) / (view.t1 - view.t0) * (w - PAD.l - PAD.r);
-const T = (x, w) => view.t0 + (x - PAD.l) / (w - PAD.l - PAD.r) * (view.t1 - view.t0);
+const Tx = (x, w) => view.t0 + (x - PAD.l) / (w - PAD.l - PAD.r) * (view.t1 - view.t0);
 const Y = (p, h) => PAD.t + (cfg.hi - p) / (cfg.hi - cfg.lo) * (h - PAD.t - PAD.b);
 const P = (y, h) => cfg.hi - (y - PAD.t) / (h - PAD.t - PAD.b) * (cfg.hi - cfg.lo);
+const dOf = (i) => (R && R.D[i]) || null;
+const knotP = (i) => { const d = dOf(i); return d ? mm(d.p) : pos(knots[i]); };
 
-// the two handle ends of a knot, in (s, mm)
+// a knot's two handle ends in (s, mm): its angle times each handle's time extent
 function handleEnds(i) {
-  const k = knots[i], prev = knots[i - 1], next = knots[i + 1], p = M.pos(k) + k.dp, out = {};
-  if (prev) { const TL = k.t - prev.t; out.in = [k.t - k.effIn * TL, p - k.vIn * k.effIn * TL]; }
-  if (next) { const TR = next.t - k.t; out.out = [k.t + k.effOut * TR, p + k.vOut * k.effOut * TR]; }
+  const k = knots[i], d = dOf(i), out = {};
+  if (!d) return out;
+  const p = mm(d.p), v = d.vel * winW();
+  if (i > 0 && d.TL > 0) out.in = [k.t - d.ei * d.TL, p - v * d.ei * d.TL];
+  if (i < knots.length - 1 && d.TR > 0) out.out = [k.t + d.eo * d.TR, p + v * d.eo * d.TR];
   return out;
 }
 function visibleHandles() {
@@ -67,8 +202,27 @@ function visibleHandles() {
   if (sel != null) { set.add(sel); if (sel > 0) set.add(sel - 1); if (sel < knots.length - 1) set.add(sel + 1); }
   return set;
 }
+const nudged = (d) => !!d && (Math.abs(d.ei - d.lIn) > 1e-6 || Math.abs(d.eo - d.lOut) > 1e-6);
 
-// ---- drawing ----------------------------------------------------------------
+// The visible 1 ms samples of arr, about two per pixel: each step draws its
+// first value and its range, in the color of the worst flag inside it.
+function series(ctx, w, arr, yOf, colorOf) {
+  const i0 = Math.max(0, Math.floor(view.t0 * 1000)), i1 = Math.min(R.n - 1, Math.ceil(view.t1 * 1000));
+  const st = Math.max(1, Math.floor((i1 - i0) / (2 * w)));
+  let col = null, px = 0, py = 0;
+  for (let i = i0; i <= i1; i += st) {
+    let lo = arr[i], hi = arr[i], f = 0;
+    for (let k = i; k < Math.min(i1 + 1, i + st); k++) { if (arr[k] < lo) lo = arr[k]; if (arr[k] > hi) hi = arr[k]; f |= R.fl[k]; }
+    const c = colorOf(f), x = X(i / 1000, w), y = yOf(arr[i]);
+    if (c !== col) { if (col) ctx.stroke(); ctx.strokeStyle = c; ctx.beginPath(); ctx.moveTo(col ? px : x, col ? py : y); col = c; }
+    ctx.lineTo(x, y);
+    if (st > 1 && lo !== hi) { ctx.lineTo(x, yOf(lo)); ctx.lineTo(x, yOf(hi)); ctx.lineTo(x, y); }
+    px = x; py = y;
+  }
+  if (col) ctx.stroke();
+}
+
+// ---- drawing ------------------------------------------------------------------------
 function ticks(ctx, w, h) {
   const span = view.t1 - view.t0, step = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 60].find((s) => span / s <= 12) || 60;
   ctx.font = `10px ${MONO}`; ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.strokeStyle = C.l2; ctx.lineWidth = 1;
@@ -84,47 +238,39 @@ function draw() {
   ctx.textAlign = 'right'; ctx.fillStyle = C.muted;
   for (const p of [cfg.lo, (cfg.lo + cfg.hi) / 2, cfg.hi]) ctx.fillText(p.toFixed(0), PAD.l - 6, Y(p, h) + 3);
   ctx.strokeStyle = C.l2; ctx.beginPath(); ctx.moveTo(PAD.l, Y(cfg.lo, h)); ctx.lineTo(w - PAD.r, Y(cfg.lo, h)); ctx.moveTo(PAD.l, Y(cfg.hi, h)); ctx.lineTo(w - PAD.r, Y(cfg.hi, h)); ctx.stroke();
-  if (!R) return;
+  if (!R) { drawStrips(); return; }
   ctx.save(); ctx.beginPath(); ctx.rect(PAD.l, 0, w - PAD.l - PAD.r, h); ctx.clip();
   // the script as authored, faint
   ctx.strokeStyle = C.l3; ctx.setLineDash([3, 4]); ctx.lineWidth = 1; ctx.beginPath();
   knots.forEach((k, i) => (i ? ctx.lineTo(X(k.t, w), Y(k.p, h)) : ctx.moveTo(X(k.t, w), Y(k.p, h)))); ctx.stroke(); ctx.setLineDash([]);
-  // the curve, red where a sample is over a ceiling
-  for (const pc of R.pieces) {
-    if (pc.t[pc.t.length - 1] < view.t0 || pc.t[0] > view.t1) continue;
-    ctx.lineWidth = 2;
-    for (let n = 1; n < pc.t.length; n++) {
-      const bad = Math.abs(pc.v[n]) > cfg.vmax * 1.001 || Math.abs(pc.a[n]) > cfg.amax * 1.001 || Math.abs(pc.j[n]) > cfg.jmax * 1.001;
-      ctx.strokeStyle = bad ? C.red : (knots[pc.i + 1].infeasible ? C.hi : C.blue);
-      ctx.beginPath(); ctx.moveTo(X(pc.t[n - 1], w), Y(pc.p[n - 1], h)); ctx.lineTo(X(pc.t[n], w), Y(pc.p[n], h)); ctx.stroke();
-    }
-  }
+  // the planner's motion, red where a sample is over a ceiling, pink in a piece no trim keeps inside
+  ctx.lineWidth = 2;
+  series(ctx, w, R.P, (x) => Y(mm(x), h), (f) => (f & 7 ? C.red : f & 8 ? C.hi : C.blue));
   // handles
-  const vis = visibleHandles();
-  for (const i of vis) {
-    const k = knots[i], e = handleEnds(i), kx = X(k.t, w), ky = Y(M.pos(k) + k.dp, h);
+  for (const i of visibleHandles()) {
+    const d = dOf(i); if (!d) continue;
+    const e = handleEnds(i), kx = X(knots[i].t, w), ky = Y(mm(d.p), h);
     for (const side of ['in', 'out']) {
       if (!e[side]) continue;
-      const nudged = Math.abs((side === 'in' ? k.effIn - k.lIn : k.effOut - k.lOut)) > 1e-6;
-      ctx.strokeStyle = nudged ? C.violet : (i === sel ? C.text : C.t3); ctx.lineWidth = 1;
+      const len = side === 'in' ? d.ei : d.eo, pre = side === 'in' ? d.lIn : d.lOut, moved = Math.abs(len - pre) > 1e-6;
+      ctx.strokeStyle = moved ? C.violet : (i === sel ? C.text : C.t3); ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(kx, ky); ctx.lineTo(X(e[side][0], w), Y(e[side][1], h)); ctx.stroke();
       ctx.fillStyle = C.bg; ctx.beginPath(); ctx.arc(X(e[side][0], w), Y(e[side][1], h), 3.5, 0, 7); ctx.fill(); ctx.stroke();
-      if (nudged) { // the length before the ceilings, ghosted
-        const prev = knots[i - 1], next = knots[i + 1], p = M.pos(k) + k.dp;
-        const g = side === 'in' ? [k.t - k.lIn * (k.t - prev.t), p - k.vIn * k.lIn * (k.t - prev.t)] : [k.t + k.lOut * (next.t - k.t), p + k.vOut * k.lOut * (next.t - k.t)];
+      if (moved) { // the length before the ceilings, ghosted
+        const s = side === 'in' ? -1 : 1, T_ = side === 'in' ? d.TL : d.TR, v = d.vel * winW();
+        const g = [knots[i].t + s * pre * T_, mm(d.p) + s * v * pre * T_];
         ctx.strokeStyle = C.muted; ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.arc(X(g[0], w), Y(g[1], h), 3.5, 0, 7); ctx.stroke(); ctx.setLineDash([]);
       }
     }
   }
   // knots
   knots.forEach((k, i) => {
-    const x = X(k.t, w), y = Y(M.pos(k) + k.dp, h);
+    const d = dOf(i), x = X(k.t, w), y = Y(knotP(i), h);
     if (x < PAD.l - 5 || x > w - PAD.r + 5) return;
-    if (k.dp !== 0 || k.pm != null) { ctx.strokeStyle = C.muted; ctx.beginPath(); ctx.arc(x, Y(k.p, h), 3.5, 0, 7); ctx.stroke(); }
-    ctx.fillStyle = k.infeasible ? C.red : CLS[k.cls]; ctx.beginPath(); ctx.arc(x, y, i === sel ? 5 : 3.5, 0, 7); ctx.fill();
+    if ((d && d.dp !== 0) || k.pm != null) { ctx.strokeStyle = C.muted; ctx.beginPath(); ctx.arc(x, Y(k.p, h), 3.5, 0, 7); ctx.stroke(); }
+    ctx.fillStyle = !d ? C.muted : d.inf ? C.red : CLS[CLSN[d.cls]]; ctx.beginPath(); ctx.arc(x, y, i === sel ? 5 : 3.5, 0, 7); ctx.fill();
     if (i === sel) { ctx.strokeStyle = C.text; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, 8, 0, 7); ctx.stroke(); }
-    if (stepsOn && diverged.has(i)) { ctx.strokeStyle = C.red; ctx.lineWidth = 1.5; ctx.setLineDash([2, 2]); ctx.beginPath(); ctx.arc(x, y, 11, 0, 7); ctx.stroke(); ctx.setLineDash([]); }
-    if (k.type !== 'auto') { ctx.fillStyle = C.violet; ctx.font = `9px ${MONO}`; ctx.textAlign = 'center'; ctx.fillText(k.type, x, y - 11); }
+    if (k.v != null && d) { ctx.fillStyle = C.violet; ctx.font = `9px ${MONO}`; ctx.textAlign = 'center'; ctx.fillText(d.g2 ? 'G2' : 'G1', x, y - 11); }
   });
   ctx.restore();
   drawStrips();
@@ -133,35 +279,22 @@ function drawStrips() {
   const { ctx, w, h } = dims(strips);
   ctx.fillStyle = C.bg; ctx.fillRect(0, 0, w, h);
   if (!R) return;
-  const rows = [['v', 'velocity mm/s', cfg.vmax, C.v], ['a', 'acceleration mm/s²', cfg.amax, C.a], ['j', 'jerk mm/s³', cfg.jmax, C.j]];
+  const Wmm = winW();
+  const rows = [['V', 1, 'velocity mm/s', cfg.vmax, C.v], ['A', 2, 'acceleration mm/s²', cfg.amax, C.a], ['J', 4, 'jerk mm/s³', cfg.jmax, C.j]];
   const rh = (h - 8) / 3;
-  rows.forEach(([key, label, ceil, color], r) => {
-    const y0 = 4 + r * rh, y1 = y0 + rh - 6;
+  const i0 = Math.max(0, Math.floor(view.t0 * 1000)), i1 = Math.min(R.n - 1, Math.ceil(view.t1 * 1000));
+  rows.forEach(([key, bit, label, ceil, color], r) => {
+    const y0 = 4 + r * rh, y1 = y0 + rh - 6, arr = R[key];
     let peak = ceil * 1.2;
-    for (const pc of R.pieces) { if (pc.t[pc.t.length - 1] < view.t0 || pc.t[0] > view.t1) continue; const pk = key === 'v' ? pc.peakV : key === 'a' ? pc.peakA : pc.peakJ; if (pk > peak) peak = pk; }
+    for (let i = i0; i <= i1; i++) peak = Math.max(peak, Math.abs(arr[i]) * Wmm);
     peak = Math.min(peak, ceil * 3);
     const YY = (val) => y0 + (y1 - y0) / 2 - val / peak * (y1 - y0) / 2;
     ctx.fillStyle = '#0D0F13'; ctx.fillRect(PAD.l, y0, w - PAD.l - PAD.r, y1 - y0);
     ctx.save(); ctx.beginPath(); ctx.rect(PAD.l, y0, w - PAD.l - PAD.r, y1 - y0); ctx.clip();
     ctx.strokeStyle = C.l2; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(PAD.l, YY(0)); ctx.lineTo(w - PAD.r, YY(0)); ctx.stroke();
     ctx.strokeStyle = C.red; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(PAD.l, YY(ceil)); ctx.lineTo(w - PAD.r, YY(ceil)); ctx.moveTo(PAD.l, YY(-ceil)); ctx.lineTo(w - PAD.r, YY(-ceil)); ctx.stroke(); ctx.setLineDash([]);
-    for (const pc of R.pieces) {
-      if (pc.t[pc.t.length - 1] < view.t0 || pc.t[0] > view.t1) continue;
-      const s = pc[key];
-      ctx.lineWidth = 1.5;
-      for (let n = 1; n < s.length; n++) {
-        ctx.strokeStyle = Math.abs(s[n]) > ceil * 1.001 ? C.red : color;
-        ctx.beginPath(); ctx.moveTo(X(pc.t[n - 1], w), YY(s[n - 1])); ctx.lineTo(X(pc.t[n], w), YY(s[n])); ctx.stroke();
-      }
-    }
-    // steps at the knots
-    for (const st of R.steps) {
-      const k = knots[st.i], x = X(k.t, w); if (x < PAD.l || x > w - PAD.r) continue;
-      const a = R.pieces[st.i - 1], b = R.pieces[st.i];
-      const va = key === 'v' ? a.vEnd : key === 'a' ? a.aEnd : null, vb = key === 'v' ? b.vStart : key === 'a' ? b.aStart : null;
-      if (va == null || Math.abs(va - vb) < peak * 0.01) continue;
-      ctx.strokeStyle = C.red; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x, YY(va)); ctx.lineTo(x, YY(vb)); ctx.stroke();
-    }
+    ctx.lineWidth = 1.5;
+    series(ctx, w, arr, (x) => YY(x * Wmm), (f) => (f & bit ? C.red : color));
     if (sel != null) { const x = X(knots[sel].t, w); ctx.strokeStyle = C.text; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke(); }
     ctx.restore();
     ctx.fillStyle = C.muted; ctx.font = `10px ${SANS}`; ctx.textAlign = 'left'; ctx.fillText(`${label}   ceiling ${fmt(ceil)}`, PAD.l + 4, y0 + 11);
@@ -169,107 +302,98 @@ function drawStrips() {
 }
 const fmt = (x, d = 0) => (Math.abs(x) >= 1e6 ? `${(x / 1e6).toFixed(2)}e6` : Number(x).toFixed(d));
 
-// ---- inspector and stats ----------------------------------------------------
+// ---- inspector and stats ------------------------------------------------------------
+// the peaks of the samples from knot a to knot b, mm units
+function peaks(a, b) {
+  const W = winW(); let v = 0, ac = 0, j = 0;
+  for (let s = Math.round(knots[a].t * 1000); s <= Math.round(knots[b].t * 1000); s++) { v = Math.max(v, Math.abs(R.V[s])); ac = Math.max(ac, Math.abs(R.A[s])); j = Math.max(j, Math.abs(R.J[s])); }
+  return { v: v * W, a: ac * W, j: j * W };
+}
 function inspector() {
-  const k = sel != null ? knots[sel] : null;
+  const k = sel != null ? knots[sel] : null, d = sel != null ? dOf(sel) : null;
   $('#k-none').hidden = !!k; $('#k-box').hidden = !k; $('#k-idx').textContent = k ? `${sel + 1} of ${knots.length}` : '';
   if (!k) return;
-  const st = R.steps.find((s) => s.i === sel);
-  const rows = [['time', `${(k.t * 1000).toFixed(0)} ms`], ['class', `<span class="cls-${k.cls}">${k.cls}</span>`], ['renders as', k.eff],
-    ['angle', k.eff === 'G0' ? `${fmt(k.vIn)} in, ${fmt(k.vOut)} out` : `${fmt(k.vIn)} mm/s`],
-    ['lengths', `${k.lIn.toFixed(3)} in, ${k.lOut.toFixed(3)} out`],
-    ['in ms', `${knots[sel - 1] ? (k.lIn * (k.t - knots[sel - 1].t) * 1000).toFixed(0) + ' in' : ''}${knots[sel + 1] ? `${knots[sel - 1] ? ', ' : ''}${(k.lOut * (knots[sel + 1].t - k.t) * 1000).toFixed(0)} out` : ''}`]];
-  const pieceRow = (pc, label) => pc && [label, `v ${fmt(pc.peakV)}  a ${fmt(pc.peakA)}  j ${fmt(pc.peakJ)}${pc.over > 1.001 ? ` <span class="bad">over ×${pc.over.toFixed(2)}</span>` : ''}`];
-  for (const r of [pieceRow(R.pieces[sel - 1], 'piece in'), pieceRow(R.pieces[sel], 'piece out')]) if (r) rows.push(r);
-  const nudged = Math.abs(k.effIn - k.lIn) > 1e-6 || Math.abs(k.effOut - k.lOut) > 1e-6;
-  if (nudged) rows.push(['after ceilings', `<dd class="nudge">${k.effIn.toFixed(3)} in, ${k.effOut.toFixed(3)} out`]);
-  if (k.dp !== 0) rows.push(['trimmed', `<dd class="nudge">${k.dp > 0 ? '+' : ''}${k.dp.toFixed(2)} mm toward the previous knot`]);
-  if (k.infeasible) rows.push(['', '<dd class="bad">no legal length, even trimmed']);
-  if (st) rows.push(['at the knot', `Δv ${fmt(st.dv)}, Δa ${fmt(st.da)}`], ['corner ramp', `${st.rampMs.toFixed(1)} ms at this jerk${st.dv ? `, ${st.cornerMs.toFixed(1)} ms for the velocity step` : ''}`]);
+  const rows = [['time', `${(k.t * 1000).toFixed(0)} ms`]];
+  if (d) {
+    const W = winW(), prev = knots[sel - 1], next = knots[sel + 1];
+    rows.push(['class', `<span class="cls-${CLSN[d.cls]}">${CLSN[d.cls]}</span>`], ['renders as', d.g2 ? 'G2' : 'G1'],
+      ['angle', `${fmt(d.vel * W)} mm/s, ${k.v != null ? 'set by hand' : sel === 0 ? 'at rest' : 'solved'}`],
+      ['lengths', `${d.lIn.toFixed(3)} in, ${d.lOut.toFixed(3)} out`],
+      ['in ms', [prev && `${(d.ei * d.TL * 1000).toFixed(0)} in`, next && `${(d.eo * d.TR * 1000).toFixed(0)} out`].filter(Boolean).join(', ')]);
+    const pieceRow = (a, b, label) => { const pk = peaks(a, b), wr = dOf(b) ? dOf(b).worst : 0; return [label, `v ${fmt(pk.v)}  a ${fmt(pk.a)}  j ${fmt(pk.j)}${wr > 1.001 ? ` <span class="bad">over ×${wr.toFixed(2)}</span>` : ''}`]; };
+    if (prev) rows.push(pieceRow(sel - 1, sel, 'piece in'));
+    if (next) rows.push(pieceRow(sel, sel + 1, 'piece out'));
+    if (nudged(d)) rows.push(['after ceilings', `<dd class="nudge">${d.ei.toFixed(3)} in, ${d.eo.toFixed(3)} out`]);
+    if (d.dp !== 0) rows.push(['trimmed', `<dd class="nudge">${d.dp > 0 ? '+' : ''}${(d.dp * W).toFixed(2)} mm toward the previous knot, keeps ${(d.share * 100).toFixed(1)}%`]);
+    if (d.inf) rows.push(['', '<dd class="bad">no legal length, even trimmed']);
+    if (d.corner) rows.push(['corner ramp', `${(d.rampT * 1000).toFixed(1)} ms at this jerk`]);
+  }
   $('#k-info').innerHTML = rows.map(([a, b]) => `<dt>${a}</dt>${b.startsWith('<dd') ? b + '</dd>' : `<dd>${b}</dd>`}`).join('');
-  $('#k-type').value = k.type;
-  const g0 = k.eff === 'G0';
-  $('#k-vrow').hidden = g0; $('#k-vinrow').hidden = !g0; $('#k-voutrow').hidden = !g0;
-  setIfIdle('#k-v', k.vIn.toFixed(0)); setIfIdle('#k-vin', k.vIn.toFixed(0)); setIfIdle('#k-vout', k.vOut.toFixed(0));
-  setIfIdle('#k-lin', k.lIn.toFixed(2)); setIfIdle('#k-lout', k.lOut.toFixed(2)); setIfIdle('#k-p', M.pos(k).toFixed(1));
-  const notes = [...k.note];
-  if (k.cls === 'rest' && k.eff === 'G2') notes.push('a hold edge: a cubic leaves rest with acceleration, so the corner ramp takes the step');
-  if (Object.keys(k.man).length) notes.push('hand-set: ' + Object.keys(k.man).join(', '));
+  $('#k-vrow').hidden = sel === 0;
+  setIfIdle('#k-v', d ? (d.vel * winW()).toFixed(0) : ''); setIfIdle('#k-p', pos(k).toFixed(1));
+  const notes = [d && d.clamped && 'angle held to the speed ceiling', k.v != null && 'angle set by hand', k.pm != null && 'moved by hand', sel === 0 && 'the origin: the motion starts here at rest'].filter(Boolean);
   $('#k-note').textContent = notes.join('. ');
 }
 function setIfIdle(sel_, v) { const el = $(sel_); if (document.activeElement !== el) el.value = v; }
 function stats() {
   if (!R) return;
-  const c = R.report.counts || {}, longest = R.steps.reduce((m, s) => Math.max(m, s.rampMs), 0);
-  const rows = [['knots', knots.length], ['holds', c.rest || 0], ['crests', c.crest || 0], ['through', c.through || 0],
-    ['pieces over', `<dd class="${R.report.overPieces ? 'bad' : ''}">${R.report.overPieces} of ${R.pieces.length}`],
-    ['infeasible', `<dd class="${R.report.infeasible ? 'bad' : ''}">${R.report.infeasible}`],
-    ['nudged', knots.filter((k) => Math.abs(k.effIn - k.lIn) > 1e-6 || Math.abs(k.effOut - k.lOut) > 1e-6).length],
-    ['trimmed', `${knots.filter((k) => k.dp !== 0).length} knots, ${knots.reduce((m, k) => m + Math.abs(k.dp), 0).toFixed(1)} mm`], ['longest ramp', `${longest.toFixed(1)} ms`]];
+  const D = R.D, c = [0, 0, 0, 0];
+  for (const d of D) if (d) c[d.cls]++;
+  const inf = D.filter((d) => d && d.inf).length, tr = D.filter((d) => d && d.dp !== 0);
+  const rows = [['knots', knots.length], ['holds', c[1]], ['crests', c[2]], ['through', c[3]],
+    ['pieces over', `<dd class="${inf ? 'bad' : ''}">${inf} of ${knots.length - 1}`],
+    ['samples over', `<dd class="${R.over ? 'bad' : ''}">${R.over} of ${R.n}`],
+    ['nudged', D.filter(nudged).length],
+    ['trimmed', `${tr.length} knots, ${tr.reduce((m, d) => m + Math.abs(d.dp) * winW(), 0).toFixed(1)} mm`],
+    ['longest ramp', `${(D.reduce((m, d) => Math.max(m, d ? d.rampT : 0), 0) * 1000).toFixed(1)} ms`]];
   $('#stats').innerHTML = rows.map(([a, b]) => `<dt>${a}</dt>${String(b).startsWith('<dd') ? b + '</dd>' : `<dd>${b}</dd>`}`).join('');
 }
 
-// ---- pointer ----------------------------------------------------------------
+// ---- pointer --------------------------------------------------------------------------
 function hit(ev) {
   const r = plot.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top, w = r.width, h = r.height;
   for (const i of visibleHandles()) {
+    if (i === 0) continue;   // the origin rests: no angle to set
     const e = handleEnds(i);
     for (const side of ['in', 'out']) if (e[side] && Math.hypot(X(e[side][0], w) - x, Y(e[side][1], h) - y) < 7) return { kind: 'handle', i, side };
   }
   let best = null;
-  knots.forEach((k, i) => { const d = Math.hypot(X(k.t, w) - x, Y(M.pos(k) + k.dp, h) - y); if (d < 9 && (!best || d < best.d)) best = { kind: 'knot', i, d }; });
+  knots.forEach((k, i) => { const d = Math.hypot(X(k.t, w) - x, Y(knotP(i), h) - y); if (d < 9 && (!best || d < best.d)) best = { kind: 'knot', i, d }; });
   return best;
 }
+// a drag replays at most once per frame
+function dragUpdate() { if (!dragRaf) dragRaf = requestAnimationFrame(() => { dragRaf = 0; update(); }); }
 plot.addEventListener('pointerdown', (ev) => {
   if (ev.button !== 0) return;
   const t = hit(ev);
   const r = plot.getBoundingClientRect();
-  if (t && t.kind === 'handle') { sel = t.i; drag = { ...t }; }
-  else if (t && t.kind === 'knot') { sel = t.i; drag = { kind: 'knot', i: t.i, moved: false }; }
+  if (t) { sel = t.i; drag = { ...t }; }
   else drag = { kind: 'pan', x0: ev.clientX, v0: { ...view }, w: r.width };
   plot.setPointerCapture(ev.pointerId); update();
 });
 plot.addEventListener('pointermove', (ev) => {
   const r = plot.getBoundingClientRect(), w = r.width, h = r.height, x = ev.clientX - r.left, y = ev.clientY - r.top;
-  if (!drag) { const t = hit(ev); plot.style.cursor = t ? 'pointer' : 'grab'; if (!playing) readout(T(x, w), P(y, h)); return; }
+  if (!drag) { const t = hit(ev); plot.style.cursor = t ? 'pointer' : 'grab'; if (!playing) readout(Tx(x, w), P(y, h)); return; }
   if (drag.kind === 'pan') { const dt = (ev.clientX - drag.x0) / (drag.w - PAD.l - PAD.r) * (drag.v0.t1 - drag.v0.t0); view = { t0: drag.v0.t0 - dt, t1: drag.v0.t1 - dt }; draw(); drawCursor(); return; }
   const k = knots[drag.i];
-  if (drag.kind === 'knot') { k.pm = Math.min(cfg.hi, Math.max(cfg.lo, P(y, h))); drag.moved = true; update(); return; }
-  // a handle: the end lands under the pointer; Shift keeps the angle
-  const prev = knots[drag.i - 1], next = knots[drag.i + 1];
-  const span = drag.side === 'in' ? k.t - prev.t : next.t - k.t;
-  const tt = T(x, w), pp = P(y, h), p = M.pos(k) + k.dp;
-  const dt = Math.min(M.LMAX * span, Math.max(M.LMIN * span, drag.side === 'in' ? k.t - tt : tt - k.t));
-  const l = dt / span;
-  if (drag.side === 'in') k.man.lIn = l; else k.man.lOut = l;
-  if (!ev.shiftKey) {
-    const v = (drag.side === 'in' ? p - pp : pp - p) / dt;
-    if (k.eff === 'G0') { if (drag.side === 'in') k.man.vIn = v; else k.man.vOut = v; }
-    else { k.man.v = v; if (k.type === 'auto' || k.type === 'G2') k.type = 'G1'; }
-  }
-  update();
+  if (drag.kind === 'knot') { k.pm = Math.min(cfg.hi, Math.max(cfg.lo, P(y, h))); dragUpdate(); return; }
+  // a handle: its angle points at the pointer; its length stays the planner's
+  const tt = Tx(x, w), pp = P(y, h), p = knotP(drag.i), dt = drag.side === 'in' ? k.t - tt : tt - k.t;
+  if (dt > 1e-4) { k.v = (drag.side === 'in' ? p - pp : pp - p) / dt; dragUpdate(); }
 });
 plot.addEventListener('pointerup', () => { drag = null; });
 plot.addEventListener('wheel', (ev) => {
   ev.preventDefault();
-  const r = plot.getBoundingClientRect(), w = r.width, tc = T(ev.clientX - r.left, w), f = ev.deltaY > 0 ? 1.2 : 1 / 1.2;
+  const r = plot.getBoundingClientRect(), w = r.width, tc = Tx(ev.clientX - r.left, w), f = ev.deltaY > 0 ? 1.2 : 1 / 1.2;
   view = { t0: tc - (tc - view.t0) * f, t1: tc + (view.t1 - tc) * f }; draw(); drawCursor();
 }, { passive: false });
 function readout(t, p) { $('#readout').textContent = `${(t * 1000).toFixed(0)} ms   ${p.toFixed(1)} mm`; }
 
-// ---- playback: the rendered motion at real speed, the carriage on the rail --
+// ---- playback: the planner's samples at real speed, the carriage on the rail ----
 function stateAt(t) {
-  if (!R || !R.pieces.length) return null;
-  const P = R.pieces;
-  if (t <= P[0].t[0]) return { p: P[0].p[0], v: 0, a: 0 };
-  const last = P[P.length - 1];
-  if (t >= last.t[last.t.length - 1]) return { p: last.p[last.p.length - 1], v: 0, a: 0 };
-  let lo = 0, hi = P.length - 1;
-  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (P[m].t[0] <= t) lo = m; else hi = m - 1; }
-  const pc = P[lo]; let a = 0, b = pc.t.length - 1;
-  while (b - a > 1) { const m = (a + b) >> 1; if (pc.t[m] <= t) a = m; else b = m; }
-  const f = (t - pc.t[a]) / Math.max(1e-9, pc.t[b] - pc.t[a]);
-  return { p: pc.p[a] + f * (pc.p[b] - pc.p[a]), v: pc.v[a] + f * (pc.v[b] - pc.v[a]), a: pc.a[a] + f * (pc.a[b] - pc.a[a]) };
+  if (!R) return null;
+  const i = Math.min(R.n - 1, Math.max(0, Math.round(t * 1000))), W = winW();
+  return { p: mm(R.P[i]), v: R.V[i] * W, a: R.A[i] * W };
 }
 function drawCursor() {
   const { ctx, w, h } = dims(overlay); ctx.clearRect(0, 0, w, h);
@@ -283,14 +407,14 @@ function drawCursor() {
 }
 function drawRail() {
   const { ctx, w, h } = dims(rail); ctx.fillStyle = C.bg; ctx.fillRect(0, 0, w, h);
-  const top = 12, bot = h - 12, YR = (mm) => bot - mm / cfg.rail * (bot - top);
+  const top = 12, bot = h - 12, YR = (v) => bot - v / cfg.rail * (bot - top);
   ctx.fillStyle = '#12151B'; ctx.fillRect(w / 2 - 5, top, 10, bot - top);
   ctx.fillStyle = 'rgba(77,166,255,0.18)'; ctx.fillRect(w / 2 - 12, YR(cfg.hi), 24, YR(cfg.lo) - YR(cfg.hi));
   ctx.strokeStyle = C.blue; ctx.lineWidth = 1; ctx.strokeRect(w / 2 - 12, YR(cfg.hi), 24, YR(cfg.lo) - YR(cfg.hi));
   ctx.fillStyle = C.muted; ctx.font = `9px ${MONO}`; ctx.textAlign = 'center';
   ctx.fillText(`${cfg.rail}`, w / 2, top - 3); ctx.fillText('0', w / 2, bot + 10);
   const st = cursor == null ? null : stateAt(cursor);
-  const p = st ? st.p : (knots.length ? M.pos(knots[0]) : cfg.lo);
+  const p = st ? st.p : (knots.length ? pos(knots[0]) : cfg.lo);
   ctx.fillStyle = C.text; ctx.fillRect(w / 2 - 16, YR(p) - 3, 32, 6);
 }
 function frame(now) {
@@ -306,37 +430,30 @@ function togglePlay() {
 }
 $('#play').addEventListener('click', togglePlay);
 
-// ---- controls ---------------------------------------------------------------
+// ---- controls ---------------------------------------------------------------------------
 $('#file').addEventListener('change', (ev) => {
   const f = ev.target.files[0]; if (!f) return;
   f.text().then((txt) => { try { load(JSON.parse(txt), f.name); } catch (e) { $('#status').textContent = `not a funscript: ${e.message}`; } });
 });
 document.addEventListener('dragover', (ev) => ev.preventDefault());
 document.addEventListener('drop', (ev) => { ev.preventDefault(); const f = ev.dataTransfer.files[0]; if (f) f.text().then((txt) => load(JSON.parse(txt), f.name)); });
-$('#sample').addEventListener('click', () => load(M.SAMPLE, 'built-in'));
-$('#autoall').addEventListener('click', () => { for (const k of knots) { k.type = 'auto'; k.man = {}; k.pm = null; } update(); });
+$('#sample').addEventListener('click', () => load(SAMPLE, 'built-in'));
+$('#autoall').addEventListener('click', () => { for (const k of knots) { k.v = null; k.pm = null; } update(); });
 $('#fit').addEventListener('click', () => { fitView(); draw(); drawCursor(); });
-$('#k-type').addEventListener('change', (ev) => { if (sel == null) return; knots[sel].type = ev.target.value; update(); });
-$('#k-auto').addEventListener('click', () => { if (sel == null) return; const k = knots[sel]; k.type = 'auto'; k.man = {}; k.pm = null; update(); });
+$('#k-auto').addEventListener('click', () => { if (sel == null) return; const k = knots[sel]; k.v = null; k.pm = null; update(); });
 $('#k-prev').addEventListener('click', () => { if (sel > 0) { sel--; update(); } });
 $('#k-next').addEventListener('click', () => { if (sel != null && sel < knots.length - 1) { sel++; update(); } });
-for (const [id, key] of [['#k-v', 'v'], ['#k-vin', 'vIn'], ['#k-vout', 'vOut'], ['#k-lin', 'lIn'], ['#k-lout', 'lOut']]) {
-  $(id).addEventListener('change', (ev) => {
-    if (sel == null) return; const k = knots[sel], v = Number(ev.target.value); if (!isFinite(v)) return;
-    k.man[key] = key.startsWith('l') ? Math.min(M.LMAX, Math.max(M.LMIN, v)) : v;
-    if (key === 'v' && (k.type === 'auto' || k.type === 'G2')) k.type = 'G1';
-    update();
-  });
-}
+$('#k-v').addEventListener('change', (ev) => { if (sel == null || sel === 0) return; const v = Number(ev.target.value); if (ev.target.value === '' || !isFinite(v)) return; knots[sel].v = v; update(); });
 $('#k-p').addEventListener('change', (ev) => { if (sel == null) return; knots[sel].pm = Math.min(cfg.hi, Math.max(cfg.lo, Number(ev.target.value))); update(); });
-for (const [id, key] of [['#c-vmax', 'vmax'], ['#c-amax', 'amax'], ['#c-jmax', 'jmax'], ['#c-lfloor', 'lfloor'], ['#c-trim', 'trim'], ['#c-hold', 'holdEps']]) {
+for (const [id, key] of [['#c-vmax', 'vmax'], ['#c-amax', 'amax'], ['#c-jmax', 'jmax'], ['#c-lfloor', 'lfloor'], ['#c-trim', 'trim']]) {
   $(id).value = cfg[key];
   $(id).addEventListener('change', (ev) => { const v = Number(ev.target.value); if (isFinite(v) && v >= 0) { cfg[key] = v; update(); } });
 }
 // the window: size and offset on the rail; the script rescales into it
 function setWindow(lo, hi) {
   const old = { lo: cfg.lo, hi: cfg.hi }; cfg.lo = lo; cfg.hi = hi; cfg.trim = hi - lo; $('#c-trim').value = cfg.trim;
-  for (const k of knots) { k.p = lo + (k.p - old.lo) / (old.hi - old.lo) * (hi - lo); if (k.pm != null) k.pm = lo + (k.pm - old.lo) / (old.hi - old.lo) * (hi - lo); }
+  const f = (p) => lo + (p - old.lo) / (old.hi - old.lo) * (hi - lo);
+  for (const k of knots) { k.p = f(k.p); if (k.pm != null) k.pm = f(k.pm); if (k.v != null) k.v *= (hi - lo) / (old.hi - old.lo); }
   syncWindowInputs(); update();
 }
 function syncWindowInputs() {
@@ -366,84 +483,24 @@ new ResizeObserver(() => { draw(); drawCursor(); }).observe(plot);
 new ResizeObserver(() => { drawStrips(); drawCursor(); }).observe(strips);
 $('#legend').innerHTML = [['hold edge', CLS.rest], ['crest', CLS.crest], ['through point', CLS.through], ['nudged handle', C.violet], ['over a ceiling', C.red], ['infeasible knot', C.hi]]
   .map(([n, c]) => `<li><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="${c}"/></svg>${n}</li>`).join('');
-// ---- the planner steps ---------------------------------------------------------
-// The real planner (steps.js over kinetic2-trace.wasm, the playground's) on this
-// page's knots, ceilings and options, in window units (0..1 over the window).
-// Constraints:
-// - Loaded the first time the steps are shown, never on the page's load.
-// - The page draws handles-model.js, not the planner. Every knot where the
-//   planner's last pass ends elsewhere (class, angle, handle lengths, trim,
-//   verdict) is listed above the steps and ringed on the plot; hand-set types
-//   and lengths are not planner inputs and are listed as such. Tolerances: the
-//   parity test's (tests/test_kinetic2_handles.cpp), trims 1e-4 of the window.
-let stepper = null, stepsOn = false, stepsLoading = false, diverged = new Set();
+
+// ---- the planner steps ------------------------------------------------------------------
+// steps.js on this page's planner instance, in mm. Loaded the first time the
+// steps are shown, never on the page's load.
+let stepper = null, stepsOn = false, stepsLoading = false;
 const SC = { ...C, t2: '#C3C8D1', l1: '#121419', l4: '#33373E', sunken: '#040507', bad: C.red };
-const winOf = () => { const W = cfg.hi - cfg.lo; return { W, w: (p) => (p - cfg.lo) / W }; };
-// The page's script through the planner: the first knot is the origin at rest,
-// every other knot submitted ahead at its time, a hand-set angle as the knot's angle.
-function replayPlanner(T) {
-  const { K, h, dv, sBuf } = T, { W, w } = winOf();
-  const ok = K.kinetic2_configure(h, cfg.vmax / W, cfg.amax / W, cfg.jmax / W, cfg.smoothness, Math.min(0.33, Math.max(0.05, cfg.lfloor)), Math.min(1, Math.max(0, cfg.trim / W)), 4000);
-  if (!ok) $('#status').textContent = 'The planner refused these ceilings or options; the steps show the last ones it took.';
-  const t0 = Math.round(knots[0].t * 1e6);
-  K.kinetic2_reset(h, w(M.pos(knots[0])), t0);
-  for (const k of knots.slice(1)) K.kinetic2_submit(h, Math.round(k.t * 1e6), w(M.pos(k)), k.man.v != null ? 1 : 0, (k.man.v ?? 0) / W, t0, 2);
-  K.kinetic2_solved(h, 0, T.kBuf);
-  const n = Math.round((knots[knots.length - 1].t + 0.3) * 1000) + 1, z = Math.floor(t0 / 1000);
-  const P = new Float32Array(n), V = new Float32Array(n), A = new Float32Array(n), J = new Float32Array(n);
-  let mv = 0, ma = 0, mj = 0, over = 0;
-  for (let i = 0; i < n; i++) {
-    if (i < z) { P[i] = w(M.pos(knots[0])); continue; }   // before the origin the axis rests on it
-    K.kinetic2_sample(h, i * 1000, sBuf);
-    P[i] = dv.getFloat32(sBuf + 8, true); V[i] = dv.getFloat32(sBuf + 12, true); A[i] = dv.getFloat32(sBuf + 16, true);
-    J[i] = i ? (A[i] - A[i - 1]) * 1000 : 0;
-    mv = Math.max(mv, Math.abs(V[i])); ma = Math.max(ma, Math.abs(A[i])); mj = Math.max(mj, Math.abs(J[i]));
-    if (Math.abs(V[i]) > cfg.vmax / W * 1.001 || Math.abs(A[i]) > cfg.amax / W * 1.001 || Math.abs(J[i]) > cfg.jmax / W * 1.001) over++;
-  }
-  return { n, P, V, A, J, max: { v: mv, a: ma, j: mj }, over };
-}
-// Where the model the page draws and the planner's render disagree.
-function diverge() {
-  const box = $('#steps-div'), f = stepper && stepper.final();
-  diverged = new Set();
-  if (!f) { box.hidden = true; return; }
-  const { W } = winOf(), s = f.snap, CL = ['end', 'rest', 'crest', 'through'], rows = [], notIn = [];
-  const n = Math.min(knots.length, s.cls.length);
-  for (let i = 0; i < n; i++) {
-    const k = knots[i], d = [], v = s.vel[i] * W, dp = s.dp[i] * W;
-    if (i > 0 && i < knots.length - 1 && k.cls !== CL[s.cls[i]]) d.push(`class ${k.cls} / ${CL[s.cls[i]]}`);
-    if (k.eff !== 'G0' && Math.abs(k.vIn - v) > 1e-3 * Math.max(1, Math.abs(k.vIn))) d.push(`angle ${k.vIn.toFixed(1)} / ${v.toFixed(1)} mm/s`);
-    if (i > 0 && Math.abs(k.effIn - s.ei[i]) > 1e-3) d.push(`length in ${k.effIn.toFixed(3)} / ${s.ei[i].toFixed(3)}`);
-    if (i < knots.length - 1 && Math.abs(k.effOut - s.eo[i]) > 1e-3) d.push(`length out ${k.effOut.toFixed(3)} / ${s.eo[i].toFixed(3)}`);
-    if (Math.abs(k.dp - dp) > 1e-4 * W) d.push(`trim ${k.dp.toFixed(2)} / ${dp.toFixed(2)} mm`);
-    if (!!k.infeasible !== !!s.inf[i]) d.push(k.infeasible ? 'over in the model only' : 'over in the planner only');
-    if (d.length) { diverged.add(i); rows.push(`<li><span class="mono">knot ${i} · ${(k.t * 1000).toFixed(0)} ms</span> ${d.join(', ')}</li>`); }
-    const hand = [k.type !== 'auto' && `${k.type} by hand`, (k.man.lIn != null || k.man.lOut != null) && 'hand-set lengths', (k.man.vIn != null || k.man.vOut != null) && 'two angles'].filter(Boolean);
-    if (hand.length) notIn.push(`knot ${i}: ${hand.join(', ')}`);
-  }
-  if (knots.length !== s.cls.length) rows.push(`<li>the planner rendered ${s.cls.length} knots, the model ${knots.length}</li>`);
-  const holdW = 0.005 * W;   // solver.hpp kHoldEps, of the window
-  const notes = [Math.abs(cfg.holdEps - holdW) > 1e-9 && `hold eps: the page ${cfg.holdEps} mm, the planner ${holdW.toFixed(2)} mm (0.005 of the window)`].filter(Boolean);
-  box.hidden = false;
-  box.innerHTML = '<h2>Model and planner <span class="muted small">the page draws handles-model.js; the steps are the planner\'s for the same knots</span></h2>'
-    + (rows.length ? `<p class="bad">They differ at ${diverged.size} knot${diverged.size === 1 ? '' : 's'} (model / planner), ringed on the plot:</p><ul class="divs">${rows.join('')}</ul>`
-      : '<p class="ok">They agree at every knot: classes, angles, handle lengths, trims and verdicts.</p>')
-    + (notIn.length ? `<p class="muted small">Not planner inputs, drawn by the model only: ${notIn.join('; ')}.</p>` : '')
-    + (notes.length ? `<p class="muted small">${notes.join('. ')}.</p>` : '')
-    + '<p class="muted small">The planner also keeps to the rail (railStop), trims the last knot and tightens over passes; the model does neither.</p>';
-}
 function showSteps() {
   $('#steps').hidden = !stepsOn;
-  if (!stepsOn) { $('#steps-div').hidden = true; diverged = new Set(); if (stepper) stepper.pause(); return; }
-  if (stepper) { stepper.update(); diverge(); return; }
+  if (!stepsOn) { if (stepper) stepper.pause(); return; }
+  if (stepper) { stepper.update(); return; }
   if (stepsLoading) return;
   stepsLoading = true;
   import('./steps.js').then((m) => m.init($('#steps'), {
-    replay: replayPlanner, fit: (cv) => { const d = dims(cv); return { g: d.ctx, w: d.w, h: d.h }; }, C: SC, MONO, SANS,
-    state: () => { const { W } = winOf(); return { o: { vmax: cfg.vmax / W, amax: cfg.amax / W, jmax: cfg.jmax / W } }; },
-    units: () => ({ k: cfg.hi - cfg.lo, off: cfg.lo, pd: 2, vd: 1, pu: ' mm', v: 'mm/s', a: 'mm/s²', j: 'mm/s³' }),
-  })).then((s) => { stepper = s; if (stepsOn) { s.update(); diverge(); draw(); } },
-    (e) => { stepsOn = false; $('#steps').hidden = true; syncStepsToggle(); $('#status').textContent = 'The planner steps did not load (' + e.message + '); they need the page served over http.'; })
+    K: T.K, replay: (W) => replay(W), fit: (cv) => { const d = dims(cv); return { g: d.ctx, w: d.w, h: d.h }; }, C: SC, MONO, SANS,
+    state: () => { const W = winW(); return { o: { vmax: cfg.vmax / W, amax: cfg.amax / W, jmax: cfg.jmax / W } }; },
+    units: () => ({ k: winW(), off: cfg.lo, pd: 2, vd: 1, pu: ' mm', v: 'mm/s', a: 'mm/s²', j: 'mm/s³' }),
+  })).then((s) => { stepper = s; if (stepsOn) s.update(); },
+    (e) => { stepsOn = false; $('#steps').hidden = true; syncStepsToggle(); $('#status').textContent = 'The planner steps did not load (' + e.message + ').'; })
     .finally(() => { stepsLoading = false; });
 }
 function syncStepsToggle() { $('#steps-toggle').setAttribute('aria-pressed', String(stepsOn)); }
@@ -451,9 +508,9 @@ $('#steps-toggle').addEventListener('click', () => { stepsOn = !stepsOn; syncSte
 
 // for handles.check.mjs
 window.__handles = {
-  state: () => ({ knots, R, sel, view, cfg, cursor, playing, diverged: [...diverged] }),
-  setWindow,
-  xy: (i) => { const r = plot.getBoundingClientRect(); return { x: r.left + X(knots[i].t, r.width), y: r.top + Y(M.pos(knots[i]) + knots[i].dp, r.height) }; },
+  state: () => ({ knots, R, sel, view, cfg, cursor, playing }),
+  setWindow, replay, load,
+  xy: (i) => { const r = plot.getBoundingClientRect(); return { x: r.left + X(knots[i].t, r.width), y: r.top + Y(knotP(i), r.height) }; },
   handleXY: (i, side) => { const r = plot.getBoundingClientRect(), e = handleEnds(i)[side]; return { x: r.left + X(e[0], r.width), y: r.top + Y(e[1], r.height) }; },
 };
-load(M.SAMPLE, 'built-in');
+boot();

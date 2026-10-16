@@ -6,8 +6,7 @@ target_compile_options(test_kinetic2 PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O2 -Wall -Wextra>)
 add_test(NAME test_kinetic2 COMMAND test_kinetic2)
 
-# Kinetic² against its spec, the handle model. handles_fixture.hpp is
-# generated: `node tests/gen_handles_fixture.mjs` from the Kinetic root.
+# The handle renderer on its fixture scripts (handles_fixture.hpp, hand-kept).
 add_executable(test_kinetic2_handles test_kinetic2_handles.cpp)
 target_link_libraries(test_kinetic2_handles PRIVATE kinetic::kinetic2)
 target_include_directories(test_kinetic2_handles PRIVATE third_party)

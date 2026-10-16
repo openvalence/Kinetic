@@ -115,50 +115,43 @@ Illegal values are red, legal ones blue.
 The trace keeps 131072 records; a window that needs more says so under the
 step list. A Kinetic change that moves a decision moves its hook with it.
 
-The handles page has the same steps, in mm. It draws `handles-model.js`, not the
-planner, so the steps run the planner on the page's knots (the first one the
-origin at rest, a hand-set angle as the knot's angle, the page's ceilings, handle
-floor, max trim and smoothness), and a box above them compares the planner's last
-pass with the model knot by knot: class, angle, handle lengths, trim and verdict,
-within the parity test's tolerances. Knots that differ are listed and ringed on
-the plot. Hand-set types (G0, G1, G2) and hand-set lengths are not planner
-inputs and are listed as such. The built-in script at the default ceilings
-agrees everywhere; the two part where the planner's rail rules, last-knot trim,
-slack passes or hold threshold (0.005 of the window) act, which the model leaves
-out.
+The handles page has the same steps, in mm, on its own planner instance: the
+knots it draws, the first one the origin at rest, an angle set by hand as the
+knot's angle.
 
 ## The handles page
 
-`handles.html` is a second page, pure JS, no wasm: a funscript as a composite
-cubic Bézier in the time-position plane (kin-d0o, the design under study for
-the renderer). The script's knots stay on the author's clock; each knot has
-one angle (its velocity) and two handle lengths (the time extent of each
-handle as a fraction of its span; a third is the exact PCHIP cubic). A knot
-is classified from its chords: a hold edge, a crest (the chords change sign)
-or a through point (same sign). Its class can be set by hand: G0 renders a
-corner with two angles, G1 one angle with free lengths, G2 continuous
-acceleration (the angle for a through point, the lengths for a crest). The
-smoothness sets the defaults: at 0 (PCHIP) crests and hold edges stay G1 as
-drawn, the corner ramp takes their acceleration step, and through points are
-G2 by their angle; at 1 through points take Makima's angles and crests and
-hold edges stay flat, G2 by their lengths; between, the free angles and lengths of the two
-blend (the kernel's Config::smoothness). The
-ceilings, the window included, bound the lengths per piece: speed from above, acceleration and jerk
-from below. A piece no length satisfies may move its later knot inside the
-tolerance box; what remains is marked infeasible. Handles drag as in Blender
-(aligned; Shift keeps the angle), knots drag in position, and the strips show
-velocity, acceleration and jerk against the ceilings with every nudge drawn.
-The window (size and offset on the rail) rescales the script live, so the same
-script can be watched asking more or less of the machine; Play runs the
-rendered motion at real speed with the carriage on the rail strip.
+`handles.html` runs a funscript through the planner and draws it as the planner
+renders it (kin-d0o): a composite cubic Bézier in the time-position plane, the
+knots on the author's clock, one angle (the knot's velocity) and two handle
+lengths per knot (the time extent of each handle as a share of its span; a
+third is the exact PCHIP cubic), the ceilings as bounds on the lengths (Valence
+RFC-106). It loads `kinetic2-trace.wasm` up front: the curve and the velocity,
+acceleration and jerk strips are the 1 ms samples, bit for bit those of
+`kinetic2.wasm`; each knot's class (end, hold edge, crest, through point),
+G1 or G2, angle, handle lengths before and after the ceilings, trim and
+verdict are the trace records of the last render round that had the knot
+between two others. The normal module reports none of those per knot, which is
+why the page takes the trace build: about 80 KB against 70 KB, with 32 MB of
+linear memory against 2 MB (the trace buffer, zeroed pages).
 
-It opens from `file://` (plain scripts, no fetch). `node playground/handles.check.mjs`
-checks the model in node (the figure numbers: 150 mm strokes at 200 ms
-between crests fit at a length of 0.25 under 1000 mm/s and 50000 mm/s²; a
-through point's G2 angle; the built-in script's classes and ceilings) and,
-with Playwright reachable, drives the page headless: load, select, drag a
-handle, set a class, tighten a ceiling, zero console errors, no horizontal
-scroll at phone width, two screenshots.
+The knots go in as a sender's would: the first is the origin at rest, the
+next 64 are submitted at its time, and each later one as a slot frees, so a
+script of any length renders. What the page sets is what the planner takes:
+knot positions, an angle per knot (drag a handle; the length stays the
+planner's), the ceilings, smoothness, handle floor and max trim. The hold
+threshold is the planner's, 0.005 of the window. The window (size and offset
+on the rail) rescales the script live; Play runs the samples at real speed
+with the carriage on the rail strip.
+
+It needs the page served over http (the module is fetched).
+`node playground/handles.check.mjs` copies both modules from
+`build-wasm/wasm/`, serves the folder and drives the page headless: every 1 ms
+sample equal to `kinetic2.wasm`'s and every knot on the curve, for the built-in
+script, an edited one, 400 mm/s, a jerk of 1e6, a 300 mm window, smoothness 1
+and a 300-knot script; a dragged handle sets the angle the planner renders;
+the planner steps on the page's instance; zero console errors, no horizontal
+scroll at 1280x720, 1920x1080 and 390x844 with the steps on and off.
 
 ## Pages
 

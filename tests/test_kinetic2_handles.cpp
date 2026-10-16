@@ -1,21 +1,10 @@
-// test_kinetic2_handles.cpp -- parity of the Kinetic² renderer with its spec,
-// the handle model (playground/handles-model.js, ruling kin-y6e / RFC-106).
-// The expected samples and trims are tests/handles_fixture.hpp, generated from
-// the model: `node tests/gen_handles_fixture.mjs` from the Kinetic root.
+// test_kinetic2_handles.cpp -- the handle renderer (Valence RFC-106, kin-y6e)
+// on its fixture scripts (tests/handles_fixture.hpp): ceilings, continuity and
+// flat holds in sampled reality, the two styles bit for bit, the smoothness,
+// handle_floor and trim_max bounds.
 // Constraints:
 // - Every engine assertion is sampled reality on the 1 ms grid, never the
-//   planner's word; the renderer's trims are read from handles::render alone.
-// - Parity bars as asserted: the renderer's trims within 1e-4 of the window at
-//   every knot with no allowance (the model renders with railStop as the
-//   kernel does, kin-88m); position within 0.5% of the window at every sample
-//   and the engine's trims within 1e-4, both past the corner-ramp allowance
-//   only. Ceilings within 0.1%.
-// - The corner ramps and the origin's lead ramp are the engine's
-//   (engine_piece.hpp, solver.hpp renderRun), and so are the slack passes that
-//   tighten a piece's ceilings by what those ramps cost it: the model has none
-//   of them, so they are the one allowance. The renderer-only cases
-//   (kRenderCases: the rail rules, the monotone judge) are held to the
-//   renderer alone: the slack passes move them past that allowance.
+//   planner's word.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest/doctest.h"
 
@@ -52,7 +41,7 @@ Run render(const handles_fixture::Case& c) {
         if (!e.submit(k, 0)) ++r.refused;
     }
     for (int i = 0; i + 1 < c.n; ++i) r.sol.push_back(e.solved(0, size_t(i)));
-    for (int t = 0; t < c.n_ms; ++t) r.s.push_back(e.stateAt(0, uint64_t(t) * kMs));
+    for (unsigned t = 0; t <= c.t_ms[c.n - 1]; ++t) r.s.push_back(e.stateAt(0, uint64_t(t) * kMs));
     return r;
 }
 
@@ -71,102 +60,6 @@ std::vector<handles::HKnot> renderBare(const handles_fixture::Case& c, const Con
 }
 
 }  // namespace
-
-TEST_CASE("handles parity: the renderer trims the model's script as the model does") {
-    auto parity = [](const handles_fixture::Case& c) {
-        const std::string name = c.name;
-        CAPTURE(name);
-        const std::vector<handles::HKnot> k = renderBare(c);
-        float worst = 0.0f; int at = 0;
-        for (int i = 0; i < c.n; ++i) {
-            CAPTURE(i);
-            const float d = std::fabs(k[size_t(i)].dp - c.dp[i]);
-            if (d > worst) { worst = d; at = i; }
-            CHECK(d <= 1e-4f);
-            CHECK(k[size_t(i)].infeasible == (c.infeasible[i] != 0));
-        }
-        MESSAGE(name << ": worst renderer trim difference " << worst << " of the window at knot " << at);
-    };
-    for (const handles_fixture::Case& c : handles_fixture::kCases) parity(c);
-    for (const handles_fixture::Case& c : handles_fixture::kRenderCases) parity(c);
-}
-
-TEST_CASE("handles parity: the kernel renders the model's script on the author's clock") {
-    for (const handles_fixture::Case& c : handles_fixture::kCases) {
-        const std::string name = c.name;
-        CAPTURE(name);
-        const Run r = render(c);
-        REQUIRE(r.refused == 0);
-        REQUIRE(int(r.s.size()) == c.n_ms);
-
-        // Position parity on the 1 ms grid.
-        // Constraint: the model steps its acceleration at a flat knot (a rest
-        // start, a hold edge) for free; the kernel stays flat up to the knot and
-        // ramps at jmax for r = |a| / jmax, so that piece lags the model by up to
-        // peak |v| * r / 2 (the floor under jmax alone is near half that), and at
-        // a speed ceiling gives that much more amplitude. That lag is the
-        // allowance on the piece, its end knot and the next piece (the gap closes
-        // at the knot after, which is reached exactly); everywhere else the bar
-        // is 0.5%.
-        // Operator ruling owed: kin-y6e asks 0.5% at every sample (open issue).
-        std::vector<float> allow(size_t(c.n_ms), 0.0f);
-        std::vector<float> knot_lag(size_t(c.n), 0.0f);
-        auto flat = [&](int i) { return i <= 0 || i >= c.n - 1 || std::fabs(c.p[i] - c.p[i - 1]) <= kHold
-                                        || std::fabs(c.p[i + 1] - c.p[i]) <= kHold; };
-        for (int i = 0; i + 1 < c.n; ++i) {
-            const int ta = int(c.t_ms[i]), tb = int(c.t_ms[i + 1]);
-            if (tb - ta < 2) continue;
-            const float aA = flat(i) ? 2.0f * std::fabs(c.ms_p[ta + 1] - c.ms_p[ta]) * 1e6f : 0.0f;
-            const float aB = flat(i + 1) ? 2.0f * std::fabs(c.ms_p[tb] - c.ms_p[tb - 1]) * 1e6f : 0.0f;
-            float vpk = 0.0f;
-            for (int t = ta + 1; t < tb; ++t) vpk = std::fmax(vpk, std::fabs(c.ms_p[t + 1] - c.ms_p[t - 1]) * 500.0f);
-            knot_lag[size_t(i + 1)] = vpk * std::fmax(aA, aB) / c.jmax * 0.5f;
-        }
-        for (int i = 0; i + 1 < c.n; ++i) {
-            const int ta = int(c.t_ms[i]), tb = int(c.t_ms[i + 1]);
-            for (int t = ta; t <= tb && t < c.n_ms; ++t)
-                allow[size_t(t)] = std::max({allow[size_t(t)], knot_lag[size_t(i + 1)], knot_lag[size_t(i)]});
-        }
-        float worst_p = 0.0f, raw = 0.0f; int at = 0, raw_at = 0, raw_over = 0;
-        for (int t = 0; t < c.n_ms; ++t) {
-            const float e = std::fabs(r.s[size_t(t)].p - c.ms_p[t]);
-            if (e > raw) { raw = e; raw_at = t; }
-            if (e > 0.005f) ++raw_over;
-            const float d = e - allow[size_t(t)];
-            if (d > worst_p) { worst_p = d; at = t; }
-        }
-        MESSAGE(name << ": worst position error past the corner-ramp allowance " << worst_p << " of the window at " << at
-                     << " ms; with no allowance " << raw << " at " << raw_at << " ms, " << raw_over << " samples over 0.5%");
-        CHECK(worst_p <= 0.005f);
-
-        // Trims: which knots moved and by how much; nothing placed early or late.
-        // A corner's solved t_us / p are its ramp's end; the knot is on the ramp.
-        float worst_t = 0.0f, raw_t = 0.0f; int at_t = 0;
-        for (int i = 1; i < c.n; ++i) {
-            CAPTURE(i);
-            const Solved& o = r.sol[size_t(i - 1)];
-            const uint64_t t_k = uint64_t(c.t_ms[i]) * kMs;
-            CHECK(o.base_us == t_k);
-            if (o.corner) { CHECK(o.head_us <= t_k); CHECK(o.t_us >= t_k); }
-            else CHECK(o.t_us == t_k);
-            const float p_k = o.knot_p;   // the renderer's placement, never read back from the curve
-            // Constraint: a ramp's time costs its pieces speed, which the slack
-            // passes give back as amplitude; the position allowance at the knot
-            // is the trim's.
-            const float e = std::fabs((p_k - c.p[i]) - c.dp[i]), d = e - allow[c.t_ms[i]];
-            raw_t = std::fmax(raw_t, e);
-            if (d > worst_t) { worst_t = d; at_t = i; }
-            CHECK(d <= 1e-4f);
-            CHECK(o.infeasible == (c.infeasible[i] != 0));
-            // Reached at its own time, at its trimmed position, within the
-            // corner ramp's tolerance (kKnotTol: a ramp that keeps the curve's
-            // velocity may pass its knot that far off).
-            CHECK(std::fabs(r.s[c.t_ms[i]].p - p_k) <= kKnotTol);
-        }
-        MESSAGE(name << ": worst engine trim difference past the corner-ramp allowance " << worst_t << " of the window at knot "
-                     << at_t << "; with no allowance " << raw_t);
-    }
-}
 
 TEST_CASE("handles invariants: ceilings, continuity and flat holds in sampled reality") {
     for (const handles_fixture::Case& c : handles_fixture::kCases) {
@@ -288,8 +181,8 @@ TEST_CASE("smoothness 0 and 1 render the pchip and smooth styles bit for bit") {
     // style: handles::Cfg::style Pchip and Smooth for the bare render, the
     // solver's style constant Pchip and Smooth for the engine. The bare smooth
     // hash moved with kin-rfw7: a smooth solve's lengths walk both sides of
-    // 1, and rail_caps now trims as the model does at smoothness 1 (before, a
-    // piece the model fits was left over jmax). All four moved with kin-9od3:
+    // 1, and a rail_caps piece left over jmax at smoothness 1 now fits. All
+    // four moved with kin-9od3:
     // the window wall at half the tolerance, end-acceleration asks held to
     // amax and dropped when no fit honors them, and (the engine) pieces built
     // from the render's curve after an on-curve corner exit. Both smooth
@@ -303,7 +196,7 @@ TEST_CASE("smoothness 0 and 1 render the pchip and smooth styles bit for bit") {
 }
 
 TEST_CASE("smoothness: crests and hold edges are flat at every value; the lengths change, not the extrema") {
-    // The model's script: free knots well inside the ceilings, so no fit or
+    // The built-in script: free knots well inside the ceilings, so no fit or
     // trim hides what the lerp does. Its through points stay inside their
     // monotone band, so nothing overshoots (kin-4o6r).
     const handles_fixture::Case& c = fixture("sample");

@@ -2445,8 +2445,7 @@ TEST_CASE("a speed-bound authored fall renders on time inside the ceilings: the 
 
 TEST_CASE("an acceleration-bound authored span renders on time inside the ceilings; jmax at its rest ends trims it") {
     // 35 mm in 60 ms on a 100 mm window from rest: the cubic's acceleration is
-    // 583 window/s^2 against 500 (ratio 1.17), its speed and jerk legal. The
-    // model (jerk-blind at a knot) renders it whole with handles near 0.36.
+    // 583 window/s^2 against 500 (ratio 1.17), its speed and jerk legal.
     // Constraint: the kernel rounds the cubic's acceleration steps at both rest
     // ends at jmax (10 ms each): amplitude gives, on time (kin-y6e). The
     // jerk-optimal profile (no Bezier) covers 0.30 in 60 ms; this renderer,
