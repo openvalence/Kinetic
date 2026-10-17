@@ -29,7 +29,7 @@ const curveCache = new Map();
 const reduced = matchMedia('(prefers-reduced-motion: reduce)');
 
 export async function init(root, a) {
-  api = a; ({ C, MONO, SANS } = a); host = root; BAD = C.bad;
+  api = a; ({ C, MONO, SANS } = a); host = root;
   const res = await fetch('./kinetic2-trace.wasm');
   if (!res.ok) throw new Error('kinetic2-trace.wasm ' + res.status);
   const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
@@ -39,7 +39,8 @@ export async function init(root, a) {
   W = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24) };
   curveBuf = K.malloc(CURVE_N * 4);
   build();
-  return { update, pause: () => setPlaying(false) };
+  // redraw: the page's palette (C, changed in place) moved under the shown step
+  return { update, pause: () => setPlaying(false), redraw: kick };
 }
 
 // ---- the trace ---------------------------------------------------------------
@@ -491,8 +492,9 @@ const ms = (s) => Math.round(s * 1000);
 const pc = (x) => (x * 100).toFixed(x > 0.999 || x < 0.001 ? 0 : 1) + '%';
 const Pu = (x) => fx(U.off + x * U.k, U.pd), Lu = (x) => fx(x * U.k, U.pd), Vu = (x) => fx(x * U.k, U.vd), Nu = (x) => num(x * U.k);
 const num = (v) => { const a = Math.abs(v); return a >= 1e6 ? (v / 1e6).toFixed(a >= 1e7 ? 0 : 1) + 'M' : a >= 1e4 ? (v / 1000).toFixed(0) + 'k' : a >= 1000 ? (v / 1000).toFixed(1) + 'k' : a >= 10 ? v.toFixed(0) : a >= 1 ? v.toFixed(1) : v.toFixed(2); };
-let BAD;   // play.js C.bad: over a ceiling
-const okc = (ok) => (ok ? C.blue : BAD);
+const okc = (ok) => (ok ? C.blue : C.bad);   // C.bad: over a ceiling
+// a palette color (#RRGGBB) at alpha a
+const alpha = (hex, a) => `rgba(${parseInt(hex.slice(1, 3), 16)},${parseInt(hex.slice(3, 5), 16)},${parseInt(hex.slice(5, 7), 16)},${a})`;
 
 function draw(v, now) {
   drawCurve(v, now);
@@ -567,7 +569,7 @@ function drawCurve(v, now) {
       const c = [k.t[i], P(i), k.t[i] + k.eo[i] * T, P(i) + k.vel[i] * k.eo[i] * T, k.t[i + 1] - k.ei[i + 1] * T, P(i + 1) - k.vel[i + 1] * k.ei[i + 1] * T, k.t[i + 1], P(i + 1)];
       const bad = k.inf[i + 1], focus = v.focus && Math.abs(v.focus[0] - k.t[i]) < 1e-9;
       g.globalAlpha = v.aHnd * (1 - 0.65 * v.reveal);
-      g.strokeStyle = bad ? BAD : C.blue; g.lineWidth = focus ? 3 : 2;
+      g.strokeStyle = bad ? C.bad : C.blue; g.lineWidth = focus ? 3 : 2;
       g.beginPath(); g.moveTo(X(c[0]), Y(c[1])); g.bezierCurveTo(X(c[2]), Y(c[3]), X(c[4]), Y(c[5]), X(c[6]), Y(c[7])); g.stroke();
       // handles
       g.strokeStyle = C.violet; g.lineWidth = 1; g.globalAlpha = v.aHnd * (focus ? 1 : 0.55) * (1 - v.reveal);
@@ -584,7 +586,7 @@ function drawCurve(v, now) {
       g.beginPath(); g.arc(x, ya, 5.5, 0, Math.PI * 2); g.stroke(); g.setLineDash([]);
       g.strokeStyle = SPEND(); g.beginPath(); g.moveTo(x, ya); g.lineTo(x, yr); g.stroke();
     }
-    g.fillStyle = C.sunken; g.strokeStyle = prov ? C.muted : k.inf[i] ? BAD : C.text; g.lineWidth = 2;
+    g.fillStyle = C.sunken; g.strokeStyle = prov ? C.muted : k.inf[i] ? C.bad : C.text; g.lineWidth = 2;
     if (prov) g.setLineDash([2, 2]);
     g.beginPath(); g.arc(x, yr, i === 0 ? 4.5 : 5, 0, Math.PI * 2); g.fill(); g.stroke(); g.setLineDash([]);
     // its angle
@@ -606,12 +608,12 @@ function drawCurve(v, now) {
     for (const e of v.emit) {
       const t = e.t - t0of();
       if (e.fl & 1) { g.strokeStyle = C.hi; g.lineWidth = 3; g.beginPath(); g.moveTo(X(e.head - cfg.t0), Y(e.knotP)); g.lineTo(X(t), Y(e.p)); g.stroke(); }
-      dot(g, X(t), Y(e.p), 3.5, e.fl & 2 ? BAD : C.blue);
+      dot(g, X(t), Y(e.p), 3.5, e.fl & 2 ? C.bad : C.blue);
     }
     g.globalAlpha = 1;
   }
 }
-const SPEND = () => 'rgba(77,166,255,0.55)';
+const SPEND = () => alpha(C.blue, 0.55);
 function dot(g, x, y, r, fill) { g.fillStyle = fill; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); }
 
 function drawDetail(v, now) {
@@ -650,7 +652,7 @@ function detailPiece(g, w, hh, d, s) {
   }
   g.strokeStyle = C.t3; g.lineWidth = 1; g.setLineDash([3, 3]);
   g.beginPath(); g.moveTo(X(c[0]), Y(c[1])); for (let j = 2; j < 8; j += 2) g.lineTo(X(c[j]), Y(c[j + 1])); g.stroke(); g.setLineDash([]);
-  g.strokeStyle = d.verdict === false ? BAD : C.blue; g.lineWidth = 3;
+  g.strokeStyle = d.verdict === false ? C.bad : C.blue; g.lineWidth = 3;
   g.beginPath(); g.moveTo(X(c[0]), Y(c[1])); g.bezierCurveTo(X(c[2]), Y(c[3]), X(c[4]), Y(c[5]), X(c[6]), Y(c[7])); g.stroke();
   g.strokeStyle = C.violet; g.lineWidth = 2;
   g.beginPath(); g.moveTo(X(c[0]), Y(c[1])); g.lineTo(X(c[2]), Y(c[3])); g.moveTo(X(c[6]), Y(c[7])); g.lineTo(X(c[4]), Y(c[5])); g.stroke();
@@ -688,7 +690,7 @@ function detailAngle(g, w, hh, d, s) {
   const [tL, tm, tR] = d.ts, [pL, pm, pR] = d.ps, dt = Math.min(tm - tL, tR - tm) * 0.9;
   g.save(); g.beginPath(); g.rect(x0 - 30, y0 - 4, x1 - x0 + 40, y1 - y0 + 8); g.clip();
   if (d.band) {
-    g.fillStyle = 'rgba(77,166,255,0.14)';
+    g.fillStyle = alpha(C.blue, 0.14);
     for (const sg of [-1, 1]) {
       g.beginPath(); g.moveTo(X(tm), Y(pm));
       g.lineTo(X(tm + sg * dt), Y(pm + sg * dt * d.band[0])); g.lineTo(X(tm + sg * dt), Y(pm + sg * dt * d.band[1])); g.closePath(); g.fill();
@@ -718,7 +720,7 @@ function detailAngle(g, w, hh, d, s) {
 
 function pill(g, xr, y, text, ok) {
   g.font = '600 11px ' + SANS; const tw = g.measureText(text).width + 18;
-  g.fillStyle = ok ? C.blue : BAD; roundRect(g, xr - tw, y - 2, tw, 20, 10); g.fill();
+  g.fillStyle = ok ? C.blue : C.bad; roundRect(g, xr - tw, y - 2, tw, 20, 10); g.fill();
   g.fillStyle = C.sunken; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(text, xr - tw / 2, y + 8);
 }
 function roundRect(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
@@ -740,7 +742,7 @@ function detailTable(g, w, hh, v, s) {
       fx(k.ei[i], 3), fx(k.eo[i], 3), k.dp[i] ? Lu(k.dp[i]) : ''];
     cols.forEach(([, x], ci) => {
       const moved = prev && ((ci === 4 && prev.vel[i] !== k.vel[i]) || (ci === 7 && prev.dp[i] !== k.dp[i]));
-      g.fillStyle = ci === 7 && k.inf[i] ? BAD : moved && hot.includes(ci) ? C.text : hot.includes(ci) ? C.blue : C.t3;
+      g.fillStyle = ci === 7 && k.inf[i] ? C.bad : moved && hot.includes(ci) ? C.text : hot.includes(ci) ? C.blue : C.t3;
       if (ci >= 4 && s.stage < (ci === 4 ? 2 : 4)) return;
       g.textAlign = ci === 3 ? 'left' : 'right';
       g.fillText(vals[ci], x, y);
@@ -757,7 +759,7 @@ function detailBuilt(g, w, hh, d) {
   d.bars.forEach(([r, x], i) => {
     const bx = x0 + i * (bw + 2);
     g.fillStyle = okc(x <= 1 + TOL); g.fillRect(bx, Y(x), bw, y1 - Y(x));
-    if (x > 1 + TOL && d.bars.length <= 24) { g.fillStyle = BAD; g.textAlign = 'center'; g.textBaseline = 'bottom'; g.fillText('×' + fx(x, 2), bx + bw / 2, Y(x) - 2); }
+    if (x > 1 + TOL && d.bars.length <= 24) { g.fillStyle = C.bad; g.textAlign = 'center'; g.textBaseline = 'bottom'; g.fillText('×' + fx(x, 2), bx + bw / 2, Y(x) - 2); }
   });
   g.fillStyle = C.muted; g.textAlign = 'left'; g.textBaseline = 'top'; g.fillText('pieces in order; the dashed line is every ceiling', x0, y1 + 6);
 }
@@ -770,7 +772,7 @@ function detailResult(g, w, hh, v) {
   g.font = '12px ' + MONO;
   e.slice(0, rows).forEach((q, r) => {
     const y = 46 + r * 17, vals = [String(q.r), fx(q.t, 3), Pu(q.p), Vu(q.v), Nu(q.a), pc(q.share), fx(q.worst, 3)];
-    cols.forEach(([, x], ci) => { g.fillStyle = ci === 6 && q.fl & 2 ? BAD : ci === 5 && q.share < 0.999 ? C.text : C.t3; g.fillText(vals[ci], x, y); });
+    cols.forEach(([, x], ci) => { g.fillStyle = ci === 6 && q.fl & 2 ? C.bad : ci === 5 && q.share < 0.999 ? C.text : C.t3; g.fillText(vals[ci], x, y); });
   });
   if (e.length > rows) { g.fillStyle = C.muted; g.font = '10px ' + MONO; g.textAlign = 'left'; g.fillText(`${rows} of ${e.length}`, 12, hh - 16); }
 }
@@ -781,7 +783,7 @@ function detailStrip(g, w, hh, now) {
   let pmin = Infinity, pmax = -Infinity;
   for (let k = 0; k <= 160; k++) { const i = n0 + k; if (i >= 0 && i < R.n) { pmin = Math.min(pmin, R.P[i]); pmax = Math.max(pmax, R.P[i]); } }
   const span = Math.max(0.02, pmax - pmin), mid = (pmax + pmin) / 2, Y = (p) => (y0 + y1) / 2 - (p - mid) / span * (y1 - y0) * 0.9;
-  g.fillStyle = 'rgba(77,166,255,0.08)'; g.fillRect(x0 + 32 * pxms, y0, 128 * pxms, y1 - y0);
+  g.fillStyle = alpha(C.blue, 0.08); g.fillRect(x0 + 32 * pxms, y0, 128 * pxms, y1 - y0);
   for (let k = 0; k <= 160; k++) {
     const i = n0 + k; if (i < 0 || i >= R.n) continue;
     g.globalAlpha = k < 32 ? 0.3 : 1;
@@ -816,10 +818,10 @@ function drawScope(v, now) {
       const N = arr.length, X = (u) => x0 + u * (x1 - x0);
       g.lineWidth = 2;
       for (let i = 1; i < N; i++) {
-        g.strokeStyle = Math.abs(arr[i]) > lim || Math.abs(arr[i - 1]) > lim ? BAD : C.blue;
+        g.strokeStyle = Math.abs(arr[i]) > lim || Math.abs(arr[i - 1]) > lim ? C.bad : C.blue;
         g.beginPath(); g.moveTo(X((i - 1) / (N - 1)), Y(arr[i - 1])); g.lineTo(X(i / (N - 1)), Y(arr[i])); g.stroke();
       }
-      if (sc.dots && v === to) sc.dots.forEach((d) => { g.fillStyle = Math.abs(d[r + 1]) > lim ? BAD : C.sunken; g.strokeStyle = C.text; g.lineWidth = 1.4; g.beginPath(); g.arc(X(d[0]), Y(d[r + 1]), 3, 0, Math.PI * 2); g.fill(); g.stroke(); });
+      if (sc.dots && v === to) sc.dots.forEach((d) => { g.fillStyle = Math.abs(d[r + 1]) > lim ? C.bad : C.sunken; g.strokeStyle = C.text; g.lineWidth = 1.4; g.beginPath(); g.arc(X(d[0]), Y(d[r + 1]), 3, 0, Math.PI * 2); g.fill(); g.stroke(); });
       if (sc.roots) sc.roots[r].forEach(([u, x]) => { g.fillStyle = C.violet; g.beginPath(); g.moveTo(X(u), Y(x) - 4); g.lineTo(X(u) - 4, Y(x) - 11); g.lineTo(X(u) + 4, Y(x) - 11); g.closePath(); g.fill(); });
     } else {
       const n = R.n, T = (n - 1) / 1000, X = (t) => x0 + t / T * (x1 - x0);
@@ -831,7 +833,7 @@ function drawScope(v, now) {
     // the peak against its ceiling: the number that decides
     const ratio = sc.kind === 'u' ? sc.ratio[r] : [R.max.v / o.vmax, R.max.a / o.amax, R.max.j / o.jmax][r];
     const over = ratio > 1 + TOL;
-    g.textAlign = 'left'; g.fillStyle = over ? BAD : C.blue; g.font = (over ? '600 ' : '') + '14px ' + MONO;
+    g.textAlign = 'left'; g.fillStyle = over ? C.bad : C.blue; g.font = (over ? '600 ' : '') + '14px ' + MONO;
     g.fillText('×' + fx(ratio, 3), x1 + 10, yc - 7);
     g.fillStyle = C.muted; g.font = '10px ' + MONO; g.fillText(Nu(ratio * lims[r]) + ' / ' + Nu(lims[r]), x1 + 10, yc + 9);
   });

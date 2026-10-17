@@ -39,7 +39,7 @@ const server = createServer((req, res) => {
 await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
 const url = `http://127.0.0.1:${server.address().port}/handles.html`;
 const browser = await chromium.launch({ headless: true });
-const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+const page = await browser.newPage({ viewport: { width: 1280, height: 900 }, colorScheme: 'dark' });
 const errors = [], requested = [];
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 page.on('pageerror', (e) => errors.push(String(e)));
@@ -118,6 +118,19 @@ const exact = async (what) => {
   const r = await drawsPlanner();
   check(r.diff === 0 && r.missing === 0 && r.off <= 1e-3 && !r.knotDiff, `${what}: ${r.n} samples equal kinetic2-trace.wasm's bit for bit${r.diff ? ` (first difference at ${r.diff - 1} ms)` : ''}; every knot's render equals its trace records${r.knotDiff ? ` (not: ${r.knotDiff})` : ''}; every knot on the curve within ${r.off.toExponential(1)} of the window${r.missing ? `, ${r.missing} knots without planner data` : ''}`);
 };
+// The theme (the site's head script and toggle, play.css's tokens): the most
+// common opaque color of a canvas, sampled every 7 px, and the theme state.
+const dominant = (sel) => page.evaluate((sel) => {
+  const cv = document.querySelector(sel), d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data, n = {};
+  for (let y = 0; y < cv.height; y += 7) for (let x = 0; x < cv.width; x += 7) {
+    const i = (y * cv.width + x) * 4;
+    if (d[i + 3] === 255) { const k = '#' + [d[i], d[i + 1], d[i + 2]].map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase(); n[k] = (n[k] || 0) + 1; }
+  }
+  return Object.entries(n).sort((a, b) => b[1] - a[1])[0]?.[0];
+}, sel);
+const themeState = () => page.evaluate(() => ({ theme: document.documentElement.dataset.theme, stored: localStorage.getItem('theme'),
+  label: document.querySelector('.theme').getAttribute('aria-label'), bad: getComputedStyle(document.documentElement).getPropertyValue('--bad').trim() }));
+const frames = () => page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
 const setNum = async (id, v) => { await page.fill(id, String(v)); await page.dispatchEvent(id, 'change'); };
 
 let s = await st();
@@ -171,15 +184,37 @@ const play = await page.evaluate(() => { const st = window.__handles.state(); re
 check(play.playing && play.cursor > 0.2, `page: playback runs (cursor at ${(play.cursor * 1000).toFixed(0)} ms after 400 ms)`);
 await page.click('#play');
 
-// the viewports, with and without the planner steps
+// the theme: the toggle flips it live and keeps the choice only while it differs
+// from the system's (the site's localStorage.theme); the system's scheme is followed
+let th = await themeState();
+check(th.theme === 'dark' && th.stored === null && th.bad === '#FF4D5E' && await dominant('#plot') === '#08090B', `theme: dark under a dark system, the plot in the dark palette (${th.theme})`);
+await page.click('.theme'); await frames();
+th = await themeState();
+const lightPlot = await dominant('#plot');
+check(th.theme === 'light' && th.stored === 'light' && th.label === 'Switch to dark theme' && th.bad === '#B8182A' && lightPlot === '#F3F2EE',
+  `theme: the toggle turns it light without a reload, stored, the plot redrawn (${lightPlot}), over a ceiling in #B8182A`);
+await exact('the light theme');
+await page.click('.theme'); await frames();
+th = await themeState();
+check(th.theme === 'dark' && th.stored === null && await dominant('#plot') === '#08090B', 'theme: toggled back to the system\'s dark, nothing stored');
+await page.emulateMedia({ colorScheme: 'light' }); await frames();
+th = await themeState();
+check(th.theme === 'light' && th.stored === null && await dominant('#plot') === '#F3F2EE', 'theme: a light system scheme turns the page light live');
+await page.emulateMedia({ colorScheme: 'dark' }); await frames();
+
+// the viewports, with and without the planner steps, in both themes
 const fits = async (label) => {
-  for (const [w, h] of [[1280, 720], [1920, 1080], [390, 844]]) {
-    await page.setViewportSize({ width: w, height: h });
-    await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
-    check(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth && document.querySelector('#stripbox').getBoundingClientRect().height > 100),
-      `page${label} at ${w}x${h}: no horizontal scroll, the strips shown`);
-    await page.screenshot({ path: join(shots, `handles${label ? '-steps' : ''}-${w}.png`), fullPage: true });
+  for (const scheme of ['dark', 'light']) {
+    await page.emulateMedia({ colorScheme: scheme });
+    for (const [w, h] of [[1280, 720], [1920, 1080], [390, 844]]) {
+      await page.setViewportSize({ width: w, height: h });
+      await frames();
+      check(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth && document.querySelector('#stripbox').getBoundingClientRect().height > 100),
+        `page${label} at ${w}x${h}, ${scheme}: no horizontal scroll, the strips shown`);
+      await page.screenshot({ path: join(shots, `handles${label ? '-steps' : ''}-${scheme}-${w}.png`), fullPage: true });
+    }
   }
+  await page.emulateMedia({ colorScheme: 'dark' });
   await page.setViewportSize({ width: 1280, height: 900 });
 };
 await fits('');
@@ -198,6 +233,11 @@ await setNum('#c-vmax', 400);
 d = await dv(); check(d.kinds.includes('trial'), 'page steps: at 400 mm/s the trim tests show');
 await exact('speed 400 mm/s with the steps shown');
 await setNum('#c-vmax', 1000);
+const stepsPicture = () => page.evaluate(() => document.querySelector('#steps canvas').toDataURL());
+const stepsDark = await stepsPicture();
+await page.click('.theme'); await frames(); await frames();
+check(await stepsPicture() !== stepsDark, 'page steps: the steps redraw in the light palette without a reload');
+await page.click('.theme'); await frames();
 await fits(' steps');
 await page.click('#steps-toggle');
 check(await page.evaluate(() => document.querySelector('#steps').hidden), 'page steps: toggled off, the panel hides');

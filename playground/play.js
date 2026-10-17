@@ -8,15 +8,22 @@
 //   anomalies are drained after every call because the ring keeps 16.
 
 const $ = (s) => document.querySelector(s);
-const C = { bg: '#08090B', sunken: '#040507', l1: '#121419', l2: '#1D2026', l3: '#272B31', l4: '#33373E',
-  text: '#ECEFF4', t2: '#C3C8D1', t3: '#A8AEB9', muted: '#666C78', blue: '#4DA6FF', violet: '#A78BFA', hi: '#FF5CB3', bad: '#FF4D5E' };   // bad: over a ceiling, here and in steps.js
+// The canvas palette: play.css's tokens for the theme shown, read again on "themechange" and
+// changed in place (steps.js holds this object). bad: over a ceiling, here and in steps.js.
+const TOKENS = { bg: '--bg', raised: '--bg-raised', sunken: '--bg-sunken', l1: '--line-1', l2: '--line-2', l3: '--line-3', l4: '--line-4',
+  text: '--text', t2: '--text-2', t3: '--text-3', muted: '--muted', blue: '--reality', violet: '--intent', hi: '--hi', bad: '--bad' };
+const C = {};
+function palette() { const cs = getComputedStyle(document.documentElement); for (const k in TOKENS) C[k] = cs.getPropertyValue(TOKENS[k]).trim(); }
+palette();
+// a palette color (#RRGGBB) at alpha a
+const alpha = (hex, a) => `rgba(${parseInt(hex.slice(1, 3), 16)},${parseInt(hex.slice(3, 5), 16)},${parseInt(hex.slice(5, 7), 16)},${a})`;
 const MONO = 'ui-monospace, "SF Mono", Consolas, monospace';
 const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
-const TOL = 1e-3;
+const TOL = 1e-3;   // relative slack before a sample counts as over a ceiling
 // kinetic2_submit flags (wasm/kinetic2_wasm.h). Streamed: every knot is a
 // sample. Authored ahead: a free knot rests when nothing follows it.
 const KNOT_SAMPLE = 0x1, KNOT_REST_IF_LAST = 0x2;
-const SPEND = 'rgba(77,166,255,0.55)';   // the reality blue, dimmed so spend marks never hide the trace   // relative slack before a sample counts as over a ceiling
+const SPEND = () => alpha(C.blue, 0.55);   // the reality blue, dimmed so spend marks never hide the trace
 
 const DEF = { vmax: 3, amax: 30, jmax: 2000, smooth: 0, floor: 0.15, trim: 1, react: 4 };
 const SPANS = [1, 2, 5, 10];
@@ -240,7 +247,7 @@ function draw() {
     g.textAlign = 'left'; g.textBaseline = 'top'; g.font = '11px ' + SANS;
     const label = pn.name + '  ' + pn.unit;
     const lw = g.measureText(label).width;
-    g.fillStyle = 'rgba(4,5,7,0.8)'; g.fillRect(pn.x0 + 1, pn.y0 + 1, lw + 12, 17);
+    g.fillStyle = alpha(C.sunken, 0.8); g.fillRect(pn.x0 + 1, pn.y0 + 1, lw + 12, 17);
     g.fillStyle = C.t2; g.fillText(label, pn.x0 + 6, pn.y0 + 4);
     g.font = '11px ' + MONO;
   }
@@ -312,8 +319,8 @@ function knots(g, pn) {
       const sxk = L.tx(s.t), syk = pn.y(s.p);
       const trimmed = s.share < 0.999, stretched = s.stretched > 1e-6;
       if (trimmed || stretched) {
-        if (stretched) arrow(g, x, y, sxk, syk, SPEND);
-        else { g.strokeStyle = SPEND; g.lineWidth = 1.5; g.beginPath(); g.moveTo(x, y); g.lineTo(sxk, syk); g.stroke(); }
+        if (stretched) arrow(g, x, y, sxk, syk, SPEND());
+        else { g.strokeStyle = SPEND(); g.lineWidth = 1.5; g.beginPath(); g.moveTo(x, y); g.lineTo(sxk, syk); g.stroke(); }
         mark(g, shape, x, y, 5.5, C.sunken, C.violet);
         mark(g, shape, sxk, syk, 4, C.blue, null);
       } else {
@@ -645,19 +652,21 @@ function buildUi() {
   $('#i-vmode').addEventListener('change', (ev) => { sel.v = ev.target.value === 'set' ? 0 : null; changed(); });
   $('#i-del').addEventListener('click', () => sel && sel !== 'start' && remove(sel));
 
-  $('#legend').innerHTML = [
-    ['<rect x="3" y="3" width="8" height="8" fill="#A78BFA"/>', 'start (at rest)'],
-    ['<circle cx="7" cy="7" r="4.5" fill="#A78BFA"/>', 'knot'],
-    ['<path d="M7 1.5 12.5 7 7 12.5 1.5 7Z" fill="#A78BFA"/>', 'live jog'],
-    ['<circle cx="7" cy="7" r="5" fill="none" stroke="#A78BFA" stroke-width="1.5"/>', 'authored, moved by the spend'],
-    ['<circle cx="7" cy="7" r="4" fill="#4DA6FF"/>', 'solved'],
-    ['<line x1="7" y1="1" x2="7" y2="13" stroke="#4DA6FF" stroke-width="1.5"/>', 'trim'],
-    ['<path d="M1 7H10M8 3.5 12.5 7 8 10.5Z" stroke="#4DA6FF" stroke-width="1.5" fill="#4DA6FF"/>', 'landed late (a live jog)'],
-    ['<circle cx="7" cy="7" r="5.5" fill="none" stroke="#FF5CB3" stroke-width="1.5"/><path d="M4 4 10 10M10 4 4 10" stroke="#FF5CB3" stroke-width="1.5"/>', 'dropped or refused'],
-    ['<rect x="2" y="2" width="10" height="10" fill="#FF5CB3"/><text x="7" y="10.5" font-size="9" text-anchor="middle" font-family="monospace" fill="#040507" font-weight="bold">v</text>', 'end velocity clamped'],
-    ['<path d="M1 7H13" stroke="#33373E" stroke-dasharray="3 2" stroke-width="1.5"/>', 'ceiling'],
-    ['<path d="M1 7H13" stroke="#FF4D5E" stroke-width="2.5"/>', 'over a ceiling by more than 0.1%, or a step between two 1 ms samples'],
-  ].map(([svg, text]) => `<li><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">${svg}</svg>${text}</li>`).join('');
+  const legend = () => { $('#legend').innerHTML = [
+    [`<rect x="3" y="3" width="8" height="8" fill="${C.violet}"/>`, 'start (at rest)'],
+    [`<circle cx="7" cy="7" r="4.5" fill="${C.violet}"/>`, 'knot'],
+    [`<path d="M7 1.5 12.5 7 7 12.5 1.5 7Z" fill="${C.violet}"/>`, 'live jog'],
+    [`<circle cx="7" cy="7" r="5" fill="none" stroke="${C.violet}" stroke-width="1.5"/>`, 'authored, moved by the spend'],
+    [`<circle cx="7" cy="7" r="4" fill="${C.blue}"/>`, 'solved'],
+    [`<line x1="7" y1="1" x2="7" y2="13" stroke="${C.blue}" stroke-width="1.5"/>`, 'trim'],
+    [`<path d="M1 7H10M8 3.5 12.5 7 8 10.5Z" stroke="${C.blue}" stroke-width="1.5" fill="${C.blue}"/>`, 'landed late (a live jog)'],
+    [`<circle cx="7" cy="7" r="5.5" fill="none" stroke="${C.hi}" stroke-width="1.5"/><path d="M4 4 10 10M10 4 4 10" stroke="${C.hi}" stroke-width="1.5"/>`, 'dropped or refused'],
+    [`<rect x="2" y="2" width="10" height="10" fill="${C.hi}"/><text x="7" y="10.5" font-size="9" text-anchor="middle" font-family="monospace" fill="${C.sunken}" font-weight="bold">v</text>`, 'end velocity clamped'],
+    [`<path d="M1 7H13" stroke="${C.l4}" stroke-dasharray="3 2" stroke-width="1.5"/>`, 'ceiling'],
+    [`<path d="M1 7H13" stroke="${C.bad}" stroke-width="2.5"/>`, 'over a ceiling by more than 0.1%, or a step between two 1 ms samples'],
+  ].map(([svg, text]) => `<li><svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">${svg}</svg>${text}</li>`).join(''); };
+  legend();
+  addEventListener('themechange', () => { palette(); legend(); if (R) draw(); stepper?.redraw(); });
 
   new ResizeObserver(() => { if (R) draw(); }).observe($('#plotbox'));
   motionPref();

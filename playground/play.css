@@ -1,12 +1,34 @@
+/* Dark by default, light from prefers-color-scheme or the header toggle (data-theme, the
+   pages' head script). play.js, handles.js and steps.js draw their canvases in these tokens,
+   read again on "themechange"; every token here is #RRGGBB (the canvases add alpha to it). */
 :root {
   --bg: #08090B; --bg-raised: #0D0F13; --bg-card: #111318; --bg-sunken: #040507;
   --line-1: #121419; --line-2: #1D2026; --line-3: #272B31; --line-4: #33373E;
   --text: #ECEFF4; --text-2: #C3C8D1; --text-3: #A8AEB9; --muted: #666C78;
   --reality: #4DA6FF; --intent: #A78BFA; --hi: #FF5CB3; --bad: #FF4D5E;
+  --plot-v: #5BD48A; --plot-a: #F2A94A; --plot-j: #C9A2FF;   /* the handles page's strips */
   --r: 2px;
   --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "SF Mono", Consolas, monospace;
   color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme=dark]) {
+    color-scheme: light;
+    --bg: #F3F2EE; --bg-raised: #EBEAE5; --bg-card: #E3E2DC; --bg-sunken: #FFFFFF;
+    --line-1: #E0DFD9; --line-2: #D4D3CC; --line-3: #BDBCB5; --line-4: #A9A8A1;
+    --text: #0B0B0C; --text-2: #2C2C31; --text-3: #45454B; --muted: #5E5E64;
+    --reality: #1764B8; --intent: #6A3FC8; --hi: #C0177A; --bad: #B8182A;
+    --plot-v: #1B7F45; --plot-a: #A15C00; --plot-j: #8650D6;
+  }
+}
+:root[data-theme=light] {
+  color-scheme: light;
+  --bg: #F3F2EE; --bg-raised: #EBEAE5; --bg-card: #E3E2DC; --bg-sunken: #FFFFFF;
+  --line-1: #E0DFD9; --line-2: #D4D3CC; --line-3: #BDBCB5; --line-4: #A9A8A1;
+  --text: #0B0B0C; --text-2: #2C2C31; --text-3: #45454B; --muted: #5E5E64;
+  --reality: #1764B8; --intent: #6A3FC8; --hi: #C0177A; --bad: #B8182A;
+  --plot-v: #1B7F45; --plot-a: #A15C00; --plot-j: #8650D6;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }

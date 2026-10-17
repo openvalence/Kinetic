@@ -14,12 +14,20 @@
 // See: playground/README.md "The handles page"
 'use strict';
 const $ = (s) => document.querySelector(s);
-const C = { bg: '#08090B', l2: '#1D2026', l3: '#272B31', text: '#ECEFF4', t3: '#A8AEB9', muted: '#666C78',
-  blue: '#4DA6FF', violet: '#A78BFA', hi: '#FF5CB3', v: '#5BD48A', a: '#F2A94A', j: '#C9A2FF', red: '#FF4D5E' };   // red: over a ceiling, as on the playground
+// The canvas palette: play.css's tokens for the theme shown, read again on "themechange" and
+// changed in place (steps.js holds this object). bad: over a ceiling, as on the playground.
+const TOKENS = { bg: '--bg', raised: '--bg-raised', sunken: '--bg-sunken', l1: '--line-1', l2: '--line-2', l3: '--line-3', l4: '--line-4',
+  text: '--text', t2: '--text-2', t3: '--text-3', muted: '--muted', blue: '--reality', violet: '--intent', hi: '--hi', bad: '--bad',
+  v: '--plot-v', a: '--plot-a', j: '--plot-j' };
+const C = {};
+function palette() { const cs = getComputedStyle(document.documentElement); for (const k in TOKENS) C[k] = cs.getPropertyValue(TOKENS[k]).trim(); }
+palette();
+// a palette color (#RRGGBB) at alpha a
+const alpha = (hex, a) => `rgba(${parseInt(hex.slice(1, 3), 16)},${parseInt(hex.slice(3, 5), 16)},${parseInt(hex.slice(5, 7), 16)},${a})`;
 const MONO = 'ui-monospace, "SF Mono", Consolas, monospace';
 const SANS = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 const CLSN = ['end', 'rest', 'crest', 'through'];
-const CLS = { end: C.muted, rest: C.t3, crest: C.text, through: C.blue };
+const CLS = (cls) => [C.muted, C.t3, C.text, C.blue][cls];   // by class, CLSN's order
 const SLOTS = 64;   // the engine's pending knots (kinetic2_wasm.cpp Engine<1, 64>)
 // the built-in script: holds, a fast stroke, a mid-travel point, a sawtooth
 const SAMPLE = { actions: [
@@ -222,7 +230,7 @@ function draw() {
   knots.forEach((k, i) => (i ? ctx.lineTo(X(k.t, w), Y(k.p, h)) : ctx.moveTo(X(k.t, w), Y(k.p, h)))); ctx.stroke(); ctx.setLineDash([]);
   // the planner's motion, red where a sample is over a ceiling, pink in a piece no trim keeps inside
   ctx.lineWidth = 2;
-  series(ctx, w, R.P, (x) => Y(mm(x), h), (f) => (f & 7 ? C.red : f & 8 ? C.hi : C.blue));
+  series(ctx, w, R.P, (x) => Y(mm(x), h), (f) => (f & 7 ? C.bad : f & 8 ? C.hi : C.blue));
   // handles
   for (const i of visibleHandles()) {
     const d = dOf(i); if (!d) continue;
@@ -245,7 +253,7 @@ function draw() {
     const d = dOf(i), x = X(k.t, w), y = Y(knotP(i), h);
     if (x < PAD.l - 5 || x > w - PAD.r + 5) return;
     if ((d && d.dp !== 0) || k.pm != null) { ctx.strokeStyle = C.muted; ctx.beginPath(); ctx.arc(x, Y(k.p, h), 3.5, 0, 7); ctx.stroke(); }
-    ctx.fillStyle = !d ? C.muted : d.inf ? C.red : CLS[CLSN[d.cls]]; ctx.beginPath(); ctx.arc(x, y, i === sel ? 5 : 3.5, 0, 7); ctx.fill();
+    ctx.fillStyle = !d ? C.muted : d.inf ? C.bad : CLS(d.cls); ctx.beginPath(); ctx.arc(x, y, i === sel ? 5 : 3.5, 0, 7); ctx.fill();
     if (i === sel) { ctx.strokeStyle = C.text; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, 8, 0, 7); ctx.stroke(); }
     if (k.v != null && d) { ctx.fillStyle = C.violet; ctx.font = `9px ${MONO}`; ctx.textAlign = 'center'; ctx.fillText(d.g2 ? 'G2' : 'G1', x, y - 11); }
   });
@@ -266,12 +274,12 @@ function drawStrips() {
     for (let i = i0; i <= i1; i++) peak = Math.max(peak, Math.abs(arr[i]) * Wmm);
     peak = Math.min(peak, ceil * 3);
     const YY = (val) => y0 + (y1 - y0) / 2 - val / peak * (y1 - y0) / 2;
-    ctx.fillStyle = '#0D0F13'; ctx.fillRect(PAD.l, y0, w - PAD.l - PAD.r, y1 - y0);
+    ctx.fillStyle = C.raised; ctx.fillRect(PAD.l, y0, w - PAD.l - PAD.r, y1 - y0);
     ctx.save(); ctx.beginPath(); ctx.rect(PAD.l, y0, w - PAD.l - PAD.r, y1 - y0); ctx.clip();
     ctx.strokeStyle = C.l2; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(PAD.l, YY(0)); ctx.lineTo(w - PAD.r, YY(0)); ctx.stroke();
-    ctx.strokeStyle = C.red; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(PAD.l, YY(ceil)); ctx.lineTo(w - PAD.r, YY(ceil)); ctx.moveTo(PAD.l, YY(-ceil)); ctx.lineTo(w - PAD.r, YY(-ceil)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.strokeStyle = C.bad; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(PAD.l, YY(ceil)); ctx.lineTo(w - PAD.r, YY(ceil)); ctx.moveTo(PAD.l, YY(-ceil)); ctx.lineTo(w - PAD.r, YY(-ceil)); ctx.stroke(); ctx.setLineDash([]);
     ctx.lineWidth = 1.5;
-    series(ctx, w, arr, (x) => YY(x * Wmm), (f) => (f & bit ? C.red : color));
+    series(ctx, w, arr, (x) => YY(x * Wmm), (f) => (f & bit ? C.bad : color));
     if (sel != null) { const x = X(knots[sel].t, w); ctx.strokeStyle = C.text; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke(); }
     ctx.restore();
     ctx.fillStyle = C.muted; ctx.font = `10px ${SANS}`; ctx.textAlign = 'left'; ctx.fillText(`${label}   ceiling ${fmt(ceil)}`, PAD.l + 4, y0 + 11);
@@ -385,8 +393,8 @@ function drawCursor() {
 function drawRail() {
   const { ctx, w, h } = dims(rail); ctx.fillStyle = C.bg; ctx.fillRect(0, 0, w, h);
   const top = 12, bot = h - 12, YR = (v) => bot - v / cfg.rail * (bot - top);
-  ctx.fillStyle = '#12151B'; ctx.fillRect(w / 2 - 5, top, 10, bot - top);
-  ctx.fillStyle = 'rgba(77,166,255,0.18)'; ctx.fillRect(w / 2 - 12, YR(cfg.hi), 24, YR(cfg.lo) - YR(cfg.hi));
+  ctx.fillStyle = C.l1; ctx.fillRect(w / 2 - 5, top, 10, bot - top);
+  ctx.fillStyle = alpha(C.blue, 0.18); ctx.fillRect(w / 2 - 12, YR(cfg.hi), 24, YR(cfg.lo) - YR(cfg.hi));
   ctx.strokeStyle = C.blue; ctx.lineWidth = 1; ctx.strokeRect(w / 2 - 12, YR(cfg.hi), 24, YR(cfg.lo) - YR(cfg.hi));
   ctx.fillStyle = C.muted; ctx.font = `9px ${MONO}`; ctx.textAlign = 'center';
   ctx.fillText(`${cfg.rail}`, w / 2, top - 3); ctx.fillText('0', w / 2, bot + 10);
@@ -458,14 +466,15 @@ document.addEventListener('keydown', (ev) => {
 });
 new ResizeObserver(() => { draw(); drawCursor(); }).observe(plot);
 new ResizeObserver(() => { drawStrips(); drawCursor(); }).observe(strips);
-$('#legend').innerHTML = [['hold edge', CLS.rest], ['crest', CLS.crest], ['through point', CLS.through], ['nudged handle', C.violet], ['over a ceiling', C.red], ['infeasible knot', C.hi]]
-  .map(([n, c]) => `<li><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="${c}"/></svg>${n}</li>`).join('');
+const legend = () => { $('#legend').innerHTML = [['hold edge', CLS(1)], ['crest', CLS(2)], ['through point', CLS(3)], ['nudged handle', C.violet], ['over a ceiling', C.bad], ['infeasible knot', C.hi]]
+  .map(([n, c]) => `<li><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="${c}"/></svg>${n}</li>`).join(''); };
+legend();
+addEventListener('themechange', () => { palette(); legend(); draw(); drawCursor(); if (stepper) stepper.redraw(); });
 
 // ---- the planner steps ------------------------------------------------------------------
 // steps.js, in mm, on its own kinetic2-trace.wasm. Loaded the first time the
 // steps are shown, never on the page's load.
 let stepper = null, stepsOn = false, stepsLoading = false;
-const SC = { ...C, t2: '#C3C8D1', l1: '#121419', l4: '#33373E', sunken: '#040507', bad: C.red };
 function showSteps() {
   $('#steps').hidden = !stepsOn;
   if (!stepsOn) { if (stepper) stepper.pause(); return; }
@@ -473,7 +482,7 @@ function showSteps() {
   if (stepsLoading) return;
   stepsLoading = true;
   import('./steps.js').then((m) => m.init($('#steps'), {
-    replay: (W) => replay(W), fit: (cv) => { const d = dims(cv); return { g: d.ctx, w: d.w, h: d.h }; }, C: SC, MONO, SANS,
+    replay: (W) => replay(W), fit: (cv) => { const d = dims(cv); return { g: d.ctx, w: d.w, h: d.h }; }, C, MONO, SANS,
     state: () => { const W = winW(); return { o: { vmax: cfg.vmax / W, amax: cfg.amax / W, jmax: cfg.jmax / W } }; },
     units: () => ({ k: winW(), off: cfg.lo, pd: 2, vd: 1, pu: ' mm', v: 'mm/s', a: 'mm/s²', j: 'mm/s³' }),
   })).then((s) => { stepper = s; if (stepsOn) s.update(); },

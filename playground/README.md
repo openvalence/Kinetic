@@ -50,6 +50,22 @@ every judge work; an added knot re-traces; a link with a piece no trim keeps
 inside opens with the steps on and shows that piece over; no horizontal scroll
 at phone width with the steps shown.
 
+For the theme: dark under a dark system; the header toggle turns the page light
+without a reload, the plot redrawn in the light palette and the over-a-ceiling
+red #B8182A (#FF4D5E in dark), and stores the choice only while it differs from
+the system's; a light system scheme turns it light live; no horizontal scroll at
+1280x720 and 390x844 in both themes with the steps off and on.
+
+## Theme
+
+Both pages carry the openvalence.org theme: a copy of the site's head script
+(`tools/chrome.html` in the site repo) inline in each page's `<head>`, and its
+sun and moon toggle in the header. The choice is the site's
+`localStorage.theme`, so it carries across openvalence.org, and a page in a
+frame follows a toggle in the page around it. `play.css` holds the dark and
+light tokens; `play.js`, `handles.js` and `steps.js` read them for the canvases
+and redraw on `themechange`.
+
 ## How a render works
 
 Every change is a full replay: configure, reset at the start state, submit
