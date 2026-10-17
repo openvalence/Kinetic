@@ -22,6 +22,8 @@ static_assert(sizeof(kinetic2_knot) == 40, "kinetic2_knot layout is ABI");
 static_assert(sizeof(kinetic2_anomaly) == 24, "kinetic2_anomaly layout is ABI");
 static_assert(offsetof(kinetic2_knot, dropped) == 32, "kinetic2_knot layout is ABI");
 static_assert(offsetof(kinetic2_anomaly, seq) == 16, "kinetic2_anomaly layout is ABI");
+static_assert(sizeof(kinetic2_render_knot) == 56, "kinetic2_render_knot layout is ABI");
+static_assert(offsetof(kinetic2_render_knot, cls) == 48, "kinetic2_render_knot layout is ABI");
 
 namespace {
 
@@ -34,9 +36,22 @@ uint64_t toUs(double t) {
 
 }  // namespace
 
+using Engine1 = kinetic2::Engine<1, 64>;
+static_assert(64 <= kinetic2::kWindowKnots, "a full window renders as one run (kinetic2_render)");
+
 struct kinetic2_handle {
-    kinetic2::Engine<1, 64> engine{kinetic2::Config{}};
+    Engine1 engine{kinetic2::Config{}};
 };
+
+// kinetic2_render reads the engine's private axis (its render scratch and
+// timeline) after a solve. An explicit instantiation's template arguments are
+// not access-checked ([temp.explicit]), so Grant hands out &Engine::_ax without
+// a line in the planner's headers. Read only; a renamed member fails the build.
+namespace {
+struct AxesTag { friend constexpr auto axesOf(AxesTag); };
+template <auto M> struct Grant { friend constexpr auto axesOf(AxesTag) { return M; } };
+template struct Grant<&Engine1::_ax>;
+}  // namespace
 
 KINETIC_EXPORT kinetic2_handle* kinetic2_create(void) {
     return new (std::nothrow) kinetic2_handle{};
@@ -123,6 +138,46 @@ KINETIC_EXPORT int kinetic2_solved(kinetic2_handle* h, uint32_t i, kinetic2_knot
     out->clamped = s.clamped ? 1 : 0;
     out->pin_v = s.pin_v ? 1 : 0;
     out->pin_a = s.pin_a ? 1 : 0;
+    return 1;
+}
+
+// The ABI never calls expect(): a run has no provisional successor, so the
+// render is ws.k[0..pending], the origin first.
+KINETIC_EXPORT int kinetic2_render(kinetic2_handle* h, uint32_t i, kinetic2_render_knot* out) {
+    if (!h || !out) return 0;
+    if (h->engine.pending(0) == 0) return 0;
+    (void)h->engine.solved(0, 0);   // solves a dirty window (an undone re-plan may retire a knot)
+    const size_t n = h->engine.pending(0);
+    if (n == 0 || i > n) return 0;
+    const auto& ax = (h->engine.*axesOf(AxesTag{}))[0];
+    for (size_t r = 0; r < n; ++r) {
+        const kinetic2::Knot& K = ax.tl.at(r);
+        if ((K.sample && !K.has_v) || kinetic2::junctionOf(K) == kinetic2::Junction::Hard) return 0;
+    }
+    const kinetic2::handles::HKnot* k = ax.ws.k;
+    const kinetic2::handles::HKnot& m = k[i];
+    std::memset(out, 0, sizeof *out);
+    out->p = kinetic2::handles::rendered(m);
+    out->dp = m.dp;
+    out->vel = m.vel;
+    out->l_in = m.lIn;
+    out->l_out = m.lOut;
+    out->eff_in = m.effIn;
+    out->eff_out = m.effOut;
+    out->span_in = i > 0 ? m.t - k[i - 1].t : 0.0f;
+    out->span_out = i < n ? k[i + 1].t - m.t : 0.0f;
+    out->share = 1.0f;
+    out->cls = uint8_t(m.cls);
+    out->g2 = m.g2 ? 1 : 0;
+    if (i > 0) {
+        const kinetic2::Solved& s = ax.sol[i - 1];
+        out->share = s.share;
+        out->worst = s.worst;
+        out->ramp_s = s.corner ? s.ramp.duration() : 0.0f;
+        out->corner = s.corner ? 1 : 0;
+        out->infeasible = s.infeasible ? 1 : 0;
+        out->clamped = s.clamped ? 1 : 0;
+    }
     return 1;
 }
 

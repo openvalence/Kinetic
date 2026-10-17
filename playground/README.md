@@ -115,9 +115,8 @@ Illegal values are red, legal ones blue.
 The trace keeps 131072 records; a window that needs more says so under the
 step list. A Kinetic change that moves a decision moves its hook with it.
 
-The handles page has the same steps, in mm, on its own planner instance: the
-knots it draws, the first one the origin at rest, an angle set by hand as the
-knot's angle.
+The handles page has the same steps, in mm: the knots it draws, the first one
+the origin at rest, an angle set by hand as the knot's angle.
 
 ## The handles page
 
@@ -126,14 +125,13 @@ renders it (kin-d0o): a composite cubic Bézier in the time-position plane, the
 knots on the author's clock, one angle (the knot's velocity) and two handle
 lengths per knot (the time extent of each handle as a share of its span; a
 third is the exact PCHIP cubic), the ceilings as bounds on the lengths (Valence
-RFC-106). It loads `kinetic2-trace.wasm` up front: the curve and the velocity,
-acceleration and jerk strips are the 1 ms samples, bit for bit those of
-`kinetic2.wasm`; each knot's class (end, hold edge, crest, through point),
-G1 or G2, angle, handle lengths before and after the ceilings, trim and
-verdict are the trace records of the last render round that had the knot
-between two others. The normal module reports none of those per knot, which is
-why the page takes the trace build: about 80 KB against 70 KB, with 32 MB of
-linear memory against 2 MB (the trace buffer, zeroed pages).
+RFC-106). It runs `kinetic2.wasm` (2 MB of linear memory): the curve and the
+velocity, acceleration and jerk strips are the 1 ms samples; each knot's class
+(end, hold edge, crest, through point), G1 or G2, angle, handle lengths before
+and after the ceilings, trim, corner ramp and verdict are `kinetic2_render`'s,
+from the last solve that rendered the knot between two others.
+`kinetic2-trace.wasm` (32 MB, the trace buffer's zeroed pages) loads only with
+the planner steps.
 
 The knots go in as a sender's would: the first is the origin at rest, the
 next 64 are submitted at its time, and each later one as a slot frees, so a
@@ -147,11 +145,13 @@ with the carriage on the rail strip.
 It needs the page served over http (the module is fetched).
 `node playground/handles.check.mjs` copies both modules from
 `build-wasm/wasm/`, serves the folder and drives the page headless: every 1 ms
-sample equal to `kinetic2.wasm`'s and every knot on the curve, for the built-in
-script, an edited one, 400 mm/s, a jerk of 1e6, a 300 mm window, smoothness 1
-and a 300-knot script; a dragged handle sets the angle the planner renders;
-the planner steps on the page's instance; zero console errors, no horizontal
-scroll at 1280x720, 1920x1080 and 390x844 with the steps on and off.
+sample equal to `kinetic2-trace.wasm`'s, every knot's `kinetic2_render` data
+equal to the trace records of its last render round, and every knot on the
+curve, for the built-in script, an edited one, 400 mm/s, a jerk of 1e6, a
+300 mm window, smoothness 1 and a 300-knot script; a dragged handle sets the
+angle the planner renders; the trace build is not fetched until the steps
+show; zero console errors, no horizontal scroll at 1280x720, 1920x1080 and
+390x844 with the steps on and off, in both themes.
 
 ## Pages
 

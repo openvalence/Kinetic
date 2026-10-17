@@ -1,11 +1,12 @@
 // handles.js -- the handles page (kin-d0o): a funscript through the real
-// Kinetic² planner (kinetic2-trace.wasm), drawn as the planner rendered it: the
+// Kinetic² planner (kinetic2.wasm), drawn as the planner rendered it: the
 // curve and its velocity, acceleration and jerk against the ceilings, each
 // knot's class, angle, handles, trim and verdict.
 // Constraints:
-// - Every drawn value is the planner's: the 1 ms samples, and per knot the last
-//   render round of the last solve that rendered it with both neighbors (its
-//   trace records, wasm/kinetic2_trace.cpp). Nothing is recomputed here.
+// - Every drawn value is the planner's: the 1 ms samples, and per knot the
+//   render of the last solve that rendered it with both neighbors
+//   (kinetic2_render, wasm/kinetic2_wasm.h). Nothing is recomputed here.
+// - kinetic2-trace.wasm loads only with the planner steps (steps.js).
 // - Inputs are the planner's only: knot times and positions, an authored angle
 //   per knot, the ceilings, smoothness, handle floor and max trim.
 // - Every change is a full replay from reset; nothing is cached across edits.
@@ -43,32 +44,30 @@ const mm = (x) => cfg.lo + x * winW();   // window units to mm
 // ---- the planner ----------------------------------------------------------------
 async function boot() {
   try {
-    const res = await fetch('./kinetic2-trace.wasm');
+    const res = await fetch('./kinetic2.wasm');
     if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
     const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
     const K = instance.exports;
-    if (!K.kinetic2_trace_records || K.kinetic2_submit.length !== 7) throw new Error('kinetic2-trace.wasm does not match this page; rebuild it');
+    if (!K.kinetic2_render || K.kinetic2_submit.length !== 7) throw new Error('kinetic2.wasm does not match this page; rebuild it');
     K._initialize();
-    T = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24) };
+    T = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24), rBuf: K.malloc(56) };
   } catch (e) {
     $('#name').textContent = 'the planner did not load';
-    $('#status').textContent = 'kinetic2-trace.wasm did not load (' + e.message + '). Build it and serve this folder: see playground/README.md.';
+    $('#status').textContent = 'kinetic2.wasm did not load (' + e.message + '). Build it and serve this folder: see playground/README.md.';
     return;
   }
   load(SAMPLE, 'built-in');
 }
 
 // One replay: configure, reset at the first knot, submit the rest on its time
-// (64 ahead, the next as each retires), sample every 1 ms. With D, each solve's
-// trace is read into D (per knot) and cleared; without, the records accumulate
-// for steps.js.
-function replay(W, D) {
+// (64 ahead, the next as each retires), sample every 1 ms. onSolve(W, live,
+// first) runs after each solve, live the knot index of each pending knot.
+function replay(W, onSolve) {
   const { K, h, dv, sBuf, kBuf } = W, Wmm = winW(), w = (p) => (p - cfg.lo) / Wmm;
   const ok = K.kinetic2_configure(h, cfg.vmax / Wmm, cfg.amax / Wmm, cfg.jmax / Wmm, cfg.smoothness,
     Math.min(0.33, Math.max(0.05, cfg.lfloor)), Math.min(1, Math.max(0, cfg.trim / Wmm)), 4000);
   const t0 = Math.round(knots[0].t * 1e6), z = Math.floor(t0 / 1000);
   K.kinetic2_reset(h, w(pos(knots[0])), t0);
-  if (D) K.kinetic2_trace_clear();
   const n = Math.round((knots[knots.length - 1].t + 0.3) * 1000) + 1;
   const P = new Float32Array(n), V = new Float32Array(n), A = new Float32Array(n), J = new Float32Array(n);
   const live = [];
@@ -84,7 +83,8 @@ function replay(W, D) {
     }
     if (sub) {
       K.kinetic2_solved(h, 0, kBuf);   // solves the window
-      if (D) { readSolve(K, live, solves === 0, D); K.kinetic2_trace_clear(); }
+      while (live.length > K.kinetic2_pending(h)) live.shift();   // an undone re-plan retires one
+      if (onSolve) onSolve(W, live, solves === 0);
       solves++;
     }
     K.kinetic2_sample(h, now, sBuf);
@@ -97,39 +97,16 @@ function replay(W, D) {
   return { n, P, V, A, J, max: { v: mv, a: ma, j: mj }, over, ok, refused };
 }
 
-// The knots of one solve, from its trace: per run, the last render round
-// (K_ROUND tag 1 or 3, its K_KNOT block) and the solved knots (K_EMIT). A knot
-// is written from a run where it has a knot on both sides (run index 2 on), or
-// from the first solve, whose origin is the first knot at rest.
-const REC = 24, K_RUN = 2, K_ROUND = 7, K_EMIT = 14;
-function readSolve(K, live, first, D) {
-  const n = K.kinetic2_trace_count(), b0 = K.kinetic2_trace_records() >> 2;
-  const i32 = new Int32Array(K.memory.buffer), f32 = new Float32Array(K.memory.buffer);
-  let run = null;
-  const flush = () => {
-    if (!run || run.fin < 0) return;
-    for (let r = first ? 0 : 2; r < run.me; r++) {
-      const ix = r === 0 ? 0 : live[run.base + r - 1];
-      if (ix == null) continue;
-      const o = b0 + (run.fin + 1 + r) * REC, fl = i32[o + 2], f = (x) => f32[o + 4 + x];
-      const d = { cls: fl & 3, g2: (fl >> 2) & 1, hasV: (fl >> 3) & 1, p: f(1) + f(2), dp: f(2), vel: f(3), lIn: f(4), lOut: f(5), ei: f(6), eo: f(7),
-        TL: r > 0 ? f(0) - f32[o - REC + 4] : 0, TR: r + 1 < run.m ? f32[o + REC + 4] - f(0) : 0,
-        corner: 0, inf: 0, clamped: 0, share: 1, worst: 0, rampT: 0 };
-      const e = run.emit[r];
-      if (e != null) {
-        const q = b0 + e * REC, ef = i32[q + 2];
-        Object.assign(d, { corner: ef & 1, inf: (ef >> 1) & 1, clamped: (ef >> 4) & 1, share: f32[q + 8], worst: f32[q + 9], rampT: f32[q + 12] });
-      }
-      D[ix] = d;
-    }
-  };
-  for (let r = 0; r < n; r++) {
-    const o = b0 + r * REC, kind = i32[o];
-    if (kind === K_RUN) { flush(); run = { m: i32[o + 1], me: i32[o + 2], base: i32[o + 3], fin: -1, emit: [] }; }
-    else if (kind === K_ROUND && (i32[o + 1] & 1)) run.fin = r;
-    else if (kind === K_EMIT) run.emit[i32[o + 1]] = r;
+// The knots of one solve (kinetic2_render): a knot is written from a solve
+// where it has a knot on both sides (window index 2 on), or from the first
+// solve, whose origin is the first knot at rest.
+function readSolve({ K, h, dv, rBuf }, live, first, D) {
+  for (let r = first ? 0 : 2; r <= live.length; r++) {
+    if (!K.kinetic2_render(h, r, rBuf)) return;
+    const f = (o) => dv.getFloat32(rBuf + o, true), u = (o) => dv.getUint8(rBuf + o);
+    D[r === 0 ? 0 : live[r - 1]] = { p: f(0), dp: f(4), vel: f(8), lIn: f(12), lOut: f(16), ei: f(20), eo: f(24), TL: f(28), TR: f(32),
+      share: f(36), worst: f(40), rampT: f(44), cls: u(48), g2: u(49), corner: u(50), inf: u(51), clamped: u(52) };
   }
-  flush();
 }
 
 // ---- the script -------------------------------------------------------------------
@@ -151,7 +128,7 @@ function update() {
   if (!T) return;
   if (knots.length < 2) { R = null; draw(); return; }
   const D = new Array(knots.length).fill(null);
-  R = replay(T, D);
+  R = replay(T, (W, live, first) => readSolve(W, live, first, D));
   R.D = D;
   // per sample: 1 v, 2 a, 4 j over its ceiling, 8 in a piece no trim keeps inside
   const Wmm = winW(), fl = new Uint8Array(R.n);
@@ -485,7 +462,7 @@ $('#legend').innerHTML = [['hold edge', CLS.rest], ['crest', CLS.crest], ['throu
   .map(([n, c]) => `<li><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="${c}"/></svg>${n}</li>`).join('');
 
 // ---- the planner steps ------------------------------------------------------------------
-// steps.js on this page's planner instance, in mm. Loaded the first time the
+// steps.js, in mm, on its own kinetic2-trace.wasm. Loaded the first time the
 // steps are shown, never on the page's load.
 let stepper = null, stepsOn = false, stepsLoading = false;
 const SC = { ...C, t2: '#C3C8D1', l1: '#121419', l4: '#33373E', sunken: '#040507', bad: C.red };
@@ -496,7 +473,7 @@ function showSteps() {
   if (stepsLoading) return;
   stepsLoading = true;
   import('./steps.js').then((m) => m.init($('#steps'), {
-    K: T.K, replay: (W) => replay(W), fit: (cv) => { const d = dims(cv); return { g: d.ctx, w: d.w, h: d.h }; }, C: SC, MONO, SANS,
+    replay: (W) => replay(W), fit: (cv) => { const d = dims(cv); return { g: d.ctx, w: d.w, h: d.h }; }, C: SC, MONO, SANS,
     state: () => { const W = winW(); return { o: { vmax: cfg.vmax / W, amax: cfg.amax / W, jmax: cfg.jmax / W } }; },
     units: () => ({ k: winW(), off: cfg.lo, pd: 2, vd: 1, pu: ' mm', v: 'mm/s', a: 'mm/s²', j: 'mm/s³' }),
   })).then((s) => { stepper = s; if (stepsOn) s.update(); },

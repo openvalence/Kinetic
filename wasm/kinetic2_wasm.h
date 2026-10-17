@@ -54,6 +54,26 @@ typedef struct kinetic2_anomaly {
     uint8_t  reserved[5]; // zero
 } kinetic2_anomaly;
 
+// One knot as the last render left it, 56 bytes (read by kinetic2_render): what
+// the handles page draws. Lengths are shares of the span on that side.
+typedef struct kinetic2_render_knot {
+    float    p;           // where the render passes it: authored plus dp, window units
+    float    dp;          // the trim, toward the knot before; 0 = not moved
+    float    vel;         // the angle, window units/s
+    float    l_in, l_out;     // the handle lengths the style solved
+    float    eff_in, eff_out; // the lengths after the ceilings
+    float    span_in, span_out; // seconds to the knot before and after in the render; 0 none
+    float    share;       // kinetic2_knot's; 1 for the origin
+    float    worst;       // kinetic2_knot's; 0 for the origin
+    float    ramp_s;      // a corner ramp's duration, s; 0 none
+    uint8_t  cls;         // kinetic2::handles::KnotClass: 0 end, 1 rest, 2 crest, 3 through
+    uint8_t  g2;          // 1 renders G2, 0 G1
+    uint8_t  corner;      // a corner ramp at this knot
+    uint8_t  infeasible;  // the piece into it is over a ceiling after the whole trim
+    uint8_t  clamped;     // kinetic2_knot's
+    uint8_t  reserved[3]; // zero
+} kinetic2_render_knot;
+
 typedef struct kinetic2_handle kinetic2_handle;
 
 // ---- the calls --------------------------------------------------------------
@@ -105,6 +125,12 @@ void kinetic2_sample(kinetic2_handle* h, double now_us, kinetic2_state* out);
 // 1 written, 0 when i is out of range.
 uint32_t kinetic2_pending(kinetic2_handle* h);
 int kinetic2_solved(kinetic2_handle* h, uint32_t i, kinetic2_knot* out);
+
+// The pending window as the solve rendered it: i = 0 the origin, i = 1..pending
+// pending knot i - 1. Solves first. 1 written; 0 when i is out of range or the
+// window did not render as one handle run (nothing pending, or a sample or
+// live-jog knot in it: those are moves, not renders).
+int kinetic2_render(kinetic2_handle* h, uint32_t i, kinetic2_render_knot* out);
 
 // Oldest recorded anomaly, 1 written, 0 when none. The ring keeps 16.
 int kinetic2_pop_anomaly(kinetic2_handle* h, kinetic2_anomaly* out);

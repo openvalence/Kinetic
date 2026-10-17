@@ -1,7 +1,8 @@
 // handles.check.mjs -- serves the playground and drives handles.html headless:
-// the page draws the planner's result (its samples equal kinetic2.wasm's bit for
-// bit, each knot on the curve), edits reach the planner, the planner steps work,
-// no console errors, no horizontal scroll at three viewports.
+// the page draws the planner's result (its samples and kinetic2_render's knots
+// equal kinetic2-trace.wasm's samples and trace records bit for bit, each knot
+// on the curve), edits reach the planner, the trace build loads only with the
+// planner steps, no console errors, no horizontal scroll at three viewports.
 // Run: node playground/handles.check.mjs
 //   PLAYWRIGHT_DIR: a node_modules holding playwright (default ../Phosphor/node_modules)
 //   SHOTS_DIR: where the screenshots go (default the OS temp dir)
@@ -55,25 +56,67 @@ const st = () => page.evaluate(() => {
     inf: D.filter((x) => x && x.inf).length, trimmed: D.filter((x) => x && x.dp !== 0).length,
     nudged: D.filter((x) => x && (Math.abs(x.ei - x.lIn) > 1e-6 || Math.abs(x.eo - x.lOut) > 1e-6)).length };
 });
-// The page's drawing against kinetic2.wasm, the main playground's build, on the
-// same knots: every 1 ms sample equal bit for bit; every knot drawn on the curve
-// at its time within kKnotTol (solver.hpp, 1e-3 of the window).
-const drawsPlanner = () => page.evaluate(async () => {
-  if (!window.__k2) {
-    const { instance } = await WebAssembly.instantiate(await (await fetch('./kinetic2.wasm')).arrayBuffer(), {});
+// The page's drawing (kinetic2.wasm) against kinetic2-trace.wasm on the same
+// knots: every 1 ms sample equal bit for bit; every knot's kinetic2_render data
+// equal bit for bit to the trace records of its last render round (K_KNOT of the
+// last odd K_ROUND per run, K_EMIT; wasm/kinetic2_trace.cpp); every knot drawn
+// on the curve at its time within kKnotTol (solver.hpp, 1e-3 of the window).
+// The trace build goes in as bytes: a fetch here would count as the page's.
+const traceB64 = readFileSync(join(here, 'kinetic2-trace.wasm')).toString('base64');
+const drawsPlanner = () => page.evaluate(async (b64) => {
+  if (!window.__k2t) {
+    const { instance } = await WebAssembly.instantiate(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)), {});
     const K = instance.exports; K._initialize();
-    window.__k2 = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24) };
+    window.__k2t = { K, h: K.kinetic2_create(), dv: new DataView(K.memory.buffer), sBuf: K.malloc(24), kBuf: K.malloc(40), aBuf: K.malloc(24) };
   }
-  const s = window.__handles.state(), R = s.R, r = window.__handles.replay(window.__k2);
+  const REC = 24, K_RUN = 2, K_ROUND = 7, K_EMIT = 14, F = Math.fround;
+  const s = window.__handles.state(), R = s.R, W = window.__k2t, K = W.K, TD = new Array(s.knots.length).fill(null);
+  const readTrace = (live, first) => {
+    const n = K.kinetic2_trace_count(), b0 = K.kinetic2_trace_records() >> 2;
+    const i32 = new Int32Array(K.memory.buffer), f32 = new Float32Array(K.memory.buffer);
+    let run = null;
+    const flush = () => {
+      if (!run || run.fin < 0) return;
+      for (let r = first ? 0 : 2; r < run.me; r++) {
+        const ix = r === 0 ? 0 : live[run.base + r - 1];
+        if (ix == null) continue;
+        const o = b0 + (run.fin + 1 + r) * REC, fl = i32[o + 2], f = (x) => f32[o + 4 + x];
+        const d = { p: F(f(1) + f(2)), dp: f(2), vel: f(3), lIn: f(4), lOut: f(5), ei: f(6), eo: f(7),
+          TL: r > 0 ? F(f(0) - f32[o - REC + 4]) : 0, TR: r + 1 < run.m ? F(f32[o + REC + 4] - f(0)) : 0,
+          share: 1, worst: 0, rampT: 0, cls: fl & 3, g2: (fl >> 2) & 1, corner: 0, inf: 0, clamped: 0 };
+        const e = run.emit[r];
+        if (e != null) {
+          const q = b0 + e * REC, ef = i32[q + 2];
+          Object.assign(d, { corner: ef & 1, inf: (ef >> 1) & 1, clamped: (ef >> 4) & 1, share: f32[q + 8], worst: f32[q + 9], rampT: f32[q + 12] });
+        }
+        TD[ix] = d;
+      }
+    };
+    for (let r = 0; r < n; r++) {
+      const o = b0 + r * REC, kind = i32[o];
+      if (kind === K_RUN) { flush(); run = { m: i32[o + 1], me: i32[o + 2], base: i32[o + 3], fin: -1, emit: [] }; }
+      else if (kind === K_ROUND && (i32[o + 1] & 1)) run.fin = r;
+      else if (kind === K_EMIT) run.emit[i32[o + 1]] = r;
+    }
+    flush();
+    K.kinetic2_trace_clear();
+  };
+  K.kinetic2_trace_clear();
+  const r = window.__handles.replay(W, (_, live, first) => readTrace(live, first));
   let diff = r.n !== R.n ? 1 : 0;
   for (let i = 0; i < R.n && !diff; i++) if (!Object.is(r.P[i], R.P[i]) || !Object.is(r.V[i], R.V[i]) || !Object.is(r.A[i], R.A[i])) diff = i + 1;
-  let off = 0, missing = 0;
-  s.knots.forEach((k, i) => { const d = R.D[i]; if (!d) { missing++; return; } off = Math.max(off, Math.abs(R.P[Math.round(k.t * 1000)] - d.p)); });
-  return { diff, off, missing, n: R.n, over: R.over };
-});
+  let off = 0, missing = 0, knotDiff = null;
+  s.knots.forEach((k, i) => {
+    const d = R.D[i], t = TD[i];
+    if (!d) { missing++; return; }
+    off = Math.max(off, Math.abs(R.P[Math.round(k.t * 1000)] - d.p));
+    if (!knotDiff) for (const key of Object.keys(d)) if (!t || !Object.is(d[key], t[key])) { knotDiff = `knot ${i} ${key}: ${d[key]} rendered, ${t && t[key]} traced`; break; }
+  });
+  return { diff, off, missing, knotDiff, n: R.n, over: R.over };
+}, traceB64);
 const exact = async (what) => {
   const r = await drawsPlanner();
-  check(r.diff === 0 && r.missing === 0 && r.off <= 1e-3, `${what}: ${r.n} samples equal kinetic2.wasm's bit for bit${r.diff ? ` (first difference at ${r.diff - 1} ms)` : ''}; every knot on the curve within ${r.off.toExponential(1)} of the window${r.missing ? `, ${r.missing} knots without planner data` : ''}`);
+  check(r.diff === 0 && r.missing === 0 && r.off <= 1e-3 && !r.knotDiff, `${what}: ${r.n} samples equal kinetic2-trace.wasm's bit for bit${r.diff ? ` (first difference at ${r.diff - 1} ms)` : ''}; every knot's render equals its trace records${r.knotDiff ? ` (not: ${r.knotDiff})` : ''}; every knot on the curve within ${r.off.toExponential(1)} of the window${r.missing ? `, ${r.missing} knots without planner data` : ''}`);
 };
 const setNum = async (id, v) => { await page.fill(id, String(v)); await page.dispatchEvent(id, 'change'); };
 
@@ -142,13 +185,13 @@ const fits = async (label) => {
 await fits('');
 
 // the planner steps: never fetched while off; on, steps.js on the page's planner
-check(!requested.some((p) => /steps\.js/.test(p)), 'page steps: steps.js is not fetched while off');
+check(!requested.some((p) => /steps\.js|kinetic2-trace\.wasm/.test(p)), 'page steps: neither steps.js nor kinetic2-trace.wasm is fetched while off');
 const dv = () => page.evaluate(() => ({ n: window.__k2steps.steps.length, idx: window.__k2steps.idx, kinds: [...new Set(window.__k2steps.steps.map((s) => s.kind))] }));
 await page.click('#steps-toggle');
 await page.waitForFunction(() => window.__k2steps);
 let d = await dv();
 check(d.n > 20 && ['classify', 'sweep', 'judge', 'piece', 'result', 'samples'].every((k) => d.kinds.includes(k)), `page steps: the built-in script, ${d.n} steps`);
-check(requested.filter((p) => /kinetic2-trace\.wasm/.test(p)).length === 1, 'page steps: the steps reuse the page\'s planner (one trace module fetched)');
+check(requested.filter((p) => /kinetic2-trace\.wasm/.test(p)).length === 1 && requested.filter((p) => /kinetic2\.wasm/.test(p)).length === 1, 'page steps: one trace module fetched, with the steps; the page runs kinetic2.wasm');
 await page.click('#st-next'); await page.click('#st-next');
 d = await dv(); check(d.idx === 2, `page steps: Next walks the steps (step ${d.idx + 1})`);
 await setNum('#c-vmax', 400);
