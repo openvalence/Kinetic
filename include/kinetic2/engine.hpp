@@ -359,6 +359,8 @@ public:
     // The solver's decision for pending knot i (tooling: the tuner shows the
     // share per knot). Solves first.
     const Solved& solved(size_t axis, size_t i) { ensureSolved(_ax[axis]); return _ax[axis].sol[i]; }
+    // The last solve's final render round, origin first; valid after a solve with no hard solved() knot.
+    const handles::HKnot* lastRender(size_t axis) const { return _ax[axis].ws.k; }
 
     // ---- anomalies ----------------------------------------------------------
     bool popAnomaly(Anomaly& out) {
