@@ -586,8 +586,8 @@ inline constexpr int   kSlackCap   = 16;
 // share near zero ranked the least-over fit by a ceiling no piece can meet.
 inline constexpr float kSlackFloor = 0.25f;
 // A tightening that did not cut its excess lowers the share at least this
-// much the next time: a share no fit answers reaches kSlackFloor in at most
-// 28 such passes.
+// much the next time; one that left the excess bit for bit where it was (the
+// share does not reach it) takes kSlackFloor at once.
 inline constexpr float kSlackStep  = 0.95f;
 // until_us: a successor is expected until then (Engine::expect; 0 none). The
 // newest knot, free and not a sample, then renders through toward a
@@ -647,7 +647,8 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
         // Speed and acceleration tighten from what the render itself reads of
         // the piece (a lead ramp can put the built piece over while the
         // render is well inside), by at most half per pass.
-        auto tighten = [&](int r, const handles::Over& o) {
+        // seed: o is r's own piece or corner ramp.
+        auto tighten = [&](int r, const handles::Over& o, bool seed = false) {
             if (r >= m) return;
             handles::Over rp;
             overMemo(&ws.memo, handles::pieceOf(k, r - 1), handles::rendered(k[r - 1]), c, &rp);
@@ -661,8 +662,20 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
                 // Stalled (the last tightening did not cut the excess): at
                 // least kSlackStep, so a share no fit answers reaches its floor.
                 if (!(w < ws.last[r][x] * (1.0f - 0.5f * handles::kTol))) t = std::fmin(t, kSlackStep * k[r].slack[x]);
+                if (w == ws.last[r][x]) t = kSlackFloor;
                 t = std::fmax(kSlackFloor, t);
-                if (t < k[r].slack[x]) { if (!final) k[r].slack[x] = t; again = true; }
+                if (t < k[r].slack[x]) {
+                    // A first ask behind a tightened successor is the step from
+                    // the untightened shares to the tightened ones, and each
+                    // tightening moves it one knot back: the knots before r
+                    // take r's share in this pass. ponytail: the walk runs to the
+                    // head (or a knot as tight); a cascade that would stop partway
+                    // gives up the stroke before it; bound the walk if a window shows it.
+                    if (seed && !final && ws.last[r][x] == INFINITY && r + 1 < m && k[r + 1].slack[x] < k[r].slack[x])
+                        for (int j = r - 1; j >= 1 && t < k[j].slack[x]; --j) k[j].slack[x] = t;
+                    if (!final) k[r].slack[x] = t;
+                    again = true;
+                }
             }
         };
         float* built = ws.built;
@@ -705,13 +718,13 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
                 built[r] = std::fmax(w, step_ratio);
                 over = over || std::fmax(po.v, std::fmax(po.a, po.x)) > 1.0f + handles::kTol;
                 po.j = std::fmax(po.j, step_ratio);
-                if (!o.infeasible) tighten(r, po);
+                if (!o.infeasible) tighten(r, po, true);
             }
             if (o.corner) {
                 const handles::Over pr = profOver(o.ramp, c);
                 over = over || std::fmax(pr.v, std::fmax(pr.a, pr.x)) > 1.0f + handles::kTol;
                 built[r] = std::fmax(built[r], std::fmax(std::fmax(pr.v, pr.a), std::fmax(pr.j, pr.x)));
-                tighten(r, pr);
+                tighten(r, pr, true);
                 tighten(r + 1, pr);
             }
             // The newest knot of a window may be the last: the engine brakes
