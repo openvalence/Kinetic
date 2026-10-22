@@ -15,7 +15,7 @@
 #include "kinetic2/engine.hpp"
 
 #ifndef KINETIC2_FINGERPRINT
-#define KINETIC2_FINGERPRINT 0xc7482d96f374ecf0ull   // accepted 2026-10-08 (kin-9od3): a piece after an on-curve corner exit is the render's curve from there
+#define KINETIC2_FINGERPRINT 0xb43b8ddce5ab576bull   // accepted 2026-10-22 (kin-f0yr change 3): built start-corrected pieces judged at their exact peaks; was 0xc7482d96f374ecf0
 #endif
 
 using namespace kinetic2;
