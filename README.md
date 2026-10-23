@@ -105,7 +105,14 @@ translation unit that compiles the planner uses `-ffp-contract=off` and not
 `-ffast-math`. Without the flag, GCC fuses multiply-adds on targets such as the
 ESP32-P4 and results drift by a few ULPs.
 
-So the plan you preview in the browser is the plan the firmware runs. The CMake
+So a plan previewed from the same knots, submitted and sampled at the same
+times under the same `Config` (`react_us` included), is the plan the firmware
+runs: a script rendered ahead previews exactly. A live re-plan (a stream, a
+jog or a supersede arriving while the axis moves) can differ in timing and
+origin between a preview and a machine: the host chooses `react_us` per submit
+from its own clock (Nucleus adapts it to its measured solve time and the
+stream's lead), and its fallbacks for a late plan, an exhausted plan buffer or
+a late tick run on the firmware clock. The CMake
 target carries the flag for you, and `tests/test_kinetic2.cpp` pins a
 fingerprint of the rendered motion. The engine is single-threaded: every call on
 one `Engine` comes from one task.
