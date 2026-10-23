@@ -748,6 +748,13 @@ std::vector<float> planOf(Engine<>& e, size_t n) {
     return p;
 }
 std::vector<float> restPlan(float p, size_t n) { return std::vector<float>(n, p); }
+// render()'s plan at tick i: it reads n + lookahead + 2 * kPlanEdge positions
+// from here, so a short plan fails the test and is never read past its end.
+const float* planAt(const std::vector<float>& plan, size_t i, size_t n = 128) {
+    if (i - Osc::kPlanEdge + n + Osc::lookahead(1000) + 2 * Osc::kPlanEdge > plan.size())
+        FAIL("the plan ends before render() at tick " << i << " reads it");
+    return &plan[i - Osc::kPlanEdge];
+}
 // One render per tick as the hub's strip does, `strip` outputs a call; the
 // head (out[0]) is what executes. Holds from tick `hold_from`.
 struct OscRun { std::vector<float> sum, osc, eff; };
@@ -756,7 +763,7 @@ OscRun oscRun(Osc& o, const Limits& L, const std::vector<float>& plan, size_t ti
     OscRun r;
     std::array<float, 128> out{};
     for (size_t i = Osc::kPlanEdge; i < ticks; ++i) {
-        o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], strip, L, lo, hi, i >= hold_from, out.data());
+        o.render(i * kMs, 1000, planAt(plan, i, strip), strip, L, lo, hi, i >= hold_from, out.data());
         r.sum.push_back(plan[i] + out[0]);
         r.osc.push_back(out[0]);
         r.eff.push_back(o.amplitudeEffective());
@@ -797,7 +804,7 @@ constexpr float kFdV = 1.0f * kUlp / 1e-3f, kFdA = 2.0f * kUlp / 1e-6f, kFdJ = 4
 TEST_CASE("oscillator: a sine at rest swings the asked amplitude at the asked period, inside the ceilings") {
     const Limits L{5.0f, 200.0f, 20000.0f};
     Osc o; o.set(oscAt(10.0f, 0.02f));
-    const auto r = oscRun(o, L, restPlan(0.5f, 2400), 2200);
+    const auto r = oscRun(o, L, restPlan(0.5f, 2500), 2200);
     const Peaks s = fdPeaks(std::vector<float>(r.sum.begin() + 400, r.sum.end()));
     CHECK(s.hi == doctest::Approx(0.52f).epsilon(1e-3));
     CHECK(s.lo == doctest::Approx(0.48f).epsilon(1e-3));
@@ -859,7 +866,7 @@ TEST_CASE("oscillator: never leaves the window; the edge bounds the amplitude an
     for (const OscShape sh : {OscShape::Sine, OscShape::Saw, OscShape::SawReverse}) {
         CAPTURE(int(sh));
         Osc o; o.set(oscAt(3.0f, 0.2f, sh));
-        const auto r = oscRun(o, L, restPlan(0.05f, 1600), 1400);   // 0.05 from the low edge
+        const auto r = oscRun(o, L, restPlan(0.05f, 1700), 1400);   // 0.05 from the low edge
         const Peaks pk = fdPeaks(r.sum);
         CHECK(pk.lo >= 0.0f);
         CHECK(o.amplitudeEffective() <= 0.05f);
@@ -877,7 +884,7 @@ TEST_CASE("oscillator: dwells stretch the period and hold the extremes; the saw 
     for (const OscShape sh : {OscShape::Sine, OscShape::Square, OscShape::Saw, OscShape::SawReverse}) {
         CAPTURE(int(sh));
         Osc o; o.set(oscAt(4.0f, 0.02f, sh, 0.3f));
-        const auto r = oscRun(o, L, restPlan(0.5f, 3000), 2800);
+        const auto r = oscRun(o, L, restPlan(0.5f, 3100), 2800);
         const bool saw = sh == OscShape::Saw || sh == OscShape::SawReverse;
         // (1 + 0.3) / 4 Hz = 325 ms; a saw keeps 250.
         for (const size_t d : periodsOf(r.osc, 600)) CHECK(d == doctest::Approx(saw ? 250 : 325).epsilon(0.01));
@@ -893,7 +900,7 @@ TEST_CASE("oscillator: a square with dwells is a pulse") {
     const Limits L{5.0f, 300.0f, 3e7f};
     auto duty = [&](float crest, float trough) {
         Osc o; o.set(oscAt(5.0f, 0.02f, OscShape::Square, crest, trough));
-        const auto r = oscRun(o, L, restPlan(0.5f, 3400), 3200);
+        const auto r = oscRun(o, L, restPlan(0.5f, 3500), 3200);
         size_t hi = 0;
         for (size_t i = 800; i < 3198; ++i) if (r.osc[i] > 0.0f) ++hi;
         return float(hi) / float(3198 - 800);
@@ -905,14 +912,14 @@ TEST_CASE("oscillator: a square with dwells is a pulse") {
 
 TEST_CASE("oscillator: a new frequency fades out, latches at rest and fades in from the trough") {
     const Limits L{5.0f, 300.0f, 300000.0f};
-    const auto plan = restPlan(0.5f, 2600);
+    const auto plan = restPlan(0.5f, 2700);
     Osc o; o.set(oscAt(10.0f, 0.02f));
     std::array<float, 128> out{};
     std::vector<float> osc, eff, sum;
     constexpr size_t kE = Osc::kPlanEdge, kSet = 800 - kE;   // the tick of the change, as an index
     for (size_t i = kE; i < 2400; ++i) {
         if (i == 800) o.set(oscAt(20.0f, 0.005f));
-        o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], 128, L, 0.0f, 1.0f, false, out.data());
+        o.render(i * kMs, 1000, planAt(plan, i), 128, L, 0.0f, 1.0f, false, out.data());
         osc.push_back(out[0]); eff.push_back(o.amplitudeEffective()); sum.push_back(plan[i] + out[0]);
     }
     size_t rest = 0;
@@ -936,7 +943,7 @@ TEST_CASE("oscillator: hold sheds it and restarts the phase at the trough; disab
     std::vector<float> osc, eff;
     constexpr size_t kE = Osc::kPlanEdge, kOn = 600 - kE, kOff = 1000 - kE;   // the hold, as indexes
     for (size_t i = kE; i < 2000; ++i) {
-        o.render(i * kMs, 1000, &plan[i - kE], 128, L, 0.0f, 1.0f, i >= 600 && i < 1000, out.data());
+        o.render(i * kMs, 1000, planAt(plan, i), 128, L, 0.0f, 1.0f, i >= 600 && i < 1000, out.data());
         osc.push_back(out[0]); eff.push_back(o.amplitudeEffective());
     }
     CHECK(eff[kOn - 1] > 0.0f);
@@ -948,7 +955,7 @@ TEST_CASE("oscillator: hold sheds it and restarts the phase at the trough; disab
     CHECK(first <= kOff + 2);
     CHECK(osc[first] < 0.0f);
     OscParams off = o.params(); off.enabled = false; o.set(off);
-    for (size_t i = 2000; i < 2300 && !o.idle(); ++i) o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], 128, L, 0.0f, 1.0f, false, out.data());
+    for (size_t i = 2000; i < 2300 && !o.idle(); ++i) o.render(i * kMs, 1000, planAt(plan, i), 128, L, 0.0f, 1.0f, false, out.data());
     CHECK(o.idle());
     CHECK(o.amplitudeEffective() == 0.0f);
 }
@@ -964,7 +971,7 @@ TEST_CASE("oscillator: the strip predicts the head it later renders, and a run i
         std::array<float, 128> out{};
         std::vector<float> head;
         for (size_t i = Osc::kPlanEdge; i < 1900; ++i) {
-            o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], 128, kHubSet, 0.0f, 1.0f, false, out.data());
+            o.render(i * kMs, 1000, planAt(plan, i), 128, kHubSet, 0.0f, 1.0f, false, out.data());
             head.push_back(out[0]);
             if (predicted && i == 500) predicted->assign(out.begin(), out.end());
         }
@@ -1000,7 +1007,7 @@ OscRun driveRun(Osc& o, const Limits& L, const std::vector<float>& plan, size_t 
             const Ask a = ask(next);
             REQUIRE(o.drive(next, a.hz, a.amp));
         }
-        o.render(i * kMs, 1000, &plan[i - Osc::kPlanEdge], 128, L, 0.0f, 1.0f, false, out.data());
+        o.render(i * kMs, 1000, planAt(plan, i), 128, L, 0.0f, 1.0f, false, out.data());
         r.sum.push_back(plan[i] + out[0]);
         r.osc.push_back(out[0]);
         r.eff.push_back(o.amplitudeEffective());
@@ -1112,7 +1119,7 @@ TEST_CASE("oscillator driven: input loss fades it to rest; the drive back fades 
 
 TEST_CASE("oscillator driven: fixed to driven goes through rest") {
     const Limits L{5.0f, 300.0f, 300000.0f};
-    const auto plan = restPlan(0.5f, 1800);
+    const auto plan = restPlan(0.5f, 1900);
     Osc o; o.set(oscAt(10.0f, 0.02f));
     std::array<float, 128> out{};
     std::vector<float> osc, eff, sum;
@@ -1120,7 +1127,7 @@ TEST_CASE("oscillator driven: fixed to driven goes through rest") {
     for (size_t i = kE; i < 1600; ++i) {
         if (i == 500) o.set(driven());
         if (i >= 500 && i % 20 == 0) REQUIRE(o.drive(i * kMs + kLead, 20.0f, 0.005f));
-        o.render(i * kMs, 1000, &plan[i - kE], 128, L, 0.0f, 1.0f, false, out.data());
+        o.render(i * kMs, 1000, planAt(plan, i), 128, L, 0.0f, 1.0f, false, out.data());
         osc.push_back(out[0]); eff.push_back(o.amplitudeEffective()); sum.push_back(plan[i] + out[0]);
     }
     size_t rest = 500 - kE;
