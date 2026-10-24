@@ -10,11 +10,12 @@
 // - A judge reads each of v, a, j at 11 u samples and at its exact turning
 //   points (the roots of the next derivative's numerator, bracketed and
 //   bisected), about 150 polynomial evaluations against overSampled's 161
-//   samples; a legality test stops at the first sample over the bar, the
-//   length walk skips the side of 1 that cannot help (lengths of a third
-//   only), and a piece whose inputs did not change is not judged again
-//   (HKnot memo). A bound on the render's work belongs in the solver, never
-//   this file.
+//   samples (a start-corrected piece searches more segments: kSegA, kSegJ,
+//   kSegS); overSampled is the test reference, never a production judge. A
+//   legality test stops at the first sample over the bar, the length walk
+//   skips the side of 1 that cannot help (lengths of a third only), and a
+//   piece whose inputs did not change is not judged again (HKnot memo). A
+//   bound on the render's work belongs in the solver, never this file.
 // - Cfg::trimLast and Cfg::railStop are the kernel's rules (kin-88m), off by
 //   default: under railStop the render holds a trimmed knot's angle to its
 //   trimmed chord, caps an angle its span cannot stop, fits the corner ramps'
@@ -24,9 +25,9 @@
 //   HKnot::rail, the last knot's brake cap on HKnot::vcap, a moving origin's
 //   HKnot::aIn and Piece::da are the engine's (solver.hpp renderRun,
 //   engine_piece.hpp); at their defaults they change nothing. overOf judges
-//   each peak at its exact turning points and agrees with a full sampling
-//   (overSampled) within kTol, which can move a trim that sits on a legality
-//   boundary.
+//   each peak at its exact turning points, a start-corrected piece's too, and
+//   agrees with a full sampling (overSampled) within kTol, never under it,
+//   which can move a trim that sits on a legality boundary.
 // - At smoothness 0 a band-legal piece stays monotone at its scaled lengths
 //   (monoOver, kin-ay9): the band guarantees it only at a third. Above 0 only
 //   the window judges overshoot.
@@ -73,6 +74,9 @@ inline constexpr float kLMax   = 0.95f;   // longest handle
 inline constexpr float kThird  = 1.0f / 3.0f;  // the polynomial cubic (the cubic Hermite)
 inline constexpr float kTol    = 1e-3f;   // a peak within 0.1% of its ceiling is legal
 inline constexpr int   kJudgeN = 160;     // u samples per fully sampled piece (overSampled)
+// overCorrected's root-search segments: v and the window, a, j (the sweep
+// in tests/test_kinetic2_handles.cpp sets them).
+inline constexpr int   kSegA = 20, kSegJ = 20, kSegS = 40;
 inline constexpr float kTick   = 1e-3f;   // the engine's tick, s: a corner ramp's clearance from a span's end
 inline constexpr int   kMemoKey = 16;     // nudge's memo inputs per piece; every input of a fit is in it
 
@@ -222,7 +226,10 @@ struct Over {
 // The piece's derivative polynomials in u, computed once per judge: T'(u) and
 // P'(u) are quadratics (ta0 + ta1 u + ta2 u^2), their second derivatives
 // linear, their third constant. v = P'/T', a = nA/T'^3, j = nJ/T'^5 with
-// nA = P''T' - P'T'' (cubic) and nJ = (P'''T' - P'T''')T' - 3 nA T'' (quartic).
+// nA = P''T' - P'T'' (quadratic) and nJ = (P'''T' - P'T''')T' - 3 nA T''
+// (cubic); the numerator of dj/du is a quartic. A start correction (da) adds
+// to each numerator a polynomial in tau = t(u)/T times a power of T' (degree
+// 14 to 17 in u): never expanded, evaluated pointwise.
 struct Coef {
     float ta0, ta1, ta2, pa0, pa1, pa2;
     float t1, t2, t3, p1, p2, p3;
@@ -250,13 +257,14 @@ inline Deriv derivAt(const Coef& k, float u) {
 }
 // The numerator of dj/du: nJ' T' - 5 nJ T''. With g = 2 pa2 T' - 2 ta2 P'
 // (which is also nA'), nJ = g T' - 3 nA T'' and nJ' = g' T' - 2 g T'' - 6 ta2 nA.
-inline float jSlopeNum(const Coef& k, float u) {
-    const Deriv d = derivAt(k, u);
+// d: derivAt(k, u), uncorrected.
+inline float jSlopeOf(const Coef& k, const Deriv& d) {
     const float g = 2.0f * k.pa2 * d.tp - 2.0f * k.ta2 * d.pp;
     const float gp = 2.0f * k.pa2 * d.tpp - 2.0f * k.ta2 * d.ppp;
     const float nJp = gp * d.tp - 2.0f * g * d.tpp - 6.0f * k.ta2 * d.nA;
     return nJp * d.tp - 5.0f * d.nJ * d.tpp;
 }
+inline float jSlopeNum(const Coef& k, float u) { return jSlopeOf(k, derivAt(k, u)); }
 inline float vAt(const Deriv& d) { return d.pp / d.tp; }
 inline float aAt(const Deriv& d) { return d.nA / (d.tp * d.tp * d.tp); }
 inline float jAt(const Deriv& d) { const float t2 = d.tp * d.tp; return d.nJ / (t2 * t2 * d.tp); }
@@ -291,15 +299,99 @@ inline int rootsOf(F&& f, int nseg, float* r, int cap) {
     return n;
 }
 
-inline float overSampled(const Piece& q, float pStart, const Cfg& c, float stop, Over* parts);
+// The worst ceiling ratio from a piece's peaks and its position's range.
+inline float ratioOf(float pv, float pa, float pj, float pMin, float pMax, const Cfg& c, Over* parts) {
+    const float out = std::fmax(0.0f, std::fmax(c.lo - pMin, pMax - c.hi));
+    if (parts) *parts = Over{pv / c.lim.vmax, pa / c.lim.amax, pj / c.lim.jmax, 1.0f + out / (c.hi - c.lo)};
+    const float o = std::fmax(pv / c.lim.vmax, std::fmax(pa / c.lim.amax, pj / c.lim.jmax));
+    // Under railStop the window is a wall: leaving it past half the tolerance
+    // ranks below any ceiling ratio short of a thousand, so the least-over fit
+    // stays inside (the other half is the engine's: a built piece reads a
+    // little past its render).
+    const float wall = c.railStop && out > 0.5f * kTol * (c.hi - c.lo) ? 1e3f : 1.0f;
+    return std::fmax(o, wall + out / (c.hi - c.lo));
+}
+
+// overOf for a start-corrected piece (da != 0): the correction c(t) = da t^2/2
+// (1 - t/T)^3 is added in time, so pp, nA and nJ each gain a polynomial in
+// tau = t(u)/T times a power of T' (degree 14 to 17 in u), evaluated
+// pointwise. The roots are searched on kSegA, kSegJ and kSegS segments, and
+// every point a search evaluates joins the maxima: a root pair missed inside
+// one segment is never read under its neighbors. The ends and the peaks are
+// also read as evalPiece reads them (overSampled): there the polynomials'
+// algebra differs in the fourth digit at a short handle's end, the fifth
+// elsewhere.
+inline float overCorrected(const Piece& q, float pStart, const Cfg& c, float stop, Over* parts) {
+    const float sv = c.lim.vmax * stop, sa = c.lim.amax * stop, sj = c.lim.jmax * stop;
+    const Coef k = coefOf(q);
+    const float iT = 1.0f / q.T, daT = q.da * q.T, daiT = q.da * iT, daiT2 = daiT * iT;
+    float r[16];
+    float pv = 0.0f, pa = 0.0f, pj = 0.0f;
+    // The corrected numerators at u (v T', a T'^3, j T'^5), folded into the
+    // maxima. slope: the numerator of dj/dt T'^7.
+    const auto at = [&](float u, float* slope = nullptr) {
+        Deriv d = derivAt(k, u);
+        if (slope) *slope = jSlopeOf(k, d);
+        const float w0 = 1.0f - u;
+        const float tau = (3.0f * u * w0 * w0 * k.t1 + 3.0f * u * u * w0 * k.t2 + u * u * u * k.t3) * iT, w = 1.0f - tau;
+        const float t2 = d.tp * d.tp, t3 = t2 * d.tp, t5 = t3 * t2;
+        d.pp += daT * (tau * w * w * w - 1.5f * tau * tau * w * w) * d.tp;
+        d.nA += q.da * (w * w * w - 6.0f * tau * w * w + 3.0f * tau * tau * w) * t3;
+        d.nJ += daiT * (-9.0f * w * w + 18.0f * tau * w - 3.0f * tau * tau) * t5;
+        if (slope) *slope += daiT2 * (36.0f - 60.0f * tau) * (t5 * t2);
+        // Division-free: a ratio divides only when it raises its maximum.
+        const float av = std::fabs(d.pp), aa = std::fabs(d.nA), aj = std::fabs(d.nJ);
+        if (av > pv * d.tp) pv = av / d.tp;
+        if (aa > pa * t3) pa = aa / t3;
+        if (aj > pj * t5) pj = aj / t5;
+        return d;
+    };
+    const auto peak = [&](float u) {
+        const Deriv d = at(u);
+        const Eval e = evalPiece(q, u);
+        pv = std::fmax(pv, std::fabs(e.v));
+        pa = std::fmax(pa, std::fabs(e.a));
+        pj = std::fmax(pj, std::fabs(e.j));
+        return d;
+    };
+    (void)peak(0.0f); (void)peak(1.0f);
+    int n = rootsOf([&](float u) { return at(u).nA; }, kSegA, r, 16);
+    for (int i = 0; i < n; ++i) (void)peak(r[i]);
+    if (pv > sv) return 2.0f * stop;
+    n = rootsOf([&](float u) { return at(u).nJ; }, kSegJ, r, 16);
+    for (int i = 0; i < n; ++i) (void)peak(r[i]);
+    if (pa > sa) return 2.0f * stop;
+    n = rootsOf([&](float u) { float sl; (void)at(u, &sl); return sl; }, kSegS, r, 16);
+    for (int i = 0; i < n; ++i) (void)peak(r[i]);
+    if (pj > sj) return 2.0f * stop;
+    // The position's turning points: the roots of the corrected P', and every
+    // point the search evaluates (a root is placed within its bracket). The
+    // Bezier stays inside its control points' hull and the correction within
+    // |da| T^2/2 * 0.0346 (the most of tau^2 (1 - tau)^3): a piece that cannot
+    // leave the window is not searched.
+    float pMin = std::fmin(pStart, pStart + q.D), pMax = std::fmax(pStart, pStart + q.D);
+    const float cb = std::fabs(daT) * q.T * 0.0173f;
+    const float hlo = pStart + std::fmin(std::fmin(0.0f, q.D), std::fmin(k.p1, k.p2)) - cb;
+    const float hhi = pStart + std::fmax(std::fmax(0.0f, q.D), std::fmax(k.p1, k.p2)) + cb;
+    if (hlo < c.lo || hhi > c.hi) {
+        const auto atP = [&](float u) {
+            const float p = pStart + evalPiece(q, u).p;
+            pMin = std::fmin(pMin, p);
+            pMax = std::fmax(pMax, p);
+        };
+        const int nr = rootsOf([&](float u) { atP(u); return at(u).pp; }, kSegA, r, 16);
+        for (int i = 0; i < nr; ++i) atP(r[i]);
+    }
+    return ratioOf(pv, pa, pj, pMin, pMax, c, parts);
+}
 
 // The worst ceiling ratio of a piece: each of v, a, j at its exact turning
 // points (the roots of the next derivative's numerator) and at 11 samples, so
 // it agrees with a full sampling (overSampled) within the tolerance at a
 // fraction of the cost; the window from the position's exact turning points.
-// A piece with a start correction (da) is sampled in full.
+// A piece with a start correction (da) is judged by overCorrected.
 inline float overOf(const Piece& q, float pStart, const Cfg& c, float stop = INFINITY, Over* parts = nullptr) {
-    if (q.da != 0.0f) return overSampled(q, pStart, c, stop, parts);
+    if (q.da != 0.0f) return overCorrected(q, pStart, c, stop, parts);
     const float sv = c.lim.vmax * stop, sa = c.lim.amax * stop, sj = c.lim.jmax * stop;
     const Coef k = coefOf(q);
     float r[6];
@@ -354,15 +446,11 @@ inline float overOf(const Piece& q, float pStart, const Cfg& c, float stop = INF
             pMax = std::fmax(pMax, p);
         }
     }
-    const float out = std::fmax(0.0f, std::fmax(c.lo - pMin, pMax - c.hi));
-    if (parts) *parts = Over{pv / c.lim.vmax, pa / c.lim.amax, pj / c.lim.jmax, 1.0f + out / (c.hi - c.lo)};
-    const float o = std::fmax(pv / c.lim.vmax, std::fmax(pa / c.lim.amax, pj / c.lim.jmax));
-    const float wall = c.railStop && out > 0.5f * kTol * (c.hi - c.lo) ? 1e3f : 1.0f;
-    return std::fmax(o, wall + out / (c.hi - c.lo));
+    return ratioOf(pv, pa, pj, pMin, pMax, c, parts);
 }
 
-// The full judge: every u sample of the piece. Kept for a piece with a
-// start correction, whose turning points are not the polynomials'.
+// The full judge: every u sample of the piece. The test reference for
+// overOf; no production caller.
 inline float overSampled(const Piece& q, float pStart, const Cfg& c, float stop, Over* parts) {
     const float sv = c.lim.vmax * stop, sa = c.lim.amax * stop, sj = c.lim.jmax * stop;
     float pv = 0.0f, pa = 0.0f, pj = 0.0f, pMin = pStart, pMax = pStart;
@@ -403,15 +491,7 @@ inline float overSampled(const Piece& q, float pStart, const Cfg& c, float stop,
             pMax = std::fmax(pMax, p);
         }
     }
-    const float out = std::fmax(0.0f, std::fmax(c.lo - pMin, pMax - c.hi));
-    if (parts) *parts = Over{pv / c.lim.vmax, pa / c.lim.amax, pj / c.lim.jmax, 1.0f + out / (c.hi - c.lo)};
-    float o = std::fmax(pv / c.lim.vmax, std::fmax(pa / c.lim.amax, pj / c.lim.jmax));
-    // Under railStop the window is a wall: leaving it past half the tolerance
-    // ranks below any ceiling ratio short of a thousand, so the least-over fit
-    // stays inside (the other half is the engine's: a built piece reads a
-    // little past its render).
-    const float wall = c.railStop && out > 0.5f * kTol * (c.hi - c.lo) ? 1e3f : 1.0f;
-    return std::fmax(o, wall + out / (c.hi - c.lo));
+    return ratioOf(pv, pa, pj, pMin, pMax, c, parts);
 }
 
 // Closed-form end accelerations of a piece (the algebra of evalPiece at u = 0, 1).

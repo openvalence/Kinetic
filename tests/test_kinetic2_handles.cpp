@@ -1,7 +1,7 @@
 // test_kinetic2_handles.cpp -- the handle renderer (Valence RFC-106, kin-y6e)
 // on its fixture scripts (tests/handles_fixture.hpp): ceilings, continuity and
 // flat holds in sampled reality, the two styles bit for bit, the smoothness,
-// handle_floor and trim_max bounds.
+// handle_floor and trim_max bounds, and the start-corrected judge.
 // Constraints:
 // - Every engine assertion is sampled reality on the 1 ms grid, never the
 //   planner's word.
@@ -188,11 +188,13 @@ TEST_CASE("smoothness 0 and 1 render the pchip and smooth styles bit for bit") {
     // from the render's curve after an on-curve corner exit. Both smooth
     // hashes moved with kin-4o6r (0x614ccb89b4dc2c36 -> 0xc99cb88b53ab265c,
     // 0xc68708be37c41d4e -> 0xf809a2cf0639093e): a crest under smooth is flat
-    // where it took Makima's angle; pchip is unchanged.
+    // where it took Makima's angle; pchip is unchanged. Both engine hashes
+    // accepted 2026-10-22 (kin-f0yr change 3): built start-corrected pieces
+    // judged at their exact peaks; was 0xa6fac79f561c2021, 0xf809a2cf0639093e.
     CHECK(bareHash(0.0f) == 0x137dfc85e450fd0dull);
     CHECK(bareHash(1.0f) == 0xc99cb88b53ab265cull);
-    CHECK(engineHash(0.0f) == 0xa6fac79f561c2021ull);
-    CHECK(engineHash(1.0f) == 0xf809a2cf0639093eull);
+    CHECK(engineHash(0.0f) == 0x923b1a7a1e7d2864ull);
+    CHECK(engineHash(1.0f) == 0xa2108375e4ef5343ull);
 }
 
 TEST_CASE("smoothness: crests and hold edges are flat at every value; the lengths change, not the extrema") {
@@ -326,4 +328,86 @@ TEST_CASE("handle_floor: no fitted handle is shorter") {
     const float floored = shortest(cfg);
     MESSAGE("shortest handle at the default floor " << dflt << ", at 0.3: " << floored);
     CHECK(floored >= 0.3f - 1e-6f);
+}
+
+// ---- the start-corrected judge (kin-f0yr) -----------------------------------
+
+namespace {
+
+// overOf on one piece under both windows: never under overSampled, over the
+// bar whenever it is, and within kTol of a sampling at 2001 u (overSampled's
+// 161 miss a narrow peak by more).
+struct Agree {
+    int pieces = 0, under = 0, apart = 0, missed = 0;
+    float margin = INFINITY;   // least (exact - overSampled) / max(1, overSampled)
+    float gap = 0.0f;          // most |exact - dense| / max(1, dense)
+    void judge(const handles::Piece& q, float p0, const Limits& lim) {
+        ++pieces;
+        float dv = 0.0f, da = 0.0f, dj = 0.0f, lo = p0, hi = p0;
+        for (int k = 0; k <= 2000; ++k) {
+            const handles::Eval e = handles::evalPiece(q, float(k) / 2000.0f);
+            dv = std::fmax(dv, std::fabs(e.v)); da = std::fmax(da, std::fabs(e.a)); dj = std::fmax(dj, std::fabs(e.j));
+            lo = std::fmin(lo, p0 + e.p); hi = std::fmax(hi, p0 + e.p);
+        }
+        handles::Cfg open; open.lim = lim; open.lo = -1e30f; open.hi = 1e30f;
+        handles::Cfg rail = open; rail.lo = 0.0f; rail.hi = 1.0f; rail.railStop = true;
+        for (const handles::Cfg& c : {open, rail}) {
+            handles::Over ex, sa;
+            (void)handles::overOf(q, p0, c, INFINITY, &ex);
+            (void)handles::overSampled(q, p0, c, INFINITY, &sa);
+            const float out = std::fmax(0.0f, std::fmax(c.lo - lo, hi - c.hi));
+            const float e[4] = {ex.v, ex.a, ex.j, ex.x}, s[4] = {sa.v, sa.a, sa.j, sa.x};
+            const float d[4] = {dv / lim.vmax, da / lim.amax, dj / lim.jmax, 1.0f + out / (c.hi - c.lo)};
+            for (int i = 0; i < 4; ++i) {
+                margin = std::fmin(margin, (e[i] - s[i]) / std::fmax(1.0f, s[i]));
+                gap = std::fmax(gap, std::fabs(e[i] - d[i]) / std::fmax(1.0f, d[i]));
+                under += e[i] < s[i] * (1.0f - 1e-5f) - 1e-7f;
+                apart += std::fabs(e[i] - d[i]) > handles::kTol * std::fmax(1.0f, d[i]);
+                missed += s[i] > 1.0f + handles::kTol && !(e[i] > 1.0f + handles::kTol);
+            }
+        }
+    }
+};
+
+}  // namespace
+
+TEST_CASE("overOf judges a start-corrected piece as overSampled does, never under it") {
+    // Every built piece with a start correction of the fixture cases, rebuilt
+    // as renderRun builds it.
+    Agree fx;
+    for (const handles_fixture::Case& c : handles_fixture::kCases) {
+        const Run r = render(c);
+        const Limits lim{c.vmax, c.amax, c.jmax};
+        State st{c.p[0], 0.0f, 0.0f};
+        uint64_t st_us = 0;
+        for (const Solved& o : r.sol) {
+            const Piece pc = buildPiece(st, st_us, o, lim);
+            if (pc.T > 0.0f && !o.hard && pc.q.da != 0.0f) fx.judge(pc.q, pc.p0, lim);
+            st = State{o.p, o.v, o.a};
+            st_us = o.t_us;
+        }
+    }
+    // Seeded synthetic pieces past every ceiling and length the solver builds.
+    // They set handles::kSegA, kSegJ and kSegS: the fewest with no under-read.
+    Agree sw;
+    uint32_t s = 0x2545f491u;
+    auto uni = [&](float lo, float hi) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return lo + (hi - lo) * float(s % 100000u) / 99999.0f; };
+    for (int n = 0; n < 20000; ++n) {
+        const Limits lim{uni(1.0f, 8.0f), uni(10.0f, 200.0f), uni(200.0f, 20000.0f)};
+        handles::Piece q;
+        q.T = uni(0.002f, 0.6f); q.D = uni(-1.0f, 1.0f);
+        q.s0 = uni(-lim.vmax, lim.vmax); q.s1 = uni(-lim.vmax, lim.vmax);
+        q.i0 = uni(handles::kLMin, handles::kLMax); q.i1 = uni(handles::kLMin, handles::kLMax);
+        q.da = uni(-4.0f, 4.0f) * lim.amax;
+        if (q.da == 0.0f) continue;
+        sw.judge(q, uni(0.0f, 1.0f), lim);
+    }
+    MESSAGE("fixtures: " << fx.pieces << " pieces, least margin " << fx.margin << ", most apart " << fx.gap
+            << "; synthetic: " << sw.pieces << " pieces, least margin " << sw.margin << ", most apart " << sw.gap);
+    REQUIRE(fx.pieces > 0);
+    for (const Agree* a : {&fx, &sw}) {
+        CHECK(a->under == 0);
+        CHECK(a->apart == 0);
+        CHECK(a->missed == 0);
+    }
 }

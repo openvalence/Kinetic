@@ -282,18 +282,28 @@ void print(const Tally& t) {
     if (t.dev_max_mm >= 0.0f) std::printf("%-17s vs PCHIP: max %.2f mm, mean %.3f mm, %.1f%% of ticks within 1 mm\n", "", t.dev_max_mm, t.dev_mean_mm, 100.0f * t.within1);
 }
 
+// One scenario's tally, then its piece judges and the share the JudgeMemo answered.
+template <typename Fn>
+void scenario(Fn&& run) {
+    const stats::Counters c0 = stats::g;
+    print(run());
+    const uint64_t n = stats::g.piece_judges - c0.piece_judges, hit = stats::g.memo_hits - c0.memo_hits;
+    std::printf("%-17s piece judges %llu, memo hits %llu (%.1f%%)\n", "", (unsigned long long)n, (unsigned long long)hit,
+                n ? 100.0 * double(hit) / double(n) : 0.0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     const uint32_t budget = argc > 1 ? uint32_t(std::atoi(argv[1])) : Config{}.solve_budget;
     g_smoothness = argc > 2 ? float(std::atof(argv[2])) : 0.0f;
     std::printf("solve_budget %u smoothness %g\n", budget, double(g_smoothness));
-    print(funscript(budget, false, "A funscript"));
-    print(funscript(budget, true, "A gentle"));
-    print(jogScrub(budget));
-    print(jogScrub(budget, true));
-    print(stream60(budget, 0.25f, "C 60 Hz stream"));
-    print(stream60(budget, 0.3f, "C+ 60 Hz past v"));
-    print(fullWindow(budget));
+    scenario([&] { return funscript(budget, false, "A funscript"); });
+    scenario([&] { return funscript(budget, true, "A gentle"); });
+    scenario([&] { return jogScrub(budget); });
+    scenario([&] { return jogScrub(budget, true); });
+    scenario([&] { return stream60(budget, 0.25f, "C 60 Hz stream"); });
+    scenario([&] { return stream60(budget, 0.3f, "C+ 60 Hz past v"); });
+    scenario([&] { return fullWindow(budget); });
     return 0;
 }

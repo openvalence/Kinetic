@@ -49,23 +49,6 @@
 
 namespace kinetic2 {
 
-// ---- cost counters (tests/bench_kinetic2.cpp) ----------------------------------
-// Compiled in only under KINETIC2_STATS; never in firmware. Not thread-safe.
-#ifdef KINETIC2_STATS
-namespace stats {
-struct Counters {
-    uint64_t windows = 0;      // solveWindow calls
-    uint64_t knots = 0;        // knots rendered
-    uint64_t judges = 0;       // renders (handles::render calls)
-    uint64_t capped = 0;       // runs kSlackCap stopped
-};
-inline Counters g{};
-}  // namespace stats
-#define K2_STAT(field, n) (::kinetic2::stats::g.field += (n))
-#else
-#define K2_STAT(field, n) ((void)0)
-#endif
-
 inline constexpr float    kHoldEps   = 0.005f;   // a chord this small is a hold, window units
 inline constexpr uint64_t kMinSpanUs = 1000;     // one tick, the floor of every span
 inline constexpr float    kIllegal   = 1e30f;    // a ratio for an illegal profile
@@ -121,6 +104,8 @@ struct Workspace {
     // tightening (the passes before this one) and the worst one this pass.
     float          last[kWindowKnots + 2][3];
     float          ask[kWindowKnots + 2][3];
+    Piece          pc[kWindowKnots + 2];     // each knot's built piece this pass (emitRun), the pass loop's
+    JudgeMemo      memo;   // kept across solves: its key holds every input
 };
 
 // ---- HARD --------------------------------------------------------------------
@@ -157,18 +142,18 @@ inline bool hardKnot(const State& s, uint64_t s_us, const Knot& K, const handles
 // From state s at s_us into solved knot k. A HARD knot is its whole profile,
 // which starts where the knot was solved from: an origin moved along it (the
 // reaction horizon) is on the same curve.
-inline Piece buildPiece(const State& s, uint64_t s_us, const Solved& k, const Limits& L) {
+inline Piece buildPiece(const State& s, uint64_t s_us, const Solved& k, const Limits& L, JudgeMemo* m = nullptr) {
     Piece q;
     if (k.hard) {
         q = Piece::profile(k.ramp);
         q.end_us = k.t_us;
     } else if (k.corner) {
-        q = Piece::bezier(s_us, s, k.head_us, State{k.head.p, k.head.v, k.a_in}, k.i0, k.i1, L, k.exact_start, k.keep_lengths);
+        q = Piece::bezier(s_us, s, k.head_us, State{k.head.p, k.head.v, k.a_in}, k.i0, k.i1, L, k.exact_start, k.keep_lengths, m);
         q.has_tail = true;
         q.tail = k.ramp;
         q.end_us = k.t_us;
     } else {
-        q = Piece::bezier(s_us, s, k.t_us, State{k.p, k.v, k.a_in}, k.i0, k.i1, L, k.exact_start, k.keep_lengths);
+        q = Piece::bezier(s_us, s, k.t_us, State{k.p, k.v, k.a_in}, k.i0, k.i1, L, k.exact_start, k.keep_lengths, m);
     }
     return q;
 }
@@ -245,7 +230,7 @@ inline bool rampOnCurve(const handles::Piece& qL, const handles::Piece& qR, floa
 // reported with the piece after it: unwinding a step too large for jmax gains
 // up to aL^2 / 2 jmax of speed (kin-jsw1).
 inline void cornerAt(Solved& o, float aL, float aR, bool from_flat, bool into_flat, const State& st,
-                     uint64_t st_us, uint64_t tr_us, const Limits& L,
+                     uint64_t st_us, uint64_t tr_us, const Limits& L, JudgeMemo* m,
                      const handles::Piece* qL = nullptr, const handles::Piece* qR = nullptr) {
     if (std::fabs(aR - aL) <= L.jmax * kStepS) return;
     uint64_t r_us = 0, h_us = 0, use_us = 0;
@@ -313,7 +298,7 @@ inline void cornerAt(Solved& o, float aL, float aR, bool from_flat, bool into_fl
             aH = aL;
             if (h_us != 0) {
                 o.a_in = w.a;
-                const Piece head = Piece::bezier(st_us, st, o.t_us - h_us, w, o.i0, o.i1, L, false, o.keep_lengths);
+                const Piece head = Piece::bezier(st_us, st, o.t_us - h_us, w, o.i0, o.i1, L, false, o.keep_lengths, m);
                 if (head.T > 0.0f) aH = handles::aEndOf(head.q);
             }
             const float res = aH - w.a;   // the head's end past the acceleration it was built to
@@ -388,8 +373,8 @@ inline float withinCeiling(float x, float ceiling) {
 }
 
 // The worst ceiling ratio of a built piece and its lead ramp.
-inline float builtOver(const Piece& pc, const handles::Cfg& c) {
-    float w = handles::overOf(pc.q, pc.p0, c);
+inline float builtOver(const Piece& pc, const handles::Cfg& c, JudgeMemo* m) {
+    float w = overMemo(m, pc.q, pc.p0, c);
     if (pc.has_lead) {
         const handles::Over pl = profOver(pc.lead, c);
         w = std::fmax(w, std::fmax(std::fmax(pl.v, pl.a), std::fmax(pl.j, pl.x)));
@@ -401,7 +386,7 @@ inline float builtOver(const Piece& pc, const handles::Cfg& c) {
 // into o: q is the rendered piece into o from q_us, and o carries the
 // render's knot (t_us, p, v, a_in, i0, i1, worst).
 inline Piece buildInto(const handles::Piece& q, uint64_t q_us, const State& s, uint64_t s_us, Solved& o,
-                       const handles::Cfg& c) {
+                       const handles::Cfg& c, JudgeMemo* m) {
     // A corner before this piece ends past its knot: the piece starts on
     // its exit with the render's curve from there on.
     if (s_us > q_us && s_us < o.t_us) {
@@ -419,18 +404,18 @@ inline Piece buildInto(const handles::Piece& q, uint64_t q_us, const State& s, u
     if (std::fabs(q.D) <= c.holdEps && std::fabs(q.s0) <= vr && std::fabs(q.s1) <= vr && std::fabs(s.v) <= vr
         && std::fabs(s.a) <= ar && std::fabs(o.p - s.p) <= kKnotTol)
         o.p = o.knot_p = s.p;
-    Piece in = Piece::bezier(s_us, s, o.t_us, State{o.p, o.v, o.a_in}, o.i0, o.i1, c.lim);
+    Piece in = Piece::bezier(s_us, s, o.t_us, State{o.p, o.v, o.a_in}, o.i0, o.i1, c.lim, false, false, m);
     // The piece starts from the state the one before it built, not the
     // render's knot: one the render fit legal that builds over a ceiling
     // or out of the window takes the nearest legal length factor of its own.
-    if (in.T > 0.0f && !(o.worst > 1.0f + handles::kTol) && builtOver(in, c) > 1.0f + handles::kTol) {
+    if (in.T > 0.0f && !(o.worst > 1.0f + handles::kTol) && builtOver(in, c, m) > 1.0f + handles::kTol) {
         bool found = false;
         for (int keep = 0; keep < 2 && !found; ++keep)
             for (int idx = keep ? 0 : 1; idx < handles::kKs && !found; ++idx) {
                 const float f = handles::ksAt(idx);
                 const float i0 = handles::clampL(o.i0 * f), i1 = handles::clampL(o.i1 * f);
-                const Piece t = Piece::bezier(s_us, s, o.t_us, State{o.p, o.v, o.a_in}, i0, i1, c.lim, false, keep != 0);
-                if (builtOver(t, c) <= 1.0f + handles::kTol) { o.i0 = i0; o.i1 = i1; o.keep_lengths = keep != 0; in = t; found = true; }
+                const Piece t = Piece::bezier(s_us, s, o.t_us, State{o.p, o.v, o.a_in}, i0, i1, c.lim, false, keep != 0, m);
+                if (builtOver(t, c, m) <= 1.0f + handles::kTol) { o.i0 = i0; o.i1 = i1; o.keep_lengths = keep != 0; in = t; found = true; }
             }
     }
     return in;
@@ -438,12 +423,12 @@ inline Piece buildInto(const handles::Piece& q, uint64_t q_us, const State& s, u
 
 // The worst ratio of a built piece over speed, acceleration and the window
 // (jerk aside): its Bezier, lead ramp and tail.
-inline float vaxOf(const Piece& pc, const handles::Cfg& c) {
+inline float vaxOf(const Piece& pc, const handles::Cfg& c, JudgeMemo* m = nullptr) {
     float w = 0.0f;
     auto take = [&w](const handles::Over& o) { w = std::fmax(w, std::fmax(o.v, std::fmax(o.a, o.x))); };
     if (pc.T > 0.0f) {
         handles::Over po;
-        handles::overOf(pc.q, pc.p0, c, INFINITY, &po);
+        overMemo(m, pc.q, pc.p0, c, &po);
         take(po);
     }
     if (pc.has_lead) take(profOver(pc.lead, c));
@@ -472,9 +457,10 @@ inline float overAll(const Piece& pc, const handles::Cfg& c) {
 // past me (the provisional successor) shapes the corner before it and is
 // never emitted. rescue: renderRun's last pass (a ramp may end on its knot).
 inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, int me, const Knot* kn, const State& s,
-                    const handles::Cfg& c, Solved* out, bool rescue = false) {
-    State st = s, sp = s;   // the state the piece into knot r - 1 started from: sp
-    uint64_t st_us = te[0], sp_us = te[0];
+                    const handles::Cfg& c, Solved* out, Workspace& ws, bool rescue = false) {
+    JudgeMemo* jm = &ws.memo;
+    State st = s;
+    uint64_t st_us = te[0], sp_us = te[0];   // where the piece into knot r - 1 started: sp_us
     for (int r = 1; r < me; ++r) {
         const Knot& K = kn[r - 1];
         Solved& o = out[r - 1];
@@ -488,7 +474,7 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, int me, 
         o.i1 = k[r].effIn;
         const float pL = handles::rendered(k[r - 1]);
         const handles::Piece qL = handles::pieceOf(k, r - 1);
-        o.worst = handles::overOf(qL, pL, c);
+        o.worst = overMemo(jm, qL, pL, c);
         // Infeasible against the ceilings themselves: a piece the render found
         // illegal only under its tightened share (slack) is legal.
         o.infeasible = k[r].infeasible && o.worst > 1.0f + handles::kTol;
@@ -500,14 +486,14 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, int me, 
             o.share = (o.p - pL) / (K.p - pL);
         o.a_in = handles::aEndOf(qL);
         const bool from_flat = std::fabs(qL.D) <= c.holdEps && qL.s0 == 0.0f && qL.s1 == 0.0f;
-        const Piece in = buildInto(qL, te[r - 1], st, st_us, o, c);
+        const Piece in = buildInto(qL, te[r - 1], st, st_us, o, c, jm);
         o.a = in.T > 0.0f ? handles::aEndOf(in.q) : 0.0f;
         if (r + 1 < m) {
             const handles::Piece qR = handles::pieceOf(k, r);
             const bool into_flat = std::fabs(qR.D) <= c.holdEps && qR.s0 == 0.0f && qR.s1 == 0.0f;
             const float aR = handles::aStartOf(qR);
             const Solved pre = o;
-            cornerAt(o, o.a, aR, from_flat, into_flat, st, st_us, te[r + 1] - te[r], c.lim, &qL, &qR);
+            cornerAt(o, o.a, aR, from_flat, into_flat, st, st_us, te[r + 1] - te[r], c.lim, jm, &qL, &qR);
             // Constraint: a ramp across the knot hands the next piece its own
             // exit, off the render by up to (aL - aR)^2 / 8 jmax of speed when
             // centered. In the rescue pass a ramp ending on the knot (the next
@@ -523,19 +509,19 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, int me, 
                     nx.i0 = k[r].effOut;
                     nx.i1 = k[r + 1].effIn;
                     nx.a_in = handles::aEndOf(qR);
-                    nx.worst = handles::overOf(qR, handles::rendered(k[r]), c);
-                    const Piece pn = buildInto(qR, te[r], State{x.p, x.v, x.a}, x.t_us, nx, c);
-                    return std::fmax(vaxOf(buildPiece(st, st_us, x, c.lim), c), vaxOf(pn, c));
+                    nx.worst = overMemo(jm, qR, handles::rendered(k[r]), c);
+                    const Piece pn = buildInto(qR, te[r], State{x.p, x.v, x.a}, x.t_us, nx, c, jm);
+                    return std::fmax(vaxOf(buildPiece(st, st_us, x, c.lim, jm), c, jm), vaxOf(pn, c, jm));
                 };
                 const float now = around(o);
                 if (now > 1.0f + handles::kTol) {
                     Solved alt = pre;
-                    cornerAt(alt, pre.a, aR, from_flat, true, st, st_us, te[r + 1] - te[r], c.lim);
+                    cornerAt(alt, pre.a, aR, from_flat, true, st, st_us, te[r + 1] - te[r], c.lim, jm);
                     if (alt.corner && around(alt) < now) o = alt;
                 }
             }
         } else if (o.v == 0.0f) {
-            cornerAt(o, o.a, 0.0f, from_flat, true, st, st_us, ~uint64_t(0) / 4, c.lim);
+            cornerAt(o, o.a, 0.0f, from_flat, true, st, st_us, ~uint64_t(0) / 4, c.lim, jm);
         }
         // A corner ramp can pass the knot off its rendered position (a flat
         // knot's turn lands on its height, not at its time): where it passes
@@ -554,24 +540,29 @@ inline void emitRun(const handles::HKnot* k, const uint64_t* te, int m, int me, 
         // (kin-554). The piece into the knot keeps its own end; it is reported.
         // A corner's exit stays: it is the next piece's own start, reached by
         // the ramp at jmax and judged with it.
+        const float v_in = o.v;
         if (!o.corner) { o.v = withinCeiling(o.v, c.lim.vmax); o.a = withinCeiling(o.a, c.lim.amax); }
+        // ws.pc[r] is buildPiece(st, st_us, o) for o as emitted: `in` while o
+        // keeps every input buildInto built it from, else built here once.
+        Piece& pc = ws.pc[r];
+        const bool kept = !o.corner && o.v == v_in;
+        pc = kept ? in : buildPiece(st, st_us, o, c.lim, jm);
         // A start step under kStepS where a corner ramp ends reads over jmax
         // on the 1 ms grid when the tick before it is near jmax already: the
         // piece the engine builds carries it exactly, unless that takes the
         // piece further over a ceiling or out of the window than the step
         // reads on the grid (every smoothness, kin-9od3, kin-4o6r).
         if (r > 1 && out[r - 2].corner) {
-            const Piece pl = buildPiece(st, st_us, o, c.lim);
             const uint64_t back = st_us > sp_us + kMinSpanUs ? st_us - kMinSpanUs : sp_us;
-            const float grid = pl.T > 0.0f ? std::fabs(handles::aStartOf(pl.q) - buildPiece(sp, sp_us, out[r - 2], c.lim).at(back).a)
+            const float grid = pc.T > 0.0f ? std::fabs(handles::aStartOf(pc.q) - ws.pc[r - 1].at(back).a)
                                                  / (c.lim.jmax * handles::kTick) : 0.0f;
-            if (pl.T > 0.0f && !pl.has_lead && pl.q.da == 0.0f && grid > 1.0f + handles::kTol) {
+            if (pc.T > 0.0f && !pc.has_lead && pc.q.da == 0.0f && grid > 1.0f + handles::kTol) {
                 o.exact_start = true;
-                const Piece ex = buildPiece(st, st_us, o, c.lim);
-                o.exact_start = handles::overOf(ex.q, ex.p0, c) <= std::fmax(grid, handles::overOf(pl.q, pl.p0, c));
+                const Piece ex = buildPiece(st, st_us, o, c.lim, jm);
+                o.exact_start = overMemo(jm, ex.q, ex.p0, c) <= std::fmax(grid, overMemo(jm, pc.q, pc.p0, c));
+                if (o.exact_start) pc = ex;
             }
         }
-        sp = st;
         sp_us = st_us;
         st = State{o.p, o.v, o.a};
         st_us = o.t_us;
@@ -595,8 +586,8 @@ inline constexpr int   kSlackCap   = 16;
 // share near zero ranked the least-over fit by a ceiling no piece can meet.
 inline constexpr float kSlackFloor = 0.25f;
 // A tightening that did not cut its excess lowers the share at least this
-// much the next time: a share no fit answers reaches kSlackFloor in at most
-// 28 such passes.
+// much the next time; one that left the excess bit for bit where it was (the
+// share does not reach it) takes kSlackFloor at once.
 inline constexpr float kSlackStep  = 0.95f;
 // until_us: a successor is expected until then (Engine::expect; 0 none). The
 // newest knot, free and not a sample, then renders through toward a
@@ -646,7 +637,7 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
         K2_STAT(judges, 1);
         K2T_PASS(pass, rescue);
         handles::render(k, m, c);
-        emitRun(k, te, m, me, kn, s, c, out, rescue);
+        emitRun(k, te, m, me, kn, s, c, out, ws, rescue);
         const bool final = pass >= kSlackCap;
         bool again = false;   // final: a piece still asks (the cap stopped the run)
         bool over = false;    // a built piece or ramp over speed, acceleration or the window
@@ -656,10 +647,11 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
         // Speed and acceleration tighten from what the render itself reads of
         // the piece (a lead ramp can put the built piece over while the
         // render is well inside), by at most half per pass.
-        auto tighten = [&](int r, const handles::Over& o) {
+        // seed: o is r's own piece or corner ramp.
+        auto tighten = [&](int r, const handles::Over& o, bool seed = false) {
             if (r >= m) return;
             handles::Over rp;
-            handles::overOf(handles::pieceOf(k, r - 1), handles::rendered(k[r - 1]), c, INFINITY, &rp);
+            overMemo(&ws.memo, handles::pieceOf(k, r - 1), handles::rendered(k[r - 1]), c, &rp);
             const float rs[3] = {o.v, o.a, o.j}, own[3] = {rp.v, rp.a, INFINITY};
             for (int x = 0; x < 3; ++x) {
                 const float w = std::fmax(rs[x], o.x);
@@ -670,17 +662,28 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
                 // Stalled (the last tightening did not cut the excess): at
                 // least kSlackStep, so a share no fit answers reaches its floor.
                 if (!(w < ws.last[r][x] * (1.0f - 0.5f * handles::kTol))) t = std::fmin(t, kSlackStep * k[r].slack[x]);
+                if (w == ws.last[r][x]) t = kSlackFloor;
                 t = std::fmax(kSlackFloor, t);
-                if (t < k[r].slack[x]) { if (!final) k[r].slack[x] = t; again = true; }
+                if (t < k[r].slack[x]) {
+                    // A first ask behind a tightened successor is the step from
+                    // the untightened shares to the tightened ones, and each
+                    // tightening moves it one knot back: the knots before r
+                    // take r's share in this pass. ponytail: the walk runs to the
+                    // head (or a knot as tight); a cascade that would stop partway
+                    // gives up the stroke before it; bound the walk if a window shows it.
+                    if (seed && !final && ws.last[r][x] == INFINITY && r + 1 < m && k[r + 1].slack[x] < k[r].slack[x])
+                        for (int j = r - 1; j >= 1 && t < k[j].slack[x]; --j) k[j].slack[x] = t;
+                    if (!final) k[r].slack[x] = t;
+                    again = true;
+                }
             }
         };
         float* built = ws.built;
         State st = s;
-        uint64_t st_us = s_us;
         float j_end = 0.0f;   // |jerk| where the previous piece (or its ramp) ends
         for (int r = 1; r < me; ++r) {
             const Solved& o = out[r - 1];
-            const Piece pc = buildPiece(st, st_us, o, c.lim);
+            const Piece& pc = ws.pc[r];
             built[r] = 0.0f;
             float step_ratio = 0.0f;
             if (pc.T > 0.0f && !o.hard) {
@@ -690,7 +693,7 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
                 // sample interval spans also carries the jerk beside it.
                 const float j1ms = c.lim.jmax * 1e-3f;
                 handles::Over po;
-                float w = handles::overOf(pc.q, pc.p0, c, INFINITY, &po);
+                float w = overMemo(&ws.memo, pc.q, pc.p0, c, &po);
                 if (pc.has_lead) {
                     const handles::Over pl = profOver(pc.lead, c);
                     po = handles::Over{std::fmax(po.v, pl.v), std::fmax(po.a, pl.a), std::fmax(po.j, pl.j), std::fmax(po.x, pl.x)};
@@ -715,13 +718,13 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
                 built[r] = std::fmax(w, step_ratio);
                 over = over || std::fmax(po.v, std::fmax(po.a, po.x)) > 1.0f + handles::kTol;
                 po.j = std::fmax(po.j, step_ratio);
-                if (!o.infeasible) tighten(r, po);
+                if (!o.infeasible) tighten(r, po, true);
             }
             if (o.corner) {
                 const handles::Over pr = profOver(o.ramp, c);
                 over = over || std::fmax(pr.v, std::fmax(pr.a, pr.x)) > 1.0f + handles::kTol;
                 built[r] = std::fmax(built[r], std::fmax(std::fmax(pr.v, pr.a), std::fmax(pr.j, pr.x)));
-                tighten(r, pr);
+                tighten(r, pr, true);
                 tighten(r + 1, pr);
             }
             // The newest knot of a window may be the last: the engine brakes
@@ -748,7 +751,6 @@ inline void renderRun(const State& s, uint64_t s_us, const Knot* kn, size_t cnt,
             j_end = o.corner ? std::fabs(o.ramp.jerk[0])
                   : (pc.T > 0.0f && !o.hard) ? std::fabs(handles::evalPiece(pc.q, 1.0f).j) : 0.0f;
             st = State{o.p, o.v, o.a};
-            st_us = o.t_us;
         }
         K2T_PASS_END(k, built, me, again, over);
         for (int r = 0; r < m; ++r)
